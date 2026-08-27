@@ -1,0 +1,37 @@
+# Rust build output
+/target/
+**/target/
+
+# Generated WebAssembly/PWA output
+**/dist/
+**/.trunk/
+
+# Rust and editor backup files
+**/*.rs.bk
+*.swp
+*.swo
+*~
+
+# Coverage and profiling output
+coverage/
+*.profraw
+*.profdata
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+
+# IDE settings
+.idea/
+.vscode/
+
+# Operating-system metadata
+.DS_Store
+Thumbs.db
+Desktop.ini

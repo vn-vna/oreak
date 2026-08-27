@@ -1,0 +1,20 @@
+[package]
+name = "oreak-legacy"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[dependencies]
+base64 = "0.22"
+flate2 = "1"
+getrandom = "0.3"
+oreak-core = { path = "../oreak-core" }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+pretty_assertions = "1"
+
+[lints.rust]
+unsafe_code = "forbid"

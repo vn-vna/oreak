@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#0c1117" />
+    <meta name="description" content="Oreak collaborative technical level editor" />
+    <title>Oreak Technical Editor</title>
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="icon" href="icon.svg" type="image/svg+xml" />
+    <link data-trunk rel="css" href="styles.css" />
+    <link data-trunk rel="copy-file" href="manifest.webmanifest" />
+    <link data-trunk rel="copy-file" href="icon.svg" />
+    <link data-trunk rel="copy-file" href="service-worker.js" />
+  </head>
+  <body>
+    <noscript>Oreak requires WebAssembly and JavaScript to run.</noscript>
+    <script>
+      if ("serviceWorker" in navigator) {
+        window.addEventListener("load", () => navigator.serviceWorker.register("/service-worker.js"));
+      }
+    </script>
+  </body>
+</html>

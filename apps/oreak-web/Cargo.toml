@@ -1,0 +1,42 @@
+[package]
+name = "oreak-web"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[dependencies]
+oreak-core = { path = "../../crates/oreak-core" }
+oreak-protocol = { path = "../../crates/oreak-protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+getrandom = { version = "0.3", features = ["wasm_js"] }
+js-sys = "0.3"
+jsonrpsee-wasm-client = "0.26"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+    "CanvasRenderingContext2d",
+    "Crypto",
+    "Document",
+    "DomRect",
+    "Element",
+    "EventTarget",
+    "HtmlCanvasElement",
+    "HtmlElement",
+    "HtmlInputElement",
+    "KeyboardEvent",
+    "Location",
+    "PointerEvent",
+    "Request",
+    "RequestCredentials",
+    "RequestInit",
+    "Response",
+    "Headers",
+    "Storage",
+    "SubmitEvent",
+    "Window",
+] }
+yew = { version = "0.23", features = ["csr"] }

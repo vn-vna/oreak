@@ -1,0 +1,27 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+          targets: wasm32-unknown-unknown
+      - run: cargo fmt --all --check
+      - run: cargo check --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo check -p oreak-core -p oreak-project -p oreak-plugin-api -p oreak-protocol -p oreak-web --target wasm32-unknown-unknown
+      - run: cargo install --locked trunk@0.21.14
+      - run: trunk build --release
+        working-directory: apps/oreak-web

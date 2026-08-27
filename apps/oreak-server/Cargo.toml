@@ -1,0 +1,28 @@
+[package]
+name = "oreak-server"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[dependencies]
+argon2 = "0.5"
+axum = "0.8"
+getrandom = "0.3"
+httpdate = "1"
+jsonrpsee = { version = "0.26", features = ["server"] }
+oreak-core = { path = "../../crates/oreak-core" }
+oreak-plugin-api = { path = "../../crates/oreak-plugin-api" }
+oreak-project = { path = "../../crates/oreak-project" }
+oreak-protocol = { path = "../../crates/oreak-protocol" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "fs", "trace"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+http-body-util = "0.1"
+jsonrpsee = { version = "0.26", features = ["ws-client"] }
