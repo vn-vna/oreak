@@ -14,11 +14,14 @@ use jsonrpsee::{
     server::ServerHandle,
     ws_client::{WsClient, WsClientBuilder},
 };
-use oreak_core::{CellKind, CommandEnvelope, CommandMetadata, GridPoint, LevelCommand};
+use oreak_core::{
+    Blind, BlindPixel, BlindStroke, BlindTile, Block, CellKind, CommandEnvelope, CommandMetadata,
+    EntityId, EntityMove, GridAnchor, GridPoint, GridSize, LevelCommand, PlaceableEntity, Shape,
+};
 use oreak_protocol::{
     ApplyCommandRequest, ApplyCommandResult, HealthResponse, HealthStatus, LevelHistoryRequest,
-    LevelSubscriptionItem, OreakRpcClient, ProjectLevelTarget, RpcErrorCode, RpcErrorData,
-    UndoLatestRequest,
+    LevelPresenceItem, LevelSubscriptionItem, OreakRpcClient, ProjectLevelTarget, RpcErrorCode,
+    RpcErrorData, UndoLatestRequest, UpdateLevelCursorRequest,
 };
 use oreak_server::build_application;
 use tokio::{net::TcpListener, task::JoinHandle, time::timeout};
@@ -417,6 +420,486 @@ async fn project_routes_enforce_membership_capabilities() {
 }
 
 #[tokio::test]
+async fn level_configuration_creation_update_validation_and_authorization() {
+    let router = build_application().into_router();
+    let (owner_cookie, owner) = register(&router, "level-config-owner@example.com").await;
+    let (viewer_cookie, _) = register(&router, "level-config-viewer@example.com").await;
+    let (outsider_cookie, _) = register(&router, "level-config-outsider@example.com").await;
+
+    let project_response = api_request(
+        &router,
+        Method::POST,
+        "/api/projects",
+        Some(serde_json::json!({
+            "workspace_id": owner["personal_workspace_id"],
+            "name": "Configured levels"
+        })),
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(project_response.status(), StatusCode::CREATED);
+    let project = json_body(project_response).await;
+    let project_id = project["id"].as_str().unwrap();
+    let levels_uri = format!("/api/projects/{project_id}/levels");
+
+    let created = api_request(
+        &router,
+        Method::POST,
+        &levels_uri,
+        Some(serde_json::json!({
+            "name": "  Opening  ",
+            "duration_seconds": 12.5
+        })),
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created = json_body(created).await;
+    assert_eq!(created["name"], "Opening");
+    assert_eq!(created["duration_seconds"], 12.5);
+    let level_id = created["id"].as_str().unwrap();
+    let configuration_uri = format!("/api/projects/{project_id}/levels/{level_id}/configuration");
+
+    let default_duration = api_request(
+        &router,
+        Method::POST,
+        &levels_uri,
+        Some(serde_json::json!({ "name": "Untimed" })),
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(default_duration.status(), StatusCode::CREATED);
+    assert_eq!(json_body(default_duration).await["duration_seconds"], 0.0);
+
+    let listed = api_request(&router, Method::GET, &levels_uri, None, Some(&owner_cookie)).await;
+    assert_eq!(listed.status(), StatusCode::OK);
+    let listed = json_body(listed).await;
+    let opening = listed["levels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|level| level["id"] == level_id)
+        .unwrap();
+    assert_eq!(opening["name"], "Opening");
+    assert_eq!(opening["duration_seconds"], 12.5);
+
+    let invitation = api_request(
+        &router,
+        Method::POST,
+        &format!("/api/projects/{project_id}/invitations"),
+        Some(serde_json::json!({
+            "email": "level-config-viewer@example.com",
+            "roles": ["viewer"]
+        })),
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(invitation.status(), StatusCode::CREATED);
+    let invitation = json_body(invitation).await;
+    let invitation_id = invitation["id"].as_str().unwrap();
+    let accepted = api_request(
+        &router,
+        Method::POST,
+        &format!("/api/projects/{project_id}/invitations/{invitation_id}/accept"),
+        None,
+        Some(&viewer_cookie),
+    )
+    .await;
+    assert_eq!(accepted.status(), StatusCode::OK);
+
+    let viewed = api_request(
+        &router,
+        Method::GET,
+        &configuration_uri,
+        None,
+        Some(&viewer_cookie),
+    )
+    .await;
+    assert_eq!(viewed.status(), StatusCode::OK);
+    assert_eq!(json_body(viewed).await["duration_seconds"], 12.5);
+
+    let viewer_update = api_request(
+        &router,
+        Method::PUT,
+        &configuration_uri,
+        Some(serde_json::json!({
+            "name": "Denied",
+            "duration_seconds": 1.0
+        })),
+        Some(&viewer_cookie),
+    )
+    .await;
+    assert_eq!(viewer_update.status(), StatusCode::FORBIDDEN);
+    let outsider_view = api_request(
+        &router,
+        Method::GET,
+        &configuration_uri,
+        None,
+        Some(&outsider_cookie),
+    )
+    .await;
+    assert_eq!(outsider_view.status(), StatusCode::FORBIDDEN);
+
+    let invalid = api_request(
+        &router,
+        Method::PUT,
+        &configuration_uri,
+        Some(serde_json::json!({
+            "name": "Invalid",
+            "duration_seconds": -1.0
+        })),
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+
+    for (method, uri, body) in [
+        (
+            Method::POST,
+            levels_uri.as_str(),
+            serde_json::json!({ "name": "Extra", "unknown": true }),
+        ),
+        (
+            Method::PUT,
+            configuration_uri.as_str(),
+            serde_json::json!({
+                "name": "Extra",
+                "duration_seconds": 1.0,
+                "unknown": true
+            }),
+        ),
+    ] {
+        let response = api_request(&router, method, uri, Some(body), Some(&owner_cookie)).await;
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    let updated = api_request(
+        &router,
+        Method::PUT,
+        &configuration_uri,
+        Some(serde_json::json!({
+            "name": "  Finale  ",
+            "duration_seconds": 30.0
+        })),
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(updated.status(), StatusCode::OK);
+    let updated = json_body(updated).await;
+    assert_eq!(updated["name"], "Finale");
+    assert_eq!(updated["duration_seconds"], 30.0);
+
+    let audit = api_request(
+        &router,
+        Method::GET,
+        &format!("/api/projects/{project_id}/audit"),
+        None,
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(audit.status(), StatusCode::OK);
+    assert!(
+        json_body(audit).await["audit"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["action"]["LevelConfigurationChanged"]["level_id"] == level_id)
+    );
+}
+
+#[tokio::test]
+async fn project_catalog_invitations_configuration_and_roles_are_authorized() {
+    let router = build_application().into_router();
+    let (owner_cookie, owner) = register(&router, "catalog-owner@example.com").await;
+    let (invitee_cookie, invitee) = register(&router, "catalog-invitee@example.com").await;
+    let (outsider_cookie, _) = register(&router, "catalog-outsider@example.com").await;
+
+    let project_response = api_request(
+        &router,
+        Method::POST,
+        "/api/projects",
+        Some(serde_json::json!({
+            "workspace_id": owner["personal_workspace_id"],
+            "name": "Shared catalog project"
+        })),
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(project_response.status(), StatusCode::CREATED);
+    let project = json_body(project_response).await;
+    let project_id = project["id"].as_str().unwrap();
+
+    let level_response = api_request(
+        &router,
+        Method::POST,
+        &format!("/api/projects/{project_id}/levels"),
+        Some(serde_json::json!({ "name": "Shared level" })),
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(level_response.status(), StatusCode::CREATED);
+
+    let invitation_response = api_request(
+        &router,
+        Method::POST,
+        &format!("/api/projects/{project_id}/invitations"),
+        Some(serde_json::json!({
+            "email": "  CATALOG-INVITEE@example.com ",
+            "roles": ["editor"]
+        })),
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(invitation_response.status(), StatusCode::CREATED);
+    let invitation = json_body(invitation_response).await;
+    assert_eq!(invitation["invitee_email"], "catalog-invitee@example.com");
+    let invitation_id = invitation["id"].as_str().unwrap();
+    let accept_uri = format!("/api/projects/{project_id}/invitations/{invitation_id}/accept");
+
+    let invitee_catalog = api_request(
+        &router,
+        Method::GET,
+        "/api/catalog",
+        None,
+        Some(&invitee_cookie),
+    )
+    .await;
+    assert_eq!(invitee_catalog.status(), StatusCode::OK);
+    let invitee_catalog = json_body(invitee_catalog).await;
+    assert!(invitee_catalog["projects"].as_array().unwrap().is_empty());
+    assert_eq!(invitee_catalog["invitations"][0]["id"], invitation_id);
+
+    let denied_accept = api_request(
+        &router,
+        Method::POST,
+        &accept_uri,
+        None,
+        Some(&outsider_cookie),
+    )
+    .await;
+    assert_eq!(denied_accept.status(), StatusCode::FORBIDDEN);
+
+    let accepted = api_request(
+        &router,
+        Method::POST,
+        &accept_uri,
+        None,
+        Some(&invitee_cookie),
+    )
+    .await;
+    assert_eq!(accepted.status(), StatusCode::OK);
+    let accepted = json_body(accepted).await;
+    assert_eq!(accepted["roles"][0], "editor");
+    assert!(
+        accepted["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|capability| capability == "edit_timeline")
+    );
+
+    let invitee_catalog = api_request(
+        &router,
+        Method::GET,
+        "/api/catalog",
+        None,
+        Some(&invitee_cookie),
+    )
+    .await;
+    assert_eq!(invitee_catalog.status(), StatusCode::OK);
+    let invitee_catalog = json_body(invitee_catalog).await;
+    assert!(
+        invitee_catalog["invitations"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+    let shared_project = invitee_catalog["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["project"]["id"] == project_id)
+        .unwrap();
+    assert_eq!(shared_project["levels"][0]["name"], "Shared level");
+
+    let configuration_uri = format!("/api/projects/{project_id}/configuration");
+    let invitee_configuration = api_request(
+        &router,
+        Method::GET,
+        &configuration_uri,
+        None,
+        Some(&invitee_cookie),
+    )
+    .await;
+    assert_eq!(invitee_configuration.status(), StatusCode::OK);
+    let invitee_configuration = json_body(invitee_configuration).await;
+    assert_eq!(invitee_configuration["members_visible"], false);
+    assert!(
+        invitee_configuration["members"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let denied_configuration = api_request(
+        &router,
+        Method::GET,
+        &configuration_uri,
+        None,
+        Some(&outsider_cookie),
+    )
+    .await;
+    assert_eq!(denied_configuration.status(), StatusCode::FORBIDDEN);
+
+    let member_id = invitee["id"].as_str().unwrap();
+    let updated_member = api_request(
+        &router,
+        Method::PUT,
+        &format!("/api/projects/{project_id}/members/{member_id}"),
+        Some(serde_json::json!({ "roles": ["viewer"] })),
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(updated_member.status(), StatusCode::OK);
+    assert_eq!(json_body(updated_member).await["roles"][0], "viewer");
+
+    let denied_theme = api_request(
+        &router,
+        Method::PUT,
+        &configuration_uri,
+        Some(serde_json::json!({ "default_theme": "light" })),
+        Some(&invitee_cookie),
+    )
+    .await;
+    assert_eq!(denied_theme.status(), StatusCode::FORBIDDEN);
+
+    let updated_theme = api_request(
+        &router,
+        Method::PUT,
+        &configuration_uri,
+        Some(serde_json::json!({ "default_theme": "light" })),
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(updated_theme.status(), StatusCode::OK);
+    assert_eq!(json_body(updated_theme).await["default_theme"], "light");
+}
+
+#[tokio::test]
+async fn project_shape_catalog_supports_validated_editor_crud() {
+    let router = build_application().into_router();
+    let (owner_cookie, target, _) = create_project_level(&router, "shape-owner@example.com").await;
+    let (outsider_cookie, _) = register(&router, "shape-outsider@example.com").await;
+    let catalog_uri = format!("/api/projects/{}/shapes", target.project_id);
+
+    let created = api_request(
+        &router,
+        Method::POST,
+        &catalog_uri,
+        Some(serde_json::json!({
+            "name": "Corner",
+            "shape": { "width": 2, "height": 2, "occupied_mask": 7 }
+        })),
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let created = json_body(created).await;
+    let shape_id = created["id"].as_str().unwrap();
+    assert_eq!(created["name"], "Corner");
+    assert_eq!(created["shape"]["occupied_mask"], 7);
+    assert_eq!(created["created_by"], created["updated_by"]);
+
+    let listed = api_request(
+        &router,
+        Method::GET,
+        &catalog_uri,
+        None,
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(listed.status(), StatusCode::OK);
+    assert_eq!(json_body(listed).await["shapes"][0]["id"], shape_id);
+
+    let denied = api_request(
+        &router,
+        Method::GET,
+        &catalog_uri,
+        None,
+        Some(&outsider_cookie),
+    )
+    .await;
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+    let entry_uri = format!("{catalog_uri}/{shape_id}");
+    let updated = api_request(
+        &router,
+        Method::PUT,
+        &entry_uri,
+        Some(serde_json::json!({
+            "name": "Vertical",
+            "shape": { "width": 1, "height": 2, "occupied_mask": 3 }
+        })),
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(updated.status(), StatusCode::OK);
+    let updated = json_body(updated).await;
+    assert_eq!(updated["name"], "Vertical");
+    assert_eq!(updated["shape"]["height"], 2);
+
+    let invalid = api_request(
+        &router,
+        Method::POST,
+        &catalog_uri,
+        Some(serde_json::json!({
+            "name": "Disconnected",
+            "shape": { "width": 2, "height": 2, "occupied_mask": 9 }
+        })),
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    let oversized = api_request(
+        &router,
+        Method::POST,
+        &catalog_uri,
+        Some(serde_json::json!({
+            "name": "Too wide",
+            "shape": { "width": 64, "height": 1, "occupied_mask": u64::MAX }
+        })),
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(oversized.status(), StatusCode::BAD_REQUEST);
+
+    let deleted = api_request(
+        &router,
+        Method::DELETE,
+        &entry_uri,
+        None,
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(deleted.status(), StatusCode::NO_CONTENT);
+    let listed = api_request(
+        &router,
+        Method::GET,
+        &catalog_uri,
+        None,
+        Some(&owner_cookie),
+    )
+    .await;
+    assert!(
+        json_body(listed).await["shapes"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn json_rpc_health_accepts_http() {
     let application = build_application();
     let _rpc_handle = application.rpc_handle();
@@ -482,6 +965,193 @@ async fn apply_command_updates_the_authoritative_snapshot() {
     assert_eq!(snapshot.server_sequence, 1);
     assert_eq!(snapshot.snapshot.cell(point), Ok(CellKind::Wall));
     assert_eq!(snapshot.level_hash, response.level_hash);
+}
+
+#[tokio::test]
+async fn grouped_move_and_resize_share_the_authoritative_timeline() {
+    let server = TestServer::start().await;
+    let (cookie, target, _) = create_project_level(&server.router, "layout-rpc@example.com").await;
+    let client = server.client(Some(&cookie)).await;
+    for (command_id, entity_id, point) in [
+        ("place-a", "a", GridPoint::new(1, 1)),
+        ("place-b", "b", GridPoint::new(2, 1)),
+    ] {
+        let entity = PlaceableEntity::block(
+            entity_id,
+            point,
+            Shape::new(1, 1, 1).unwrap(),
+            Block::default(),
+        )
+        .unwrap();
+        client
+            .apply_command(ApplyCommandRequest {
+                target: target.clone(),
+                command: CommandEnvelope::new(
+                    CommandMetadata::new(command_id, "spoofed", 1),
+                    LevelCommand::PlaceEntity { entity },
+                ),
+            })
+            .await
+            .unwrap();
+    }
+
+    let moved = client
+        .apply_command(ApplyCommandRequest {
+            target: target.clone(),
+            command: CommandEnvelope::new(
+                CommandMetadata::new("move-group", "spoofed", 1),
+                LevelCommand::MoveEntities {
+                    moves: vec![
+                        EntityMove::new("a", GridPoint::new(2, 1)),
+                        EntityMove::new("b", GridPoint::new(3, 1)),
+                    ],
+                },
+            ),
+        })
+        .await
+        .unwrap();
+    assert_eq!(moved.server_sequence, 3);
+    assert!(matches!(
+        moved.result,
+        ApplyCommandResult::Applied { ref event } if event.changes.len() == 2
+    ));
+
+    let resized = client
+        .apply_command(ApplyCommandRequest {
+            target: target.clone(),
+            command: CommandEnvelope::new(
+                CommandMetadata::new("resize", "spoofed", 1),
+                LevelCommand::ResizeGrid {
+                    size: GridSize::new(10, 6).unwrap(),
+                    anchor: GridAnchor::BottomLeft,
+                },
+            ),
+        })
+        .await
+        .unwrap();
+    assert_eq!(resized.server_sequence, 4);
+
+    let snapshot = client.level_snapshot(target).await.unwrap().snapshot;
+    assert_eq!(snapshot.size(), GridSize::new(10, 6).unwrap());
+    assert_eq!(
+        snapshot.entity(&EntityId::from("a")).unwrap().origin(),
+        GridPoint::new(2, 1)
+    );
+    assert_eq!(
+        snapshot.entity(&EntityId::from("b")).unwrap().origin(),
+        GridPoint::new(3, 1)
+    );
+}
+
+#[tokio::test]
+async fn blind_brush_commands_use_the_authoritative_core_path() {
+    let server = TestServer::start().await;
+    let (cookie, target, user) =
+        create_project_level(&server.router, "brush-rpc@example.com").await;
+    let client = server.client(Some(&cookie)).await;
+    let entity_id = EntityId::from("blind-rpc");
+    let entity = PlaceableEntity::blind(
+        entity_id.clone(),
+        GridPoint::new(2, 2),
+        Shape::new(1, 1, 1).unwrap(),
+        Blind::new(2, vec![BlindTile::empty(2).unwrap()]).unwrap(),
+    )
+    .unwrap();
+    client
+        .apply_command(ApplyCommandRequest {
+            target: target.clone(),
+            command: CommandEnvelope::new(
+                CommandMetadata::new("place-blind", "spoofed", 1),
+                LevelCommand::PlaceEntity { entity },
+            ),
+        })
+        .await
+        .unwrap();
+
+    let painted = client
+        .apply_command(ApplyCommandRequest {
+            target: target.clone(),
+            command: CommandEnvelope::new(
+                CommandMetadata::new("paint-blind", "spoofed", 1),
+                LevelCommand::PaintBlindStroke {
+                    entity_id: entity_id.clone(),
+                    color_index: 4,
+                    stroke: BlindStroke::new(vec![BlindPixel::new(0, 0), BlindPixel::new(1, 0)])
+                        .unwrap(),
+                },
+            ),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        painted.result,
+        ApplyCommandResult::Applied { ref event }
+            if event.metadata.actor.as_str() == user["id"].as_str().unwrap()
+    ));
+
+    client
+        .apply_command(ApplyCommandRequest {
+            target: target.clone(),
+            command: CommandEnvelope::new(
+                CommandMetadata::new("erase-blind", "spoofed", 1),
+                LevelCommand::EraseBlindStroke {
+                    entity_id: entity_id.clone(),
+                    stroke: BlindStroke::new(vec![BlindPixel::new(1, 0)]).unwrap(),
+                },
+            ),
+        })
+        .await
+        .unwrap();
+    client
+        .apply_command(ApplyCommandRequest {
+            target: target.clone(),
+            command: CommandEnvelope::new(
+                CommandMetadata::new("fill-blind", "spoofed", 1),
+                LevelCommand::FloodFillBlind {
+                    entity_id: entity_id.clone(),
+                    start: BlindPixel::new(1, 0),
+                    color_index: 7,
+                },
+            ),
+        })
+        .await
+        .unwrap();
+    let no_change = client
+        .apply_command(ApplyCommandRequest {
+            target: target.clone(),
+            command: CommandEnvelope::new(
+                CommandMetadata::new("fill-painted", "spoofed", 1),
+                LevelCommand::FloodFillBlind {
+                    entity_id: entity_id.clone(),
+                    start: BlindPixel::new(0, 0),
+                    color_index: 9,
+                },
+            ),
+        })
+        .await
+        .unwrap();
+    assert_eq!(no_change.result, ApplyCommandResult::NoChange);
+    assert_eq!(no_change.server_sequence, 4);
+
+    let snapshot = client.level_snapshot(target).await.unwrap();
+    let entity = snapshot.snapshot.entity(&entity_id).unwrap();
+    let blind = entity.as_blind().unwrap();
+    assert_eq!(
+        blind.color_at(entity.shape(), BlindPixel::new(0, 0)),
+        Some(4)
+    );
+    assert_eq!(
+        blind.color_at(entity.shape(), BlindPixel::new(1, 0)),
+        Some(7)
+    );
+    assert_eq!(
+        blind.color_at(entity.shape(), BlindPixel::new(0, 1)),
+        Some(7)
+    );
+    assert_eq!(
+        blind.color_at(entity.shape(), BlindPixel::new(1, 1)),
+        Some(7)
+    );
 }
 
 #[tokio::test]
@@ -591,6 +1261,94 @@ async fn subscription_starts_with_snapshot_and_skips_no_ops() {
     assert!(matches!(
         update,
         LevelSubscriptionItem::Event { event } if event.server_sequence == 1
+    ));
+}
+
+#[tokio::test]
+async fn presence_reports_connection_join_cursor_and_leave() {
+    let server = TestServer::start().await;
+    let (cookie, target, _) = create_project_level(&server.router, "presence@example.com").await;
+    let first_client = server.client(Some(&cookie)).await;
+    let second_client = server.client(Some(&cookie)).await;
+    let mut first = first_client
+        .subscribe_level_presence(target.clone())
+        .await
+        .unwrap();
+    let first_snapshot = timeout(Duration::from_secs(1), first.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let LevelPresenceItem::Snapshot {
+        self_id: first_id,
+        participants,
+        ..
+    } = first_snapshot
+    else {
+        panic!("presence subscription must start with a snapshot");
+    };
+    assert_eq!(participants.len(), 1);
+
+    let mut second = second_client
+        .subscribe_level_presence(target.clone())
+        .await
+        .unwrap();
+    let second_snapshot = timeout(Duration::from_secs(1), second.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let LevelPresenceItem::Snapshot {
+        self_id: second_id,
+        participants,
+        ..
+    } = second_snapshot
+    else {
+        panic!("presence subscription must start with a snapshot");
+    };
+    assert_ne!(first_id, second_id);
+    assert_eq!(participants.len(), 2);
+
+    let joined = timeout(Duration::from_secs(1), first.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        joined,
+        LevelPresenceItem::Joined { participant, .. } if participant.id == second_id
+    ));
+
+    second_client
+        .update_level_cursor(UpdateLevelCursorRequest {
+            target: target.clone(),
+            cursor: Some(GridPoint::new(3, 4)),
+        })
+        .await
+        .unwrap();
+    let cursor = timeout(Duration::from_secs(1), first.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        cursor,
+        LevelPresenceItem::Cursor {
+            presence_id,
+            cursor: Some(GridPoint { x: 3, y: 4 }),
+            ..
+        } if presence_id == second_id
+    ));
+
+    second.unsubscribe().await.unwrap();
+    let left = timeout(Duration::from_secs(1), first.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        left,
+        LevelPresenceItem::Left { presence_id, .. } if presence_id == second_id
     ));
 }
 

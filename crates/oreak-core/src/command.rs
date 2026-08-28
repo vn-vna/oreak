@@ -3,8 +3,38 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ActorId, BlindGuide, BlindGuidePatch, BlindGuideSet, BlindPixel, BlindStroke, BlindTile,
     BlindTilePatch, CellKind, CommandId, Decorator, DecoratorId, DirectionMode, EntityId,
-    GridPoint, LevelHash, PlaceableEntity, ShapeCell,
+    GridPoint, GridSize, LevelHash, LevelSnapshot, PlaceableEntity, ShapeCell,
 };
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GridAnchor {
+    TopLeft,
+    Top,
+    TopRight,
+    Left,
+    #[default]
+    Center,
+    Right,
+    BottomLeft,
+    Bottom,
+    BottomRight,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityMove {
+    pub entity_id: EntityId,
+    pub origin: GridPoint,
+}
+
+impl EntityMove {
+    #[must_use]
+    pub fn new(entity_id: impl Into<EntityId>, origin: GridPoint) -> Self {
+        Self {
+            entity_id: entity_id.into(),
+            origin,
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandMetadata {
@@ -26,11 +56,15 @@ impl CommandMetadata {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LevelCommandKind {
+    ResizeGrid,
+    RestoreSnapshot,
     SetCell,
     PlaceEntity,
     MoveEntity,
+    MoveEntities,
     RotateEntityClockwise,
     FlipEntityHorizontal,
+    SetBlindResolution,
     DeleteEntity,
     RestoreEntity,
     RestoreDeletedEntity,
@@ -51,6 +85,15 @@ pub enum LevelCommandKind {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LevelCommand {
+    ResizeGrid {
+        size: GridSize,
+        anchor: GridAnchor,
+    },
+    /// Exact snapshot restoration used by compensating history events.
+    #[doc(hidden)]
+    RestoreSnapshot {
+        snapshot: Box<LevelSnapshot>,
+    },
     SetCell {
         point: GridPoint,
         kind: CellKind,
@@ -62,11 +105,18 @@ pub enum LevelCommand {
         entity_id: EntityId,
         origin: GridPoint,
     },
+    MoveEntities {
+        moves: Vec<EntityMove>,
+    },
     RotateEntityClockwise {
         entity_id: EntityId,
     },
     FlipEntityHorizontal {
         entity_id: EntityId,
+    },
+    SetBlindResolution {
+        entity_id: EntityId,
+        pixels_per_cell: u8,
     },
     DeleteEntity {
         entity_id: EntityId,
@@ -146,11 +196,15 @@ impl LevelCommand {
     #[must_use]
     pub const fn kind(&self) -> LevelCommandKind {
         match self {
+            Self::ResizeGrid { .. } => LevelCommandKind::ResizeGrid,
+            Self::RestoreSnapshot { .. } => LevelCommandKind::RestoreSnapshot,
             Self::SetCell { .. } => LevelCommandKind::SetCell,
             Self::PlaceEntity { .. } => LevelCommandKind::PlaceEntity,
             Self::MoveEntity { .. } => LevelCommandKind::MoveEntity,
+            Self::MoveEntities { .. } => LevelCommandKind::MoveEntities,
             Self::RotateEntityClockwise { .. } => LevelCommandKind::RotateEntityClockwise,
             Self::FlipEntityHorizontal { .. } => LevelCommandKind::FlipEntityHorizontal,
+            Self::SetBlindResolution { .. } => LevelCommandKind::SetBlindResolution,
             Self::DeleteEntity { .. } => LevelCommandKind::DeleteEntity,
             Self::RestoreEntity { .. } => LevelCommandKind::RestoreEntity,
             Self::RestoreDeletedEntity { .. } => LevelCommandKind::RestoreDeletedEntity,
@@ -186,6 +240,7 @@ impl CommandEnvelope {
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum LevelTarget {
+    Grid,
     Cell(GridPoint),
     Entity(EntityId),
     Decorator(DecoratorId),
@@ -201,6 +256,7 @@ pub enum LevelTarget {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LevelValue {
+    Grid(Box<LevelSnapshot>),
     Cell(CellKind),
     Entity(Option<PlaceableEntity>),
     Decorator(Option<Decorator>),

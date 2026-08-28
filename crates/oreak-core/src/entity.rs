@@ -169,6 +169,25 @@ impl BlindTile {
         &self.colors
     }
 
+    /// Resamples this tile by choosing the nearest source pixel center.
+    /// Exact ties select the source pixel with the higher coordinate.
+    pub fn resampled(&self, pixels_per_cell: u8) -> Result<Self, EntityError> {
+        validate_pixels_per_cell(pixels_per_cell)?;
+        if self.pixels_per_cell == pixels_per_cell {
+            return Ok(self.clone());
+        }
+
+        let mut colors = Vec::with_capacity(tile_pixel_count(pixels_per_cell));
+        for y in 0..pixels_per_cell {
+            let source_y = nearest_source_pixel(y, self.pixels_per_cell, pixels_per_cell);
+            for x in 0..pixels_per_cell {
+                let source_x = nearest_source_pixel(x, self.pixels_per_cell, pixels_per_cell);
+                colors.push(self.color(source_x, source_y).unwrap_or_default());
+            }
+        }
+        Ok(Self::from_valid_colors(pixels_per_cell, colors))
+    }
+
     #[must_use]
     pub fn pixel(&self, x: u8, y: u8) -> Option<bool> {
         self.color(x, y).map(|color| color != 0)
@@ -332,6 +351,88 @@ impl Blind {
         self.tiles.get(tile_index)?.color(x, y)
     }
 
+    /// Resamples every occupied tile independently by nearest source pixel center.
+    ///
+    /// Guides are projected onto destination pixel adjacencies. A destination
+    /// edge is retained when its sampled source path crosses a source guide.
+    /// Source edges not sampled by any destination adjacency are dropped, and
+    /// multiple source edges may merge into one destination edge. This keeps
+    /// the result deterministic, valid, and bounded by the destination graph.
+    pub fn resampled(&self, shape: Shape, pixels_per_cell: u8) -> Result<Self, EntityError> {
+        validate_pixels_per_cell(pixels_per_cell)?;
+        if self.pixels_per_cell == pixels_per_cell {
+            return Ok(self.clone());
+        }
+
+        let tiles = self
+            .tiles
+            .iter()
+            .map(|tile| tile.resampled(pixels_per_cell))
+            .collect::<Result<Vec<_>, _>>()?;
+        let guides = self.resampled_guides(shape, pixels_per_cell);
+        Self::with_guides(pixels_per_cell, tiles, guides)
+    }
+
+    #[must_use]
+    pub fn empty_fill_region(&self, shape: Shape, start: BlindPixel) -> Vec<BlindPixel> {
+        if self.color_at(shape, start) != Some(0) {
+            return Vec::new();
+        }
+
+        let mut pending = VecDeque::from([start]);
+        let mut visited = BTreeSet::from([start]);
+        let mut region = Vec::new();
+        while let Some(pixel) = pending.pop_front() {
+            if self.color_at(shape, pixel) != Some(0) {
+                continue;
+            }
+            region.push(pixel);
+
+            for neighbor in pixel_neighbors(pixel).into_iter().flatten() {
+                if visited.contains(&neighbor) || self.color_at(shape, neighbor) != Some(0) {
+                    continue;
+                }
+                let guide = BlindGuide::from_transformed(pixel, neighbor);
+                if self.has_guide(guide) {
+                    continue;
+                }
+                visited.insert(neighbor);
+                pending.push_back(neighbor);
+            }
+        }
+        region
+    }
+
+    #[must_use]
+    pub fn paintable_partition(&self, shape: Shape, start: BlindPixel) -> Vec<BlindPixel> {
+        if self.color_at(shape, start).is_none() {
+            return Vec::new();
+        }
+
+        let mut pending = VecDeque::from([start]);
+        let mut visited = BTreeSet::from([start]);
+        let mut region = Vec::new();
+        while let Some(pixel) = pending.pop_front() {
+            if self.color_at(shape, pixel).is_none() {
+                continue;
+            }
+            region.push(pixel);
+
+            for neighbor in pixel_neighbors(pixel).into_iter().flatten() {
+                if visited.contains(&neighbor) || self.color_at(shape, neighbor).is_none() {
+                    continue;
+                }
+                let guide = BlindGuide::from_transformed(pixel, neighbor);
+                if self.has_guide(guide) {
+                    continue;
+                }
+                visited.insert(neighbor);
+                pending.push_back(neighbor);
+            }
+        }
+        region
+    }
+
     #[must_use]
     pub fn has_guide(&self, guide: BlindGuide) -> bool {
         self.guides.binary_search(&guide).is_ok()
@@ -384,34 +485,8 @@ impl Blind {
     }
 
     fn flood_fill(&mut self, shape: Shape, start: BlindPixel, color_index: u8) {
-        let Some(source_color) = self.color_at(shape, start) else {
-            return;
-        };
-        if source_color == color_index {
-            return;
-        }
-
-        let mut pending = VecDeque::from([start]);
-        let mut visited = BTreeSet::from([start]);
-        while let Some(pixel) = pending.pop_front() {
-            if self.color_at(shape, pixel) != Some(source_color) {
-                continue;
-            }
+        for pixel in self.empty_fill_region(shape, start) {
             self.set_pixel_color(shape, pixel, color_index);
-
-            for neighbor in pixel_neighbors(pixel).into_iter().flatten() {
-                if visited.contains(&neighbor)
-                    || self.color_at(shape, neighbor) != Some(source_color)
-                {
-                    continue;
-                }
-                let guide = BlindGuide::from_transformed(pixel, neighbor);
-                if self.has_guide(guide) {
-                    continue;
-                }
-                visited.insert(neighbor);
-                pending.push_back(neighbor);
-            }
         }
     }
 
@@ -483,6 +558,60 @@ impl Blind {
     fn guide_is_in_footprint(&self, shape: Shape, guide: BlindGuide) -> bool {
         self.pixel_location(shape, guide.first()).is_some()
             && self.pixel_location(shape, guide.second()).is_some()
+    }
+
+    fn resampled_guides(&self, shape: Shape, pixels_per_cell: u8) -> Vec<BlindGuide> {
+        let width = u16::from(shape.width()) * u16::from(pixels_per_cell);
+        let height = u16::from(shape.height()) * u16::from(pixels_per_cell);
+        let mut guides = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                let first = BlindPixel::new(x, y);
+                if !pixel_is_in_footprint(shape, first, pixels_per_cell) {
+                    continue;
+                }
+                for second in [
+                    x.checked_add(1)
+                        .filter(|next_x| *next_x < width)
+                        .map(|next_x| BlindPixel::new(next_x, y)),
+                    y.checked_add(1)
+                        .filter(|next_y| *next_y < height)
+                        .map(|next_y| BlindPixel::new(x, next_y)),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    if !pixel_is_in_footprint(shape, second, pixels_per_cell) {
+                        continue;
+                    }
+                    let source_first =
+                        resampled_source_pixel(first, self.pixels_per_cell, pixels_per_cell);
+                    let source_second =
+                        resampled_source_pixel(second, self.pixels_per_cell, pixels_per_cell);
+                    if self.source_path_has_guide(source_first, source_second) {
+                        guides.push(BlindGuide::from_transformed(first, second));
+                    }
+                }
+            }
+        }
+        guides
+    }
+
+    fn source_path_has_guide(&self, first: BlindPixel, second: BlindPixel) -> bool {
+        if first.y == second.y {
+            return (first.x..second.x).any(|x| {
+                self.has_guide(BlindGuide::from_transformed(
+                    BlindPixel::new(x, first.y),
+                    BlindPixel::new(x + 1, first.y),
+                ))
+            });
+        }
+        (first.y..second.y).any(|y| {
+            self.has_guide(BlindGuide::from_transformed(
+                BlindPixel::new(first.x, y),
+                BlindPixel::new(first.x, y + 1),
+            ))
+        })
     }
 }
 
@@ -597,6 +726,15 @@ impl PlaceableEntity {
         };
         let mut next = self.clone();
         next.kind = PlaceableEntityKind::Blind(blind.apply_operation(self.shape, operation)?);
+        Ok(next)
+    }
+
+    pub fn resampled_blind(&self, pixels_per_cell: u8) -> Result<Self, EntityError> {
+        let PlaceableEntityKind::Blind(blind) = &self.kind else {
+            return Err(EntityError::NotBlind(self.id.clone()));
+        };
+        let mut next = self.clone();
+        next.kind = PlaceableEntityKind::Blind(blind.resampled(self.shape, pixels_per_cell)?);
         Ok(next)
     }
 
@@ -794,6 +932,48 @@ fn pixel_neighbors(pixel: BlindPixel) -> [Option<BlindPixel>; 4] {
         pixel.y.checked_sub(1).map(|y| BlindPixel::new(pixel.x, y)),
         pixel.y.checked_add(1).map(|y| BlindPixel::new(pixel.x, y)),
     ]
+}
+
+fn nearest_source_pixel(destination: u8, source_size: u8, destination_size: u8) -> u8 {
+    let numerator = (2 * u16::from(destination) + 1) * u16::from(source_size);
+    let denominator = 2 * u16::from(destination_size);
+    (numerator / denominator) as u8
+}
+
+fn resampled_source_pixel(
+    destination: BlindPixel,
+    source_size: u8,
+    destination_size: u8,
+) -> BlindPixel {
+    let destination_size = u16::from(destination_size);
+    let source_size_u16 = u16::from(source_size);
+    let cell_x = destination.x / destination_size;
+    let cell_y = destination.y / destination_size;
+    let local_x = (destination.x % destination_size) as u8;
+    let local_y = (destination.y % destination_size) as u8;
+    BlindPixel::new(
+        cell_x * source_size_u16
+            + u16::from(nearest_source_pixel(
+                local_x,
+                source_size,
+                destination_size as u8,
+            )),
+        cell_y * source_size_u16
+            + u16::from(nearest_source_pixel(
+                local_y,
+                source_size,
+                destination_size as u8,
+            )),
+    )
+}
+
+fn pixel_is_in_footprint(shape: Shape, pixel: BlindPixel, pixels_per_cell: u8) -> bool {
+    let resolution = u16::from(pixels_per_cell);
+    let cell_x = pixel.x / resolution;
+    let cell_y = pixel.y / resolution;
+    cell_x < u16::from(shape.width())
+        && cell_y < u16::from(shape.height())
+        && shape.contains(ShapeCell::new(cell_x as u8, cell_y as u8))
 }
 
 fn bit_is_set(bits: &[u8], index: usize) -> bool {

@@ -144,6 +144,17 @@ fn flood_fill_is_four_neighbor_and_respects_guide_barriers() {
             .blame_blind_guide(&EntityId::from("blind"), bottom)
             .is_some()
     );
+    let entity = timeline
+        .snapshot()
+        .entity(&EntityId::from("blind"))
+        .unwrap();
+    let partition = entity
+        .as_blind()
+        .unwrap()
+        .paintable_partition(entity.shape(), BlindPixel::new(0, 0));
+    assert_eq!(partition.len(), 2);
+    assert!(partition.contains(&BlindPixel::new(0, 1)));
+    assert!(!partition.contains(&BlindPixel::new(1, 0)));
 
     timeline
         .apply(command(
@@ -159,6 +170,21 @@ fn flood_fill_is_four_neighbor_and_respects_guide_barriers() {
     assert_eq!(color(&timeline, "blind", BlindPixel::new(0, 1)), Some(4));
     assert_eq!(color(&timeline, "blind", BlindPixel::new(1, 0)), Some(0));
     assert_eq!(color(&timeline, "blind", BlindPixel::new(1, 1)), Some(0));
+
+    let event_count = timeline.events().len();
+    let painted_fill = timeline
+        .apply(command(
+            "fill-painted",
+            LevelCommand::FloodFillBlind {
+                entity_id: EntityId::from("blind"),
+                start: BlindPixel::new(0, 0),
+                color_index: 7,
+            },
+        ))
+        .unwrap();
+    assert!(matches!(painted_fill, ApplyOutcome::NoChange { .. }));
+    assert_eq!(timeline.events().len(), event_count);
+    assert_eq!(color(&timeline, "blind", BlindPixel::new(0, 0)), Some(4));
 
     let event_count = timeline.events().len();
     let outcome = timeline

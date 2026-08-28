@@ -18,13 +18,15 @@ use axum::{
         header::{COOKIE, RETRY_AFTER, SET_COOKIE},
     },
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
+use oreak_core::{MAX_BLOCK_SHAPE_AXIS, Shape};
 use oreak_plugin_api::MANIFEST_FORMAT_VERSION;
 use oreak_project::{
-    ApprovalPolicy, AuditAction, AuditContext, AuditEvent, AuditEventId, Capability, LevelId,
-    Project, ProjectError, ProjectId, ProjectRole, ReleaseChannelId, ReleaseGate, ThemeId,
-    TimestampMs, UserId, Workspace, WorkspaceError, WorkspaceId, WorkspaceKind, WorkspaceRole,
+    ApprovalPolicy, AuditAction, AuditContext, AuditEvent, AuditEventId, Capability, InvitationId,
+    LevelConfiguration, LevelId, Project, ProjectError, ProjectId, ProjectInvitationState,
+    ProjectRole, ReleaseChannelId, ReleaseGate, ThemeId, TimestampMs, UserId, Workspace,
+    WorkspaceError, WorkspaceId, WorkspaceKind, WorkspaceRole,
 };
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
@@ -177,7 +179,17 @@ struct WorkspaceRecord {
 struct ProjectRecord {
     name: String,
     project: Project,
-    level_names: BTreeMap<LevelId, String>,
+    shape_catalog: Vec<ShapeCatalogRecord>,
+}
+
+struct ShapeCatalogRecord {
+    id: String,
+    name: String,
+    shape: Shape,
+    created_by: UserId,
+    created_at_ms: i64,
+    updated_by: UserId,
+    updated_at_ms: i64,
 }
 
 struct RateLimiter {
@@ -291,15 +303,18 @@ impl ApiError {
 
     fn project(error: ProjectError) -> Self {
         let status = match &error {
-            ProjectError::PermissionDenied { .. } | ProjectError::ProjectOwnerRequired => {
-                StatusCode::FORBIDDEN
-            }
-            ProjectError::LevelNotFound(_) | ProjectError::ReleaseChannelNotFound(_) => {
-                StatusCode::NOT_FOUND
-            }
-            ProjectError::DuplicateLevel(_) | ProjectError::DuplicateReleaseChannel(_) => {
-                StatusCode::CONFLICT
-            }
+            ProjectError::PermissionDenied { .. }
+            | ProjectError::ProjectOwnerRequired
+            | ProjectError::InvitationNotForActor => StatusCode::FORBIDDEN,
+            ProjectError::LevelNotFound(_)
+            | ProjectError::ReleaseChannelNotFound(_)
+            | ProjectError::MemberNotFound(_)
+            | ProjectError::InvitationNotFound(_) => StatusCode::NOT_FOUND,
+            ProjectError::DuplicateLevel(_)
+            | ProjectError::DuplicateReleaseChannel(_)
+            | ProjectError::DuplicateInvitation(_)
+            | ProjectError::PendingInvitationExists(_)
+            | ProjectError::AlreadyMember(_) => StatusCode::CONFLICT,
             _ => StatusCode::BAD_REQUEST,
         };
         Self::new(status, error.to_string())
@@ -398,6 +413,20 @@ struct ProjectSummary {
     capabilities: Vec<String>,
     level_count: usize,
     plugin_manifest_format_version: u32,
+    default_theme: String,
+}
+
+#[derive(Serialize)]
+struct CatalogSnapshot {
+    workspaces: Vec<WorkspaceSummary>,
+    projects: Vec<CatalogProject>,
+    invitations: Vec<ProjectInvitationSummary>,
+}
+
+#[derive(Serialize)]
+struct CatalogProject {
+    project: ProjectSummary,
+    levels: Vec<LevelSummary>,
 }
 
 #[derive(Serialize)]
@@ -414,9 +443,55 @@ struct MembershipSummary {
     joined_at_ms: i64,
 }
 
+#[derive(Serialize)]
+struct ProjectConfiguration {
+    project: ProjectSummary,
+    members: Vec<MembershipSummary>,
+    invitations: Vec<ProjectInvitationSummary>,
+    members_visible: bool,
+}
+
+#[derive(Clone, Serialize)]
+struct ProjectInvitationSummary {
+    id: InvitationId,
+    project_id: ProjectId,
+    project_name: String,
+    invitee_email: String,
+    roles: Vec<String>,
+    invited_by: UserId,
+    invited_at_ms: i64,
+    expires_at_ms: Option<i64>,
+}
+
 #[derive(Deserialize)]
+struct InviteProjectMemberRequest {
+    email: String,
+    roles: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct UpdateProjectMemberRequest {
+    roles: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct UpdateProjectConfigurationRequest {
+    default_theme: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreateLevelRequest {
     name: String,
+    #[serde(default)]
+    duration_seconds: f64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateLevelConfigurationRequest {
+    name: String,
+    duration_seconds: f64,
 }
 
 #[derive(Serialize)]
@@ -428,7 +503,44 @@ struct LevelList {
 struct LevelSummary {
     id: LevelId,
     name: String,
+    duration_seconds: f64,
     revision_count: usize,
+}
+
+#[derive(Deserialize)]
+struct SaveShapeCatalogEntryRequest {
+    name: String,
+    shape: Shape,
+}
+
+#[derive(Serialize)]
+struct ShapeCatalogList {
+    shapes: Vec<ShapeCatalogEntry>,
+}
+
+#[derive(Serialize)]
+struct ShapeCatalogEntry {
+    id: String,
+    name: String,
+    shape: Shape,
+    created_by: UserId,
+    created_at_ms: i64,
+    updated_by: UserId,
+    updated_at_ms: i64,
+}
+
+impl From<&ShapeCatalogRecord> for ShapeCatalogEntry {
+    fn from(record: &ShapeCatalogRecord) -> Self {
+        Self {
+            id: record.id.clone(),
+            name: record.name.clone(),
+            shape: record.shape,
+            created_by: record.created_by.clone(),
+            created_at_ms: record.created_at_ms,
+            updated_by: record.updated_by.clone(),
+            updated_at_ms: record.updated_at_ms,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -478,6 +590,7 @@ pub(crate) fn router(state: MvpState) -> Router {
         .route("/api/auth/login", post(login))
         .route("/api/auth/logout", post(logout))
         .route("/api/auth/me", get(me))
+        .route("/api/catalog", get(get_catalog))
         .route(
             "/api/workspaces",
             get(list_workspaces).post(create_workspace),
@@ -492,8 +605,36 @@ pub(crate) fn router(state: MvpState) -> Router {
             get(list_project_members),
         )
         .route(
+            "/api/projects/{project_id}/members/{member_id}",
+            put(update_project_member),
+        )
+        .route(
+            "/api/projects/{project_id}/configuration",
+            get(get_project_configuration).put(update_project_configuration),
+        )
+        .route(
+            "/api/projects/{project_id}/invitations",
+            post(invite_project_member),
+        )
+        .route(
+            "/api/projects/{project_id}/invitations/{invitation_id}/accept",
+            post(accept_project_invitation),
+        )
+        .route(
             "/api/projects/{project_id}/levels",
             get(list_levels).post(create_level),
+        )
+        .route(
+            "/api/projects/{project_id}/levels/{level_id}/configuration",
+            get(get_level_configuration).put(update_level_configuration),
+        )
+        .route(
+            "/api/projects/{project_id}/shapes",
+            get(list_shape_catalog).post(create_shape_catalog_entry),
+        )
+        .route(
+            "/api/projects/{project_id}/shapes/{shape_id}",
+            put(update_shape_catalog_entry).delete(delete_shape_catalog_entry),
         )
         .route("/api/projects/{project_id}/audit", get(list_project_audit))
         .route(
@@ -658,6 +799,73 @@ async fn me(
     Ok(Json(UserSummary::from(user)))
 }
 
+async fn get_catalog(
+    State(state): State<MvpState>,
+    headers: HeaderMap,
+) -> Result<Json<CatalogSnapshot>, ApiError> {
+    let user_id = authenticate(&state, &headers).await?;
+    let now = now_timestamp()?;
+    let store = state.store.read().await;
+    let mut visible_workspace_ids = store
+        .workspaces
+        .values()
+        .filter(|record| record.workspace.members().contains_key(&user_id))
+        .map(|record| record.workspace.id().clone())
+        .collect::<BTreeSet<_>>();
+    let mut projects = store
+        .projects
+        .values()
+        .filter(|record| has_project_access(&store, record, &user_id, ProjectAccess::View))
+        .filter_map(|record| {
+            visible_workspace_ids.insert(record.project.workspace_id().clone());
+            Some(CatalogProject {
+                project: project_summary(&store, record, &user_id)?,
+                levels: level_summaries(record),
+            })
+        })
+        .collect::<Vec<_>>();
+    projects.sort_by(|left, right| {
+        left.project
+            .name
+            .to_ascii_lowercase()
+            .cmp(&right.project.name.to_ascii_lowercase())
+            .then_with(|| left.project.id.cmp(&right.project.id))
+    });
+    let mut workspaces = visible_workspace_ids
+        .into_iter()
+        .filter_map(|workspace_id| {
+            store
+                .workspaces
+                .get(&workspace_id)
+                .map(|record| workspace_summary(record, &user_id))
+        })
+        .collect::<Vec<_>>();
+    for workspace in &mut workspaces {
+        workspace.project_count = projects
+            .iter()
+            .filter(|project| project.project.workspace_id.as_str() == workspace.id.as_str())
+            .count();
+    }
+    workspaces.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let mut invitations = pending_invitations_for(&store, &user_id, now);
+    invitations.sort_by(|left, right| {
+        left.project_name
+            .to_ascii_lowercase()
+            .cmp(&right.project_name.to_ascii_lowercase())
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    Ok(Json(CatalogSnapshot {
+        workspaces,
+        projects,
+        invitations,
+    }))
+}
+
 async fn list_workspaces(
     State(state): State<MvpState>,
     headers: HeaderMap,
@@ -745,7 +953,7 @@ async fn create_project(
         project_id.clone(),
         input.workspace_id.clone(),
         user_id.clone(),
-        ThemeId::new("default").expect("the fixed theme ID is valid"),
+        ThemeId::new("dark").expect("the fixed theme ID is valid"),
         ApprovalPolicy::new(true, 1, BTreeSet::new()).expect("the fixed approval policy is valid"),
         ReleaseGate::default(),
         audit_context(&user_id)?,
@@ -754,7 +962,7 @@ async fn create_project(
     let record = ProjectRecord {
         name,
         project,
-        level_names: BTreeMap::new(),
+        shape_catalog: Vec::new(),
     };
 
     let mut store = state.store.write().await;
@@ -823,6 +1031,160 @@ async fn list_project_members(
     Ok(Json(MembershipList { members }))
 }
 
+async fn get_project_configuration(
+    State(state): State<MvpState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Json<ProjectConfiguration>, ApiError> {
+    let user_id = authenticate(&state, &headers).await?;
+    let project_id = parse_project_id(project_id)?;
+    let now = now_timestamp()?;
+    let store = state.store.read().await;
+    let record = authorized_project(&store, &project_id, &user_id, ProjectAccess::View)?;
+    let members_visible =
+        has_project_access(&store, record, &user_id, ProjectAccess::Administration);
+    let members = if members_visible {
+        membership_summaries(&store, record)
+    } else {
+        Vec::new()
+    };
+    let invitations = if members_visible {
+        pending_invitations_for_project(&store, record, now)
+    } else {
+        Vec::new()
+    };
+    Ok(Json(ProjectConfiguration {
+        project: project_summary(&store, record, &user_id).ok_or_else(ApiError::internal)?,
+        members,
+        invitations,
+        members_visible,
+    }))
+}
+
+async fn invite_project_member(
+    State(state): State<MvpState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(input): Json<InviteProjectMemberRequest>,
+) -> Result<(StatusCode, Json<ProjectInvitationSummary>), ApiError> {
+    let user_id = authenticate(&state, &headers).await?;
+    let project_id = parse_project_id(project_id)?;
+    let email = normalize_email(&input.email)?;
+    let roles = parse_project_roles(input.roles)?;
+    let invitation_id =
+        InvitationId::new(random_identifier("pinv")?).map_err(|_| ApiError::internal())?;
+    let context = audit_context(&user_id)?;
+    let mut store = state.store.write().await;
+    let invitee = store
+        .user_ids_by_email
+        .get(&email)
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("registered user"))?;
+    let record = store
+        .projects
+        .get_mut(&project_id)
+        .ok_or_else(|| ApiError::not_found("project"))?;
+    record
+        .project
+        .invite_member(invitation_id.clone(), invitee, roles, None, context)
+        .map_err(ApiError::project)?;
+    let invitation = record
+        .project
+        .invitations()
+        .get(&invitation_id)
+        .expect("the invitation was inserted");
+    let summary = project_invitation_summary(record, invitation, email);
+    Ok((StatusCode::CREATED, Json(summary)))
+}
+
+async fn accept_project_invitation(
+    State(state): State<MvpState>,
+    headers: HeaderMap,
+    Path((project_id, invitation_id)): Path<(String, String)>,
+) -> Result<Json<ProjectSummary>, ApiError> {
+    let user_id = authenticate(&state, &headers).await?;
+    let project_id = parse_project_id(project_id)?;
+    let invitation_id =
+        InvitationId::new(invitation_id).map_err(|_| ApiError::not_found("project invitation"))?;
+    let context = audit_context(&user_id)?;
+    let mut store = state.store.write().await;
+    let record = store
+        .projects
+        .get_mut(&project_id)
+        .ok_or_else(|| ApiError::not_found("project"))?;
+    record
+        .project
+        .accept_invitation(&invitation_id, context)
+        .map_err(ApiError::project)?;
+    let record = store
+        .projects
+        .get(&project_id)
+        .expect("the project was checked");
+    Ok(Json(
+        project_summary(&store, record, &user_id).ok_or_else(ApiError::internal)?,
+    ))
+}
+
+async fn update_project_member(
+    State(state): State<MvpState>,
+    headers: HeaderMap,
+    Path((project_id, member_id)): Path<(String, String)>,
+    Json(input): Json<UpdateProjectMemberRequest>,
+) -> Result<Json<MembershipSummary>, ApiError> {
+    let user_id = authenticate(&state, &headers).await?;
+    let project_id = parse_project_id(project_id)?;
+    let member_id = UserId::new(member_id).map_err(|_| ApiError::not_found("project member"))?;
+    let roles = parse_project_roles(input.roles)?;
+    let context = audit_context(&user_id)?;
+    let mut store = state.store.write().await;
+    let record = store
+        .projects
+        .get_mut(&project_id)
+        .ok_or_else(|| ApiError::not_found("project"))?;
+    record
+        .project
+        .set_member_roles(&member_id, roles, context)
+        .map_err(ApiError::project)?;
+    let record = store
+        .projects
+        .get(&project_id)
+        .expect("the project was checked");
+    membership_summary(&store, record, &member_id)
+        .ok_or_else(ApiError::internal)
+        .map(Json)
+}
+
+async fn update_project_configuration(
+    State(state): State<MvpState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(input): Json<UpdateProjectConfigurationRequest>,
+) -> Result<Json<ProjectSummary>, ApiError> {
+    let user_id = authenticate(&state, &headers).await?;
+    let project_id = parse_project_id(project_id)?;
+    let theme = match input.default_theme.as_str() {
+        "dark" | "light" => ThemeId::new(input.default_theme).map_err(|_| ApiError::internal())?,
+        _ => return Err(ApiError::bad_request("theme must be 'dark' or 'light'")),
+    };
+    let context = audit_context(&user_id)?;
+    let mut store = state.store.write().await;
+    let record = store
+        .projects
+        .get_mut(&project_id)
+        .ok_or_else(|| ApiError::not_found("project"))?;
+    record
+        .project
+        .set_default_theme(theme, context)
+        .map_err(ApiError::project)?;
+    let record = store
+        .projects
+        .get(&project_id)
+        .expect("the project was checked");
+    Ok(Json(
+        project_summary(&store, record, &user_id).ok_or_else(ApiError::internal)?,
+    ))
+}
+
 async fn list_levels(
     State(state): State<MvpState>,
     headers: HeaderMap,
@@ -838,11 +1200,8 @@ async fn list_levels(
         .values()
         .map(|timeline| LevelSummary {
             id: timeline.level_id().clone(),
-            name: record
-                .level_names
-                .get(timeline.level_id())
-                .cloned()
-                .unwrap_or_else(|| timeline.level_id().to_string()),
+            name: timeline.configuration().name().to_owned(),
+            duration_seconds: timeline.configuration().duration_seconds(),
             revision_count: timeline.revisions().len(),
         })
         .collect();
@@ -858,6 +1217,8 @@ async fn create_level(
     let user_id = authenticate(&state, &headers).await?;
     let project_id = parse_project_id(project_id)?;
     let name = validate_name(input.name)?;
+    let configuration =
+        LevelConfiguration::new(name, input.duration_seconds).map_err(ApiError::project)?;
     let level_id = LevelId::new(random_identifier("lvl")?).map_err(|_| ApiError::internal())?;
     let context = audit_context(&user_id)?;
     let mut store = state.store.write().await;
@@ -868,17 +1229,167 @@ async fn create_level(
         .expect("project was authorized");
     record
         .project
-        .create_level(level_id.clone(), context)
+        .create_level(level_id.clone(), configuration.clone(), context)
         .map_err(ApiError::project)?;
-    record.level_names.insert(level_id.clone(), name.clone());
     Ok((
         StatusCode::CREATED,
         Json(LevelSummary {
             id: level_id,
-            name,
+            name: configuration.name().to_owned(),
+            duration_seconds: configuration.duration_seconds(),
             revision_count: 0,
         }),
     ))
+}
+
+async fn get_level_configuration(
+    State(state): State<MvpState>,
+    headers: HeaderMap,
+    Path((project_id, level_id)): Path<(String, String)>,
+) -> Result<Json<LevelConfiguration>, ApiError> {
+    let user_id = authenticate(&state, &headers).await?;
+    let project_id = parse_project_id(project_id)?;
+    let level_id = parse_level_id(level_id)?;
+    let store = state.store.read().await;
+    let record = authorized_project(&store, &project_id, &user_id, ProjectAccess::View)?;
+    let configuration = record
+        .project
+        .timelines()
+        .get(&level_id)
+        .ok_or_else(|| ApiError::not_found("level"))?
+        .configuration()
+        .clone();
+    Ok(Json(configuration))
+}
+
+async fn update_level_configuration(
+    State(state): State<MvpState>,
+    headers: HeaderMap,
+    Path((project_id, level_id)): Path<(String, String)>,
+    Json(input): Json<UpdateLevelConfigurationRequest>,
+) -> Result<Json<LevelConfiguration>, ApiError> {
+    let user_id = authenticate(&state, &headers).await?;
+    let project_id = parse_project_id(project_id)?;
+    let level_id = parse_level_id(level_id)?;
+    let name = validate_name(input.name)?;
+    let configuration =
+        LevelConfiguration::new(name, input.duration_seconds).map_err(ApiError::project)?;
+    let context = audit_context(&user_id)?;
+    let mut store = state.store.write().await;
+    authorized_project(&store, &project_id, &user_id, ProjectAccess::EditLevel)?;
+    let record = store
+        .projects
+        .get_mut(&project_id)
+        .expect("project was authorized");
+    record
+        .project
+        .set_level_configuration(&level_id, configuration, context)
+        .map_err(ApiError::project)?;
+    Ok(Json(
+        record.project.timelines()[&level_id]
+            .configuration()
+            .clone(),
+    ))
+}
+
+async fn list_shape_catalog(
+    State(state): State<MvpState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Json<ShapeCatalogList>, ApiError> {
+    let user_id = authenticate(&state, &headers).await?;
+    let project_id = parse_project_id(project_id)?;
+    let store = state.store.read().await;
+    let record = authorized_project(&store, &project_id, &user_id, ProjectAccess::View)?;
+    Ok(Json(ShapeCatalogList {
+        shapes: record
+            .shape_catalog
+            .iter()
+            .map(ShapeCatalogEntry::from)
+            .collect(),
+    }))
+}
+
+async fn create_shape_catalog_entry(
+    State(state): State<MvpState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Json(input): Json<SaveShapeCatalogEntryRequest>,
+) -> Result<(StatusCode, Json<ShapeCatalogEntry>), ApiError> {
+    let user_id = authenticate(&state, &headers).await?;
+    let project_id = parse_project_id(project_id)?;
+    let name = validate_name(input.name)?;
+    validate_catalog_shape(input.shape)?;
+    let id = random_identifier("shp")?;
+    let occurred_at_ms = now_timestamp()?.as_i64();
+    let mut store = state.store.write().await;
+    authorized_project(&store, &project_id, &user_id, ProjectAccess::EditLevel)?;
+    let record = store
+        .projects
+        .get_mut(&project_id)
+        .expect("project was authorized");
+    let entry = ShapeCatalogRecord {
+        id,
+        name,
+        shape: input.shape,
+        created_by: user_id.clone(),
+        created_at_ms: occurred_at_ms,
+        updated_by: user_id,
+        updated_at_ms: occurred_at_ms,
+    };
+    let summary = ShapeCatalogEntry::from(&entry);
+    record.shape_catalog.push(entry);
+    Ok((StatusCode::CREATED, Json(summary)))
+}
+
+async fn update_shape_catalog_entry(
+    State(state): State<MvpState>,
+    headers: HeaderMap,
+    Path((project_id, shape_id)): Path<(String, String)>,
+    Json(input): Json<SaveShapeCatalogEntryRequest>,
+) -> Result<Json<ShapeCatalogEntry>, ApiError> {
+    let user_id = authenticate(&state, &headers).await?;
+    let project_id = parse_project_id(project_id)?;
+    let name = validate_name(input.name)?;
+    validate_catalog_shape(input.shape)?;
+    let occurred_at_ms = now_timestamp()?.as_i64();
+    let mut store = state.store.write().await;
+    authorized_project(&store, &project_id, &user_id, ProjectAccess::EditLevel)?;
+    let entry = store
+        .projects
+        .get_mut(&project_id)
+        .expect("project was authorized")
+        .shape_catalog
+        .iter_mut()
+        .find(|entry| entry.id == shape_id)
+        .ok_or_else(|| ApiError::not_found("shape"))?;
+    entry.name = name;
+    entry.shape = input.shape;
+    entry.updated_by = user_id;
+    entry.updated_at_ms = occurred_at_ms;
+    Ok(Json(ShapeCatalogEntry::from(&*entry)))
+}
+
+async fn delete_shape_catalog_entry(
+    State(state): State<MvpState>,
+    headers: HeaderMap,
+    Path((project_id, shape_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let user_id = authenticate(&state, &headers).await?;
+    let project_id = parse_project_id(project_id)?;
+    let mut store = state.store.write().await;
+    authorized_project(&store, &project_id, &user_id, ProjectAccess::EditLevel)?;
+    let catalog = &mut store
+        .projects
+        .get_mut(&project_id)
+        .expect("project was authorized")
+        .shape_catalog;
+    let index = catalog
+        .iter()
+        .position(|entry| entry.id == shape_id)
+        .ok_or_else(|| ApiError::not_found("shape"))?;
+    catalog.remove(index);
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_project_audit(
@@ -1182,6 +1693,19 @@ fn parse_project_id(value: String) -> Result<ProjectId, ApiError> {
     ProjectId::new(value).map_err(|_| ApiError::not_found("project"))
 }
 
+fn parse_level_id(value: String) -> Result<LevelId, ApiError> {
+    LevelId::new(value).map_err(|_| ApiError::not_found("level"))
+}
+
+fn validate_catalog_shape(shape: Shape) -> Result<(), ApiError> {
+    if shape.width() > MAX_BLOCK_SHAPE_AXIS || shape.height() > MAX_BLOCK_SHAPE_AXIS {
+        return Err(ApiError::bad_request(format!(
+            "project shapes cannot exceed {MAX_BLOCK_SHAPE_AXIS} x {MAX_BLOCK_SHAPE_AXIS}"
+        )));
+    }
+    Ok(())
+}
+
 fn workspace_summary(record: &WorkspaceRecord, user_id: &UserId) -> WorkspaceSummary {
     let role = record
         .workspace
@@ -1233,7 +1757,140 @@ fn project_summary(
         capabilities,
         level_count: record.project.timelines().len(),
         plugin_manifest_format_version: MANIFEST_FORMAT_VERSION,
+        default_theme: record.project.default_theme().to_string(),
     })
+}
+
+fn level_summaries(record: &ProjectRecord) -> Vec<LevelSummary> {
+    let mut levels = record
+        .project
+        .timelines()
+        .values()
+        .map(|timeline| LevelSummary {
+            id: timeline.level_id().clone(),
+            name: timeline.configuration().name().to_owned(),
+            duration_seconds: timeline.configuration().duration_seconds(),
+            revision_count: timeline.revisions().len(),
+        })
+        .collect::<Vec<_>>();
+    levels.sort_by(|left, right| {
+        left.name
+            .to_ascii_lowercase()
+            .cmp(&right.name.to_ascii_lowercase())
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    levels
+}
+
+fn membership_summaries(store: &MemoryStore, record: &ProjectRecord) -> Vec<MembershipSummary> {
+    record
+        .project
+        .members()
+        .keys()
+        .filter_map(|member_id| membership_summary(store, record, member_id))
+        .collect()
+}
+
+fn membership_summary(
+    store: &MemoryStore,
+    record: &ProjectRecord,
+    member_id: &UserId,
+) -> Option<MembershipSummary> {
+    let member = record.project.members().get(member_id)?;
+    Some(MembershipSummary {
+        user_id: member.user_id().clone(),
+        email: store
+            .users
+            .get(member.user_id())
+            .map(|user| user.email.clone()),
+        roles: member.roles().iter().map(role_name).collect(),
+        capabilities: record
+            .project
+            .capabilities_for(member.user_id())
+            .iter()
+            .map(capability_name)
+            .collect(),
+        joined_at_ms: member.joined_at().as_i64(),
+    })
+}
+
+fn pending_invitations_for(
+    store: &MemoryStore,
+    invitee: &UserId,
+    now: TimestampMs,
+) -> Vec<ProjectInvitationSummary> {
+    store
+        .projects
+        .values()
+        .flat_map(|record| {
+            record
+                .project
+                .invitations()
+                .values()
+                .filter(|invitation| invitation.invitee() == invitee)
+                .filter(|invitation| invitation_is_active(invitation, now))
+                .filter_map(|invitation| {
+                    let email = store.users.get(invitee)?.email.clone();
+                    Some(project_invitation_summary(record, invitation, email))
+                })
+        })
+        .collect()
+}
+
+fn pending_invitations_for_project(
+    store: &MemoryStore,
+    record: &ProjectRecord,
+    now: TimestampMs,
+) -> Vec<ProjectInvitationSummary> {
+    record
+        .project
+        .invitations()
+        .values()
+        .filter(|invitation| invitation_is_active(invitation, now))
+        .filter_map(|invitation| {
+            let email = store.users.get(invitation.invitee())?.email.clone();
+            Some(project_invitation_summary(record, invitation, email))
+        })
+        .collect()
+}
+
+fn invitation_is_active(invitation: &oreak_project::ProjectInvitation, now: TimestampMs) -> bool {
+    invitation.state() == ProjectInvitationState::Pending
+        && invitation
+            .expires_at()
+            .is_none_or(|expiry| expiry.as_i64() > now.as_i64())
+}
+
+fn project_invitation_summary(
+    record: &ProjectRecord,
+    invitation: &oreak_project::ProjectInvitation,
+    invitee_email: String,
+) -> ProjectInvitationSummary {
+    ProjectInvitationSummary {
+        id: invitation.id().clone(),
+        project_id: record.project.id().clone(),
+        project_name: record.name.clone(),
+        invitee_email,
+        roles: invitation.roles().iter().map(role_name).collect(),
+        invited_by: invitation.invited_by().clone(),
+        invited_at_ms: invitation.invited_at().as_i64(),
+        expires_at_ms: invitation.expires_at().map(TimestampMs::as_i64),
+    }
+}
+
+fn parse_project_roles(roles: Vec<String>) -> Result<BTreeSet<ProjectRole>, ApiError> {
+    roles
+        .into_iter()
+        .map(|role| match role.as_str() {
+            "owner" => Ok(ProjectRole::owner()),
+            "admin" => Ok(ProjectRole::admin()),
+            "editor" => Ok(ProjectRole::editor()),
+            "viewer" => Ok(ProjectRole::viewer()),
+            _ => Err(ApiError::bad_request(format!(
+                "unsupported project role '{role}'"
+            ))),
+        })
+        .collect()
 }
 
 fn authorized_project<'a>(
@@ -1411,7 +2068,7 @@ mod tests {
         let record = ProjectRecord {
             name: "Project".to_owned(),
             project,
-            level_names: BTreeMap::new(),
+            shape_catalog: Vec::new(),
         };
         assert!(has_project_access(
             &store,

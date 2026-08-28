@@ -31,8 +31,8 @@ pub use permissions::{
     owner_capabilities, viewer_capabilities,
 };
 pub use project::{
-    LevelTimeline, Project, ProjectError, ProjectInvitation, ProjectInvitationState, ProjectMember,
-    TimelineRevision,
+    LevelConfiguration, LevelTimeline, Project, ProjectError, ProjectInvitation,
+    ProjectInvitationState, ProjectMember, TimelineRevision,
 };
 pub use release::{
     Artifact, ArtifactInput, CodecCertifications, MissingCertifications, OpaqueCertification,

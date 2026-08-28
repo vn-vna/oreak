@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use thiserror::Error;
 
 use crate::{
@@ -135,9 +135,66 @@ impl TimelineRevision {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct LevelConfiguration {
+    name: String,
+    duration_seconds: f64,
+}
+
+impl Eq for LevelConfiguration {}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SerializedLevelConfiguration {
+    name: String,
+    duration_seconds: f64,
+}
+
+impl<'de> Deserialize<'de> for LevelConfiguration {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let configuration = SerializedLevelConfiguration::deserialize(deserializer)?;
+        Self::new(configuration.name, configuration.duration_seconds).map_err(D::Error::custom)
+    }
+}
+
+impl LevelConfiguration {
+    pub fn new(name: impl Into<String>, duration_seconds: f64) -> Result<Self, ProjectError> {
+        let name = name.into();
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(ProjectError::EmptyName);
+        }
+        if !duration_seconds.is_finite() || duration_seconds < 0.0 {
+            return Err(ProjectError::InvalidLevelDuration);
+        }
+        Ok(Self {
+            name: name.to_owned(),
+            duration_seconds: if duration_seconds == 0.0 {
+                0.0
+            } else {
+                duration_seconds
+            },
+        })
+    }
+
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    #[must_use]
+    pub const fn duration_seconds(&self) -> f64 {
+        self.duration_seconds
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LevelTimeline {
     level_id: LevelId,
+    configuration: LevelConfiguration,
     revisions: Vec<TimelineRevision>,
 }
 
@@ -145,6 +202,11 @@ impl LevelTimeline {
     #[must_use]
     pub const fn level_id(&self) -> &LevelId {
         &self.level_id
+    }
+
+    #[must_use]
+    pub const fn configuration(&self) -> &LevelConfiguration {
+        &self.configuration
     }
 
     #[must_use]
@@ -650,6 +712,7 @@ impl Project {
     pub fn create_level(
         &mut self,
         level_id: LevelId,
+        configuration: LevelConfiguration,
         context: AuditContext,
     ) -> Result<(), ProjectError> {
         self.ensure_fresh_audit(&context.event_id)?;
@@ -661,10 +724,36 @@ impl Project {
             level_id.clone(),
             LevelTimeline {
                 level_id: level_id.clone(),
+                configuration,
                 revisions: Vec::new(),
             },
         );
         self.append_audit(context, AuditAction::LevelCreated { level_id });
+        Ok(())
+    }
+
+    pub fn set_level_configuration(
+        &mut self,
+        level_id: &LevelId,
+        configuration: LevelConfiguration,
+        context: AuditContext,
+    ) -> Result<(), ProjectError> {
+        self.ensure_fresh_audit(&context.event_id)?;
+        self.require(&context.actor, Capability::EditTimeline)?;
+        let timeline = self
+            .timelines
+            .get_mut(level_id)
+            .ok_or_else(|| ProjectError::LevelNotFound(level_id.clone()))?;
+        if timeline.configuration == configuration {
+            return Err(ProjectError::NoChange);
+        }
+        timeline.configuration = configuration;
+        self.append_audit(
+            context,
+            AuditAction::LevelConfigurationChanged {
+                level_id: level_id.clone(),
+            },
+        );
         Ok(())
     }
 
@@ -1336,6 +1425,8 @@ pub enum ProjectError {
     DuplicateLevel(LevelId),
     #[error("level '{0}' was not found")]
     LevelNotFound(LevelId),
+    #[error("level duration must be finite and nonnegative")]
+    InvalidLevelDuration,
     #[error("revision '{0}' already exists")]
     DuplicateRevision(RevisionId),
     #[error("revision '{0}' was not found on the level timeline")]
@@ -1440,6 +1531,10 @@ mod tests {
         values.iter().cloned().collect()
     }
 
+    fn level_configuration(name: &str) -> LevelConfiguration {
+        LevelConfiguration::new(name, 0.0).unwrap()
+    }
+
     fn add_member(project: &mut Project, name: &str, member_roles: BTreeSet<ProjectRole>, at: i64) {
         let invitation_id = InvitationId::new(format!("invite-{name}")).unwrap();
         project
@@ -1463,7 +1558,11 @@ mod tests {
         let level_id = LevelId::new("level").unwrap();
         let revision_id = RevisionId::new("revision-1").unwrap();
         project
-            .create_level(level_id.clone(), audit("level-created", actor, 10))
+            .create_level(
+                level_id.clone(),
+                level_configuration("Level"),
+                audit("level-created", actor, 10),
+            )
             .unwrap();
         project
             .append_timeline_revision(
@@ -1502,6 +1601,7 @@ mod tests {
         let mut project = project();
         let result = project.create_level(
             LevelId::new("unauthorized").unwrap(),
+            level_configuration("Unauthorized"),
             audit("other-level", "organization-admin", 1),
         );
         assert_eq!(
@@ -1520,6 +1620,7 @@ mod tests {
         assert!(matches!(
             project.create_level(
                 LevelId::new("level-a").unwrap(),
+                level_configuration("Level A"),
                 audit("admin-level-a", "admin", 3)
             ),
             Err(ProjectError::PermissionDenied { .. })
@@ -1534,9 +1635,67 @@ mod tests {
         project
             .create_level(
                 LevelId::new("level-b").unwrap(),
+                level_configuration("Level B"),
                 audit("admin-level-b", "admin", 5),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn level_configuration_is_validated_and_trimmed() {
+        let configuration = LevelConfiguration::new("  Opening  ", 12.5).unwrap();
+        assert_eq!(configuration.name(), "Opening");
+        assert_eq!(configuration.duration_seconds(), 12.5);
+        assert_eq!(
+            LevelConfiguration::new("  ", 0.0),
+            Err(ProjectError::EmptyName)
+        );
+        for duration in [-1.0, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert_eq!(
+                LevelConfiguration::new("Level", duration),
+                Err(ProjectError::InvalidLevelDuration)
+            );
+        }
+    }
+
+    #[test]
+    fn level_configuration_is_owned_by_the_timeline_and_changes_are_audited() {
+        let mut project = project();
+        let level_id = LevelId::new("level").unwrap();
+        project
+            .create_level(
+                level_id.clone(),
+                LevelConfiguration::new("  Opening  ", 10.0).unwrap(),
+                audit("level-created", "owner", 1),
+            )
+            .unwrap();
+        assert_eq!(
+            project.timelines()[&level_id].configuration().name(),
+            "Opening"
+        );
+
+        project
+            .set_level_configuration(
+                &level_id,
+                LevelConfiguration::new("Finale", 30.0).unwrap(),
+                audit("level-configured", "owner", 2),
+            )
+            .unwrap();
+        let configuration = project.timelines()[&level_id].configuration();
+        assert_eq!(configuration.name(), "Finale");
+        assert_eq!(configuration.duration_seconds(), 30.0);
+        assert!(matches!(
+            project.audit_events().last().unwrap().action(),
+            AuditAction::LevelConfigurationChanged { level_id: changed } if changed == &level_id
+        ));
+        assert_eq!(
+            project.set_level_configuration(
+                &level_id,
+                configuration.clone(),
+                audit("level-unchanged", "owner", 3),
+            ),
+            Err(ProjectError::NoChange)
+        );
     }
 
     #[test]
@@ -1879,7 +2038,11 @@ mod tests {
 
         let level = LevelId::new("level").unwrap();
         project
-            .create_level(level.clone(), audit("level", "owner", 2))
+            .create_level(
+                level.clone(),
+                level_configuration("Level"),
+                audit("level", "owner", 2),
+            )
             .unwrap();
         project
             .append_timeline_revision(
@@ -1925,7 +2088,11 @@ mod tests {
         let contribution_count = project.contribution_events().len();
         let level = LevelId::new("level").unwrap();
         project
-            .create_level(level.clone(), audit("level", "owner", 1))
+            .create_level(
+                level.clone(),
+                level_configuration("Level"),
+                audit("level", "owner", 1),
+            )
             .unwrap();
         project
             .append_timeline_revision(

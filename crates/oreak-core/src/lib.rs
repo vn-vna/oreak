@@ -20,8 +20,8 @@ pub use brush::{
     MIN_BLIND_COLOR_INDEX,
 };
 pub use command::{
-    CommandEnvelope, CommandMetadata, HistoryChange, HistoryEvent, LevelCommand, LevelCommandKind,
-    LevelTarget, LevelValue,
+    CommandEnvelope, CommandMetadata, EntityMove, GridAnchor, HistoryChange, HistoryEvent,
+    LevelCommand, LevelCommandKind, LevelTarget, LevelValue,
 };
 pub use decorator::{CardinalDirection, Decorator, DecoratorKind, DirectionMode};
 pub use entity::{

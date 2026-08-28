@@ -8,7 +8,7 @@ use jsonrpsee::{
     core::{RpcResult, SubscriptionResult},
     proc_macros::rpc,
 };
-use oreak_core::{ActorId, CommandId};
+use oreak_core::{ActorId, CommandId, GridPoint};
 pub use oreak_core::{
     ApplyOutcome, CommandEnvelope, CommandMetadata, HistoryEvent, LevelHash, LevelSnapshot,
 };
@@ -202,6 +202,58 @@ pub enum LevelSubscriptionItem {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct PresenceId(String);
+
+impl PresenceId {
+    #[must_use]
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PresenceParticipant {
+    pub id: PresenceId,
+    pub actor: ActorId,
+    pub cursor: Option<GridPoint>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum LevelPresenceItem {
+    Snapshot {
+        target: ProjectLevelTarget,
+        self_id: PresenceId,
+        participants: Vec<PresenceParticipant>,
+    },
+    Joined {
+        target: ProjectLevelTarget,
+        participant: PresenceParticipant,
+    },
+    Left {
+        target: ProjectLevelTarget,
+        presence_id: PresenceId,
+    },
+    Cursor {
+        target: ProjectLevelTarget,
+        presence_id: PresenceId,
+        cursor: Option<GridPoint>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateLevelCursorRequest {
+    pub target: ProjectLevelTarget,
+    pub cursor: Option<GridPoint>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RpcErrorCode {
@@ -302,6 +354,9 @@ pub trait OreakRpc {
     #[method(name = "undo_latest", param_kind = map, with_extensions)]
     async fn undo_latest(&self, request: UndoLatestRequest) -> RpcResult<UndoLatestResponse>;
 
+    #[method(name = "update_level_cursor", param_kind = map, with_extensions)]
+    async fn update_level_cursor(&self, request: UpdateLevelCursorRequest) -> RpcResult<()>;
+
     #[subscription(
         name = "subscribe_level",
         unsubscribe = "unsubscribe_level",
@@ -310,12 +365,26 @@ pub trait OreakRpc {
         with_extensions
     )]
     async fn subscribe_level(&self, target: ProjectLevelTarget) -> SubscriptionResult;
+
+    #[subscription(
+        name = "subscribe_level_presence",
+        unsubscribe = "unsubscribe_level_presence",
+        item = LevelPresenceItem,
+        param_kind = map,
+        with_extensions
+    )]
+    async fn subscribe_level_presence(&self, target: ProjectLevelTarget) -> SubscriptionResult;
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        LevelHistoryRequest, LevelId, ProjectId, ProjectLevelTarget, RpcErrorCode, RpcErrorData,
+        ApplyCommandRequest, LevelHistoryRequest, LevelId, LevelPresenceItem, PresenceId,
+        PresenceParticipant, ProjectId, ProjectLevelTarget, RpcErrorCode, RpcErrorData,
+    };
+    use oreak_core::{
+        ActorId, BlindPixel, BlindStroke, CommandEnvelope, CommandMetadata, EntityId, EntityMove,
+        GridAnchor, GridPoint, GridSize, LevelCommand,
     };
 
     #[test]
@@ -333,6 +402,146 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&target).unwrap(),
             r#"{"project_id":"project-one","level_id":"level-one"}"#
+        );
+    }
+
+    #[test]
+    fn presence_wire_shapes_are_scoped_and_string_identified() {
+        let target = ProjectLevelTarget::new("project-one", "level-one");
+        let item = LevelPresenceItem::Snapshot {
+            target: target.clone(),
+            self_id: PresenceId::new("connection-one"),
+            participants: vec![PresenceParticipant {
+                id: PresenceId::new("connection-one"),
+                actor: ActorId::new("user-one"),
+                cursor: Some(GridPoint::new(2, 3)),
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(item).unwrap(),
+            serde_json::json!({
+                "kind": "snapshot",
+                "target": { "project_id": "project-one", "level_id": "level-one" },
+                "self_id": "connection-one",
+                "participants": [{
+                    "id": "connection-one",
+                    "actor": "user-one",
+                    "cursor": { "x": 2, "y": 3 }
+                }]
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(LevelPresenceItem::Cursor {
+                target,
+                presence_id: PresenceId::new("connection-one"),
+                cursor: None,
+            })
+            .unwrap()["cursor"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn blind_brush_commands_have_stable_wire_shapes() {
+        let target = ProjectLevelTarget::new("project-one", "level-one");
+        let metadata = CommandMetadata::new("brush-1", "client-actor", 1_000);
+        let request = ApplyCommandRequest {
+            target,
+            command: CommandEnvelope::new(
+                metadata,
+                LevelCommand::PaintBlindStroke {
+                    entity_id: EntityId::from("blind-1"),
+                    color_index: 4,
+                    stroke: BlindStroke::new(vec![
+                        BlindPixel::new(1, 0),
+                        BlindPixel::new(0, 0),
+                        BlindPixel::new(1, 0),
+                    ])
+                    .unwrap(),
+                },
+            ),
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            value["command"]["command"]["PaintBlindStroke"],
+            serde_json::json!({
+                "entity_id": "blind-1",
+                "color_index": 4,
+                "stroke": { "pixels": [{ "x": 0, "y": 0 }, { "x": 1, "y": 0 }] }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ApplyCommandRequest>(value).unwrap(),
+            request
+        );
+
+        let erase = LevelCommand::EraseBlindStroke {
+            entity_id: EntityId::from("blind-1"),
+            stroke: BlindStroke::new(vec![BlindPixel::new(2, 3)]).unwrap(),
+        };
+        assert_eq!(
+            serde_json::to_value(erase).unwrap(),
+            serde_json::json!({
+                "EraseBlindStroke": {
+                    "entity_id": "blind-1",
+                    "stroke": { "pixels": [{ "x": 2, "y": 3 }] }
+                }
+            })
+        );
+        let fill = LevelCommand::FloodFillBlind {
+            entity_id: EntityId::from("blind-1"),
+            start: BlindPixel::new(3, 7),
+            color_index: 6,
+        };
+        assert_eq!(
+            serde_json::to_value(fill).unwrap(),
+            serde_json::json!({
+                "FloodFillBlind": {
+                    "entity_id": "blind-1",
+                    "start": { "x": 3, "y": 7 },
+                    "color_index": 6
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn resize_and_group_move_commands_have_stable_ordered_wire_shapes() {
+        let resize = LevelCommand::ResizeGrid {
+            size: GridSize::new(12, 7).unwrap(),
+            anchor: GridAnchor::TopLeft,
+        };
+        assert_eq!(
+            serde_json::to_value(&resize).unwrap(),
+            serde_json::json!({
+                "ResizeGrid": {
+                    "size": { "width": 12, "height": 7 },
+                    "anchor": "TopLeft"
+                }
+            })
+        );
+
+        let moves = LevelCommand::MoveEntities {
+            moves: vec![
+                EntityMove::new("second", GridPoint::new(4, 3)),
+                EntityMove::new("first", GridPoint::new(2, 1)),
+            ],
+        };
+        let value = serde_json::to_value(&moves).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "MoveEntities": {
+                    "moves": [
+                        { "entity_id": "second", "origin": { "x": 4, "y": 3 } },
+                        { "entity_id": "first", "origin": { "x": 2, "y": 1 } }
+                    ]
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<LevelCommand>(value).unwrap(),
+            moves
         );
     }
 

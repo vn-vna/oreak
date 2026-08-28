@@ -1,5 +1,6 @@
 use oreak_core::{
-    Blind, BlindTile, CardinalDirection, CollectCapacity, DecoratorKind, GridPoint, LevelSnapshot,
+    Blind, BlindTile, CardinalDirection, CollectCapacity, CommandEnvelope, CommandMetadata,
+    DecoratorKind, EntityId, GridPoint, LevelCommand, LevelSnapshot, LevelTimeline,
     PlaceableEntity, PlaceableEntityKind,
 };
 use oreak_legacy::{
@@ -141,6 +142,132 @@ fn blind_canvas_uses_top_down_wire_rows_and_lower_left_core_tiles() {
     let patched = DataCodec::decode_gzip(encoded, wire.len()).unwrap().data;
     assert_eq!(patched, vec![0x5c, 0, 0x2b, 0, 0, 0x3c, 0, 0x4d]);
     assert_eq!(LegacyLevel::parse(&output).unwrap().snapshot(), &changed);
+}
+
+#[test]
+fn block_transforms_and_delete_remain_legacy_exportable() {
+    let board = token(&[0xff, 0xff]);
+    let shape = token(&[0x07]);
+    let json = format!(
+        r#"{{"dur":0,"bes":[4,4],"bdat":"{board}","entitites":[["block",{{"eid":"b","g":{{"r":[0,0,2,2],"d":"{shape}"}},"cc":[[1,null,-1]]}}]]}}"#
+    );
+    let level = LegacyLevel::parse(&json).unwrap();
+    let mut timeline = LevelTimeline::new(level.snapshot().clone()).unwrap();
+    for (id, command) in [
+        (
+            "move-block",
+            LevelCommand::MoveEntity {
+                entity_id: EntityId::from("b"),
+                origin: GridPoint::new(1, 1),
+            },
+        ),
+        (
+            "rotate-block",
+            LevelCommand::RotateEntityClockwise {
+                entity_id: EntityId::from("b"),
+            },
+        ),
+        (
+            "flip-block",
+            LevelCommand::FlipEntityHorizontal {
+                entity_id: EntityId::from("b"),
+            },
+        ),
+    ] {
+        timeline
+            .apply(CommandEnvelope::new(
+                CommandMetadata::new(id, "web", 100),
+                command,
+            ))
+            .unwrap();
+    }
+
+    let transformed_json = level.export(timeline.snapshot()).unwrap();
+    assert_eq!(
+        LegacyLevel::parse(&transformed_json).unwrap().snapshot(),
+        timeline.snapshot()
+    );
+
+    timeline
+        .apply(CommandEnvelope::new(
+            CommandMetadata::new("delete-block", "web", 101),
+            LevelCommand::DeleteEntity {
+                entity_id: EntityId::from("b"),
+            },
+        ))
+        .unwrap();
+    let deleted_json = level.export(timeline.snapshot()).unwrap();
+    assert!(
+        LegacyLevel::parse(&deleted_json)
+            .unwrap()
+            .snapshot()
+            .entities()
+            .is_empty()
+    );
+}
+
+#[test]
+fn blind_transforms_and_delete_without_sbln_remain_legacy_exportable() {
+    let board = token(&[0xff, 0x0f]);
+    let shape = token(&[0x03]);
+    let wire = [0x1a, 0, 0x2b, 0, 0, 0x3c, 0, 0x4d];
+    let canvas = gzip_token(&wire);
+    let json = format!(
+        r#"{{"dur":0,"bes":[4,3],"bdat":"{board}","entitites":[["pool",{{"eid":"p","g":{{"r":[0,0,2,1],"d":"{shape}"}},"stc":{{"c":{{"r":[4,2],"cmp":true,"data":"{canvas}"}}}}}}]]}}"#
+    );
+    let level = LegacyLevel::parse(&json).unwrap();
+    let mut timeline = LevelTimeline::new(level.snapshot().clone()).unwrap();
+    for (id, command) in [
+        (
+            "rotate-blind",
+            LevelCommand::RotateEntityClockwise {
+                entity_id: EntityId::from("p"),
+            },
+        ),
+        (
+            "move-blind",
+            LevelCommand::MoveEntity {
+                entity_id: EntityId::from("p"),
+                origin: GridPoint::new(2, 0),
+            },
+        ),
+        (
+            "flip-blind",
+            LevelCommand::FlipEntityHorizontal {
+                entity_id: EntityId::from("p"),
+            },
+        ),
+    ] {
+        timeline
+            .apply(CommandEnvelope::new(
+                CommandMetadata::new(id, "web", 100),
+                command,
+            ))
+            .unwrap();
+    }
+
+    let transformed_json = level.export(timeline.snapshot()).unwrap();
+    assert_eq!(
+        LegacyLevel::parse(&transformed_json).unwrap().snapshot(),
+        timeline.snapshot()
+    );
+
+    timeline
+        .apply(CommandEnvelope::new(
+            CommandMetadata::new("delete-blind", "web", 101),
+            LevelCommand::DeleteEntity {
+                entity_id: EntityId::from("p"),
+            },
+        ))
+        .unwrap();
+    let deleted_json = level.export(timeline.snapshot()).unwrap();
+    assert!(
+        LegacyLevel::parse(&deleted_json)
+            .unwrap()
+            .snapshot()
+            .entities()
+            .is_empty()
+    );
 }
 
 #[test]

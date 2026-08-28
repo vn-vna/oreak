@@ -363,6 +363,31 @@ fn malformed_and_duplicate_decorator_ownership_is_rejected() {
 }
 
 #[test]
+fn ice_and_direction_reject_blind_owners() {
+    let mut timeline = LevelTimeline::new(snapshot(vec![blind("blind", 0)], Vec::new())).unwrap();
+    for command_value in [
+        LevelCommand::SetIce {
+            decorator_id: DecoratorId::from("ice-blind"),
+            entity_id: EntityId::from("blind"),
+            blocking_count: 1,
+        },
+        LevelCommand::SetDirection {
+            decorator_id: DecoratorId::from("direction-blind"),
+            entity_id: EntityId::from("blind"),
+            mode: DirectionMode::Horizontal,
+        },
+    ] {
+        assert!(matches!(
+            timeline.apply(command("blind-decorator", command_value)),
+            Err(TimelineError::InvalidLevel(
+                LevelError::DecoratorOwnerNotBlock { .. }
+            ))
+        ));
+    }
+    assert!(timeline.events().is_empty());
+}
+
+#[test]
 fn later_owned_decorator_blocks_undo_of_entity_placement() {
     let mut timeline = LevelTimeline::new(LevelSnapshot::new(6, 6).unwrap()).unwrap();
     timeline

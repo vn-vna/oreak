@@ -106,6 +106,9 @@ pub enum AuditAction {
     LevelCreated {
         level_id: LevelId,
     },
+    LevelConfigurationChanged {
+        level_id: LevelId,
+    },
     ArtifactCreated {
         artifact_id: ArtifactId,
         candidate_id: CandidateId,

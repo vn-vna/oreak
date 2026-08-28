@@ -6,9 +6,9 @@ use thiserror::Error;
 use crate::{
     ActorId, BlindBrushOperation, BlindGuide, BlindGuidePatch, BlindTilePatch, CellKind,
     CommandEnvelope, CommandId, CommandMetadata, Decorator, DecoratorId, DecoratorKind,
-    DirectionMode, EntityError, EntityId, GridError, GridPoint, HistoryChange, HistoryEvent,
-    LevelCommand, LevelCommandKind, LevelError, LevelHash, LevelSnapshot, LevelTarget, LevelValue,
-    PlaceableEntity,
+    DirectionMode, EntityError, EntityId, EntityMove, GridAnchor, GridError, GridPoint, GridSize,
+    HistoryChange, HistoryEvent, LevelCommand, LevelCommandKind, LevelError, LevelHash,
+    LevelSnapshot, LevelTarget, LevelValue, PlaceableEntity,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -243,6 +243,7 @@ impl LevelTimeline {
 
     fn current_value(&self, target: &LevelTarget) -> Result<LevelValue, TimelineError> {
         match target {
+            LevelTarget::Grid => Ok(LevelValue::Grid(Box::new(self.current.clone()))),
             LevelTarget::Cell(point) => Ok(LevelValue::Cell(self.current.cell(*point)?)),
             LevelTarget::Entity(entity_id) => {
                 Ok(LevelValue::Entity(self.current.entity(entity_id).cloned()))
@@ -310,6 +311,10 @@ fn apply_command(
     command: &LevelCommand,
 ) -> Result<Option<CommandApplication>, TimelineError> {
     match command {
+        LevelCommand::ResizeGrid { size, anchor } => apply_resize_grid(snapshot, *size, *anchor),
+        LevelCommand::RestoreSnapshot { snapshot: restored } => {
+            apply_restore_snapshot(snapshot, restored)
+        }
         LevelCommand::SetCell { point, kind } => apply_set_cell(snapshot, *point, *kind),
         LevelCommand::PlaceEntity { entity } => apply_place_entity(snapshot, entity),
         LevelCommand::MoveEntity { entity_id, origin } => {
@@ -326,6 +331,7 @@ fn apply_command(
                 },
             )
         }
+        LevelCommand::MoveEntities { moves } => apply_move_entities(snapshot, moves),
         LevelCommand::RotateEntityClockwise { entity_id } => {
             let before = required_entity(snapshot, entity_id)?;
             let after = before.rotated_clockwise();
@@ -351,6 +357,25 @@ fn apply_command(
                 after,
                 LevelCommand::FlipEntityHorizontal {
                     entity_id: entity_id.clone(),
+                },
+            )
+        }
+        LevelCommand::SetBlindResolution {
+            entity_id,
+            pixels_per_cell,
+        } => {
+            let before = required_entity(snapshot, entity_id)?;
+            let after = before
+                .resampled_blind(*pixels_per_cell)
+                .map_err(LevelError::from)?;
+            if &after == before {
+                return Ok(None);
+            }
+            apply_entity_replacement(
+                snapshot,
+                after,
+                LevelCommand::RestoreEntity {
+                    entity: before.clone(),
                 },
             )
         }
@@ -541,6 +566,102 @@ fn apply_command(
     }
 }
 
+fn apply_resize_grid(
+    snapshot: &LevelSnapshot,
+    size: GridSize,
+    anchor: GridAnchor,
+) -> Result<Option<CommandApplication>, TimelineError> {
+    size.validate()?;
+    if snapshot.size() == size {
+        return Ok(None);
+    }
+
+    let (offset_x, offset_y) = resize_offset(snapshot.size(), size, anchor);
+    let mut cells = vec![CellKind::Floor; size.cell_count()];
+    for y in 0..snapshot.size().height() {
+        for x in 0..snapshot.size().width() {
+            let source = GridPoint::new(x, y);
+            let kind = snapshot.cell(source)?;
+            let Some(target) = translated_point(source, offset_x, offset_y, size) else {
+                if kind != CellKind::Floor {
+                    return Err(LevelError::ResizeWouldClipCell { point: source }.into());
+                }
+                continue;
+            };
+            cells[size.index_of(target)?] = kind;
+        }
+    }
+
+    let entities = snapshot
+        .entities()
+        .iter()
+        .map(|entity| {
+            translated_point(entity.origin(), offset_x, offset_y, size)
+                .map(|origin| entity.moved_to(origin))
+                .ok_or_else(|| LevelError::ResizeWouldClipEntity {
+                    entity_id: entity.id().clone(),
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let resized = LevelSnapshot::from_parts(size, cells, entities, snapshot.decorators().to_vec())?;
+    Ok(Some(snapshot_replacement(snapshot, resized)))
+}
+
+fn apply_restore_snapshot(
+    snapshot: &LevelSnapshot,
+    restored: &LevelSnapshot,
+) -> Result<Option<CommandApplication>, TimelineError> {
+    restored.validate_domain()?;
+    if snapshot == restored {
+        return Ok(None);
+    }
+    Ok(Some(snapshot_replacement(snapshot, restored.clone())))
+}
+
+fn snapshot_replacement(before: &LevelSnapshot, after: LevelSnapshot) -> CommandApplication {
+    CommandApplication {
+        inverse: LevelCommand::RestoreSnapshot {
+            snapshot: Box::new(before.clone()),
+        },
+        changes: vec![HistoryChange {
+            target: LevelTarget::Grid,
+            before: LevelValue::Grid(Box::new(before.clone())),
+            after: LevelValue::Grid(Box::new(after.clone())),
+        }],
+        snapshot: after,
+    }
+}
+
+fn resize_offset(before: GridSize, after: GridSize, anchor: GridAnchor) -> (i32, i32) {
+    let width_delta = i32::from(after.width()) - i32::from(before.width());
+    let height_delta = i32::from(after.height()) - i32::from(before.height());
+    let offset_x = match anchor {
+        GridAnchor::TopLeft | GridAnchor::Left | GridAnchor::BottomLeft => 0,
+        GridAnchor::Top | GridAnchor::Center | GridAnchor::Bottom => width_delta.div_euclid(2),
+        GridAnchor::TopRight | GridAnchor::Right | GridAnchor::BottomRight => width_delta,
+    };
+    let offset_y = match anchor {
+        GridAnchor::BottomLeft | GridAnchor::Bottom | GridAnchor::BottomRight => 0,
+        GridAnchor::Left | GridAnchor::Center | GridAnchor::Right => height_delta.div_euclid(2),
+        GridAnchor::TopLeft | GridAnchor::Top | GridAnchor::TopRight => height_delta,
+    };
+    (offset_x, offset_y)
+}
+
+fn translated_point(
+    point: GridPoint,
+    offset_x: i32,
+    offset_y: i32,
+    size: GridSize,
+) -> Option<GridPoint> {
+    let x = i32::from(point.x).checked_add(offset_x)?;
+    let y = i32::from(point.y).checked_add(offset_y)?;
+    if x < 0 || y < 0 || x >= i32::from(size.width()) || y >= i32::from(size.height()) {
+        return None;
+    }
+    Some(GridPoint::new(x as u16, y as u16))
+}
+
 fn apply_set_cell(
     snapshot: &LevelSnapshot,
     point: GridPoint,
@@ -592,6 +713,46 @@ fn apply_place_entity(
             None,
             Some(entity.clone()),
         )],
+    }))
+}
+
+fn apply_move_entities(
+    snapshot: &LevelSnapshot,
+    moves: &[EntityMove],
+) -> Result<Option<CommandApplication>, TimelineError> {
+    let mut seen = BTreeSet::new();
+    let mut replacements = Vec::with_capacity(moves.len());
+    let mut inverse_moves = Vec::with_capacity(moves.len());
+    let mut changes = Vec::with_capacity(moves.len());
+    for movement in moves {
+        if !seen.insert(movement.entity_id.clone()) {
+            return Err(LevelError::DuplicateEntityMove(movement.entity_id.clone()).into());
+        }
+        let before = required_entity(snapshot, &movement.entity_id)?;
+        if before.origin() == movement.origin {
+            continue;
+        }
+        let after = before.moved_to(movement.origin);
+        replacements.push(after.clone());
+        inverse_moves.push(EntityMove::new(before.id().clone(), before.origin()));
+        changes.push(entity_change(
+            before.id().clone(),
+            Some(before.clone()),
+            Some(after),
+        ));
+    }
+    if replacements.is_empty() {
+        return Ok(None);
+    }
+
+    let mut next = snapshot.clone();
+    next.replace_entities(replacements)?;
+    Ok(Some(CommandApplication {
+        snapshot: next,
+        inverse: LevelCommand::MoveEntities {
+            moves: inverse_moves,
+        },
+        changes,
     }))
 }
 

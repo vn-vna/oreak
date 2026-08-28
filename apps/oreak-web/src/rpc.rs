@@ -3,9 +3,9 @@ use std::rc::Rc;
 use jsonrpsee_wasm_client::{Client, WasmClientBuilder};
 use oreak_core::HistoryEvent;
 use oreak_protocol::{
-    ApplyCommandRequest, ApplyCommandResponse, LevelHistoryRequest, LevelSnapshotResponse,
-    LevelSubscriptionItem, MAX_LEVEL_HISTORY_PAGE_SIZE, OreakRpcClient as _, ProjectLevelTarget,
-    UndoLatestRequest, UndoLatestResponse,
+    ApplyCommandRequest, ApplyCommandResponse, LevelHistoryRequest, LevelPresenceItem,
+    LevelSnapshotResponse, LevelSubscriptionItem, MAX_LEVEL_HISTORY_PAGE_SIZE, OreakRpcClient as _,
+    ProjectLevelTarget, UndoLatestRequest, UndoLatestResponse, UpdateLevelCursorRequest,
 };
 use yew::Callback;
 
@@ -20,6 +20,7 @@ pub enum RpcUpdate {
         events: Vec<HistoryEvent>,
     },
     Subscription(LevelSubscriptionItem),
+    Presence(LevelPresenceItem),
     Closed(String),
 }
 
@@ -56,26 +57,60 @@ impl RpcClient {
             return Err("level subscription snapshot referenced the wrong target".to_owned());
         }
         let events = fetch_history(&inner, &target, snapshot.server_sequence).await?;
+        let mut presence_subscription = inner
+            .subscribe_level_presence(target.clone())
+            .await
+            .map_err(|error| format!("subscribe_level_presence failed: {error}"))?;
+        let initial_presence = presence_subscription
+            .next()
+            .await
+            .ok_or_else(|| "presence subscription closed before its initial roster".to_owned())?
+            .map_err(|error| format!("initial presence item failed: {error}"))?;
+        if !matches!(
+            &initial_presence,
+            LevelPresenceItem::Snapshot {
+                target: presence_target,
+                ..
+            } if presence_target == &target
+        ) {
+            return Err("presence subscription did not start with a scoped roster".to_owned());
+        }
 
         updates.emit(RpcUpdate::Snapshot(snapshot));
         updates.emit(RpcUpdate::History {
-            target,
+            target: target.clone(),
             through_sequence: events.last().map_or(0, |event| event.sequence),
             events,
         });
+        updates.emit(RpcUpdate::Presence(initial_presence));
+        let timeline_updates = updates.clone();
         wasm_bindgen_futures::spawn_local(async move {
             while let Some(item) = subscription.next().await {
                 match item {
-                    Ok(item) => updates.emit(RpcUpdate::Subscription(item)),
+                    Ok(item) => timeline_updates.emit(RpcUpdate::Subscription(item)),
                     Err(error) => {
-                        updates.emit(RpcUpdate::Closed(format!(
+                        timeline_updates.emit(RpcUpdate::Closed(format!(
                             "level subscription failed: {error}"
                         )));
                         return;
                     }
                 }
             }
-            updates.emit(RpcUpdate::Closed("level subscription closed".to_owned()));
+            timeline_updates.emit(RpcUpdate::Closed("level subscription closed".to_owned()));
+        });
+        wasm_bindgen_futures::spawn_local(async move {
+            while let Some(item) = presence_subscription.next().await {
+                match item {
+                    Ok(item) => updates.emit(RpcUpdate::Presence(item)),
+                    Err(error) => {
+                        updates.emit(RpcUpdate::Closed(format!(
+                            "presence subscription failed: {error}"
+                        )));
+                        return;
+                    }
+                }
+            }
+            updates.emit(RpcUpdate::Closed("presence subscription closed".to_owned()));
         });
 
         Ok(Self {
@@ -108,6 +143,17 @@ impl RpcClient {
             .undo_latest(request)
             .await
             .map_err(|error| format!("undo_latest failed: {error}"))
+    }
+
+    pub async fn update_level_cursor(
+        &self,
+        request: UpdateLevelCursorRequest,
+    ) -> Result<(), String> {
+        self.inner
+            .as_ref()
+            .update_level_cursor(request)
+            .await
+            .map_err(|error| format!("update_level_cursor failed: {error}"))
     }
 }
 

@@ -1,33 +1,45 @@
 use std::collections::{BTreeMap, BTreeSet};
 
+use gloo_timers::callback::Timeout;
 use js_sys::Date;
 use oreak_core::{
-    BlameEntry, CellKind, GridPoint, HistoryEvent, LevelCommand, LevelSnapshot, LevelTarget,
+    BlameEntry, BlindPixel, BlindStroke, CellKind, CollectCapacity, CommandEnvelope, DecoratorKind,
+    DirectionMode, EntityId, EntityMove, GridAnchor, GridPoint, GridSize, HistoryEvent,
+    LevelCommand, LevelSnapshot, LevelTarget, PlaceableEntity, PlaceableEntityKind, Shape,
+    ShapeCell,
 };
 use oreak_protocol::{
-    ApplyCommandRequest, ApplyCommandResponse, ApplyCommandResult, LevelEvent,
+    ApplyCommandRequest, ApplyCommandResponse, ApplyCommandResult, LevelEvent, LevelPresenceItem,
     LevelSnapshotResponse, LevelSubscriptionItem, ProjectLevelTarget, UndoLatestRequest,
-    UndoLatestResponse,
+    UndoLatestResponse, UpdateLevelCursorRequest,
 };
-use wasm_bindgen::{JsCast, JsValue};
+use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use web_sys::{
-    CanvasRenderingContext2d, Element, HtmlCanvasElement, HtmlElement, HtmlInputElement,
-    KeyboardEvent, PointerEvent,
+    CanvasRenderingContext2d, DragEvent, Element, HtmlCanvasElement, HtmlElement, HtmlInputElement,
+    HtmlSelectElement, KeyboardEvent, PointerEvent, ResizeObserver, WheelEvent,
 };
 use yew::prelude::*;
 
 use crate::api::{
-    ApiError, LevelSummary, ProjectSummary, RestClient, UserSummary, WorkspaceSummary,
-    draft_storage_key, projects_for_workspace,
+    ApiError, CatalogSnapshot, LevelConfiguration, LevelSummary, MembershipSummary,
+    ProjectConfiguration, ProjectInvitationSummary, ProjectSummary, RestClient, ShapeCatalogEntry,
+    ShapeDefinition, UserSummary, WorkspaceSummary, draft_storage_key,
 };
 use crate::model::{
-    EditorModel, Mode, ModelChange, Shortcut, ShortcutScope, hydrate_history, resolve_shortcut,
+    EditorModel, MapResizeEdge, Mode, ModelChange, MoveDirection, PresenceRoster, Selection,
+    ShapeBoundaryEdges, Shortcut, ShortcutScope, ViewportTransform,
+    blind_pixel_from_top_left_sample, designer_mask_from_shape, entity_ids_in_rect,
+    hydrate_history, key_locker_for_key, key_locker_for_lock, plan_content_aware_edge_resize,
+    pool_tile_geometry, rasterize_blind_segment, reconnect_delay_ms, resolve_shortcut,
+    select_entity, shape_boundary_edges, shape_from_designer_mask, shape_world_points,
 };
 use crate::rpc::{RpcClient, RpcUpdate};
 
-const CANVAS_SIZE: u32 = 768;
+const CANVAS_WIDTH: u32 = 1280;
+const CANVAS_HEIGHT: u32 = 720;
 const BOARD_ORIGIN: f64 = 44.0;
 const CELL_SIZE: f64 = 85.0;
+const BLIND_INSET: f64 = 6.0;
 const THEME_STORAGE_KEY: &str = "oreak.theme.override";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +63,14 @@ enum Theme {
 }
 
 impl Theme {
+    const fn from_name(value: &str) -> Option<Self> {
+        match value.as_bytes() {
+            b"dark" => Some(Self::Dark),
+            b"light" => Some(Self::Light),
+            _ => None,
+        }
+    }
+
     const fn name(self) -> &'static str {
         match self {
             Self::Dark => "dark",
@@ -126,8 +146,106 @@ pub(crate) enum TopMenu {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RightTab {
+    Inspector,
     Activity,
     Blame,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum LeftTab {
+    #[default]
+    Tool,
+    Templates,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum WorkspaceTool {
+    #[default]
+    Place,
+    Transform,
+    Decorate,
+    Cells,
+    Resize,
+    Paint,
+    Fill,
+    SandboxMove,
+}
+
+impl WorkspaceTool {
+    const fn for_mode(mode: Mode) -> &'static [Self] {
+        match mode {
+            Mode::Select => &[Self::Place, Self::Transform, Self::Decorate],
+            Mode::Map => &[Self::Cells, Self::Resize],
+            Mode::Brush => &[Self::Paint, Self::Fill],
+            Mode::Sandbox => &[Self::SandboxMove],
+        }
+    }
+
+    const fn default_for(mode: Mode) -> Self {
+        match mode {
+            Mode::Select => Self::Place,
+            Mode::Map => Self::Cells,
+            Mode::Brush => Self::Paint,
+            Mode::Sandbox => Self::SandboxMove,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Place => "Place",
+            Self::Transform => "Transform",
+            Self::Decorate => "Decorate",
+            Self::Cells => "Cells",
+            Self::Resize => "Resize",
+            Self::Paint => "Paint",
+            Self::Fill => "Fill",
+            Self::SandboxMove => "Move",
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::Place => "Place one default Block or Pool at the selected floor cell.",
+            Self::Transform => "Move or reshape the selected entity as one timeline action.",
+            Self::Decorate => "Edit Ice, Direction, and Key & Locker on the selected Block.",
+            Self::Cells => "Paint logical Floor and Wall cells on the map.",
+            Self::Resize => "Resize the map from one of nine fixed visual anchors.",
+            Self::Paint => "Paint or erase pixels on the selected Pool canvas.",
+            Self::Fill => "Fill one connected empty region on the selected Pool canvas.",
+            Self::SandboxMove => "Sandbox movement remains parity gated.",
+        }
+    }
+
+    const fn icon(self) -> &'static str {
+        match self {
+            Self::Place => "+",
+            Self::Transform => "<>",
+            Self::Decorate => "*",
+            Self::Cells => "#",
+            Self::Resize => "[]",
+            Self::Paint => "/",
+            Self::Fill => "~",
+            Self::SandboxMove => ">",
+        }
+    }
+
+    const fn key(self) -> char {
+        match self {
+            Self::Place | Self::Cells | Self::Paint | Self::SandboxMove => 'Z',
+            Self::Transform | Self::Resize | Self::Fill => 'X',
+            Self::Decorate => 'C',
+        }
+    }
+
+    fn from_key(mode: Mode, key: &str) -> Option<Self> {
+        let index = match key.to_ascii_lowercase().as_str() {
+            "z" => 0,
+            "x" => 1,
+            "c" => 2,
+            _ => return None,
+        };
+        Self::for_mode(mode).get(index).copied()
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -156,7 +274,7 @@ impl PaletteCommand {
         match self {
             Self::Select => "Switch mode: Select",
             Self::Map => "Switch mode: Map",
-            Self::Brush => "Switch mode: Brush (parity gated)",
+            Self::Brush => "Switch mode: Brush",
             Self::Sandbox => "Switch mode: Sandbox (parity gated)",
             Self::Undo => "Undo my latest change",
             Self::ToggleTheme => "Toggle light or dark theme",
@@ -181,6 +299,7 @@ struct Toast {
     id: u32,
     message: String,
     tone: &'static str,
+    occurred_at_ms: i64,
 }
 
 #[derive(Debug)]
@@ -197,6 +316,135 @@ struct PendingCell {
     command_id: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlacementKind {
+    Block,
+    Blind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EntityAction {
+    Move(MoveDirection),
+    RotateClockwise,
+    FlipHorizontal,
+    Delete,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum DecoratorAction {
+    ToggleIce,
+    CycleDirection,
+    SetDirection(DirectionMode),
+    BeginKeyLocker,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum BlindBrushTool {
+    #[default]
+    Paint,
+    FloodFill,
+}
+
+#[derive(Debug)]
+enum BlindGestureOperation {
+    Paint { color_index: u8 },
+    Erase,
+    FloodFill { start: BlindPixel, color_index: u8 },
+}
+
+#[derive(Debug)]
+struct BlindGesture {
+    pointer_id: i32,
+    entity_id: EntityId,
+    operation: BlindGestureOperation,
+    pixels: BTreeSet<BlindPixel>,
+    partition: BTreeSet<BlindPixel>,
+    last_pixel: Option<BlindPixel>,
+}
+
+#[derive(Debug)]
+struct EntityDrag {
+    pointer_id: i32,
+    start: GridPoint,
+    current: GridPoint,
+    origins: Vec<(EntityId, GridPoint)>,
+    start_canvas_x: f64,
+    start_canvas_y: f64,
+    active: bool,
+}
+
+#[derive(Debug)]
+struct PanGesture {
+    pointer_id: i32,
+    start_x: f64,
+    start_y: f64,
+    offset_x: f64,
+    offset_y: f64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PlacementDrag {
+    kind: PlacementKind,
+    shape: Shape,
+    hover: Option<GridPoint>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SidebarSide {
+    Left,
+    Right,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PanelLayout {
+    Docked,
+    Floating,
+    Hidden,
+}
+
+impl PanelLayout {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Docked => "DOCKED",
+            Self::Floating => "FLOATING",
+            Self::Hidden => "HIDDEN",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct SidebarResize {
+    side: SidebarSide,
+    pointer_id: i32,
+    start_client_x: f64,
+    start_width: f64,
+}
+
+#[derive(Debug)]
+struct MapResizeGesture {
+    pointer_id: i32,
+    edge: MapResizeEdge,
+    start_x: f64,
+    start_y: f64,
+    start_size: GridSize,
+    preview_size: GridSize,
+    anchor: GridAnchor,
+    cell_size: f64,
+}
+
+#[derive(Debug)]
+struct MarqueeGesture {
+    pointer_id: i32,
+    start: GridPoint,
+    current: GridPoint,
+    start_canvas_x: f64,
+    start_canvas_y: f64,
+    current_canvas_x: f64,
+    current_canvas_y: f64,
+    additive: bool,
+    active: bool,
+}
+
 pub struct App {
     phase: Phase,
     session_id: String,
@@ -206,44 +454,106 @@ pub struct App {
     selected_workspace_id: String,
     catalog_project: Option<ProjectSummary>,
     levels: Vec<LevelSummary>,
+    catalog_levels: BTreeMap<String, Vec<LevelSummary>>,
+    catalog_invitations: Vec<ProjectInvitationSummary>,
+    catalog_query: String,
+    expanded_workspaces: BTreeSet<String>,
+    project_configuration: Option<ProjectConfiguration>,
+    configuration_project: Option<ProjectSummary>,
+    configuration_pending: bool,
+    configuration_error: Option<String>,
+    invitation_email: String,
+    invitation_role: String,
     auth_mode: AuthMode,
     auth_email: String,
     auth_password: String,
     project_name: String,
     level_name: String,
+    level_duration: String,
     request_pending: bool,
     form_error: Option<String>,
     model: EditorModel,
     mode: Mode,
-    selected: Option<GridPoint>,
+    selection: Option<Selection>,
     drag_kind: Option<CellKind>,
     last_drag: Option<GridPoint>,
+    blind_brush_tool: BlindBrushTool,
+    blind_color_index: u8,
+    blind_gesture: Option<BlindGesture>,
+    entity_drag: Option<EntityDrag>,
+    pan_gesture: Option<PanGesture>,
+    placement_drag: Option<PlacementDrag>,
+    sidebar_resize: Option<SidebarResize>,
+    map_resize_gesture: Option<MapResizeGesture>,
+    marquee_gesture: Option<MarqueeGesture>,
+    pending_edge_view: Option<MapResizeEdge>,
+    viewport: ViewportTransform,
+    canvas_width: u32,
+    canvas_height: u32,
+    canvas_size_initialized: bool,
+    canvas_resize_observer: Option<ResizeObserver>,
+    canvas_resize_callback: Option<Closure<dyn FnMut()>>,
+    left_sidebar_width: f64,
+    right_sidebar_width: f64,
+    left_panel_layout: PanelLayout,
+    right_panel_layout: PanelLayout,
+    resize_width: String,
+    resize_height: String,
+    resize_anchor: GridAnchor,
+    shape_catalog: Vec<ShapeCatalogEntry>,
+    shape_catalog_pending: bool,
+    shape_draft_name: String,
+    shape_draft_mask: u64,
+    selected_shape_id: Option<String>,
+    isolated_blind: Option<EntityId>,
+    key_locker_assignment: Option<EntityId>,
     canvas_ref: NodeRef,
     root_ref: NodeRef,
     palette_input_ref: NodeRef,
     canvas_dirty: bool,
     theme: ThemeSettings,
     open_menu: Option<TopMenu>,
+    left_tab: LeftTab,
     right_tab: RightTab,
+    workspace_tool: WorkspaceTool,
     palette_open: bool,
     palette_query: String,
     toasts: Vec<Toast>,
+    active_toasts: BTreeSet<u32>,
+    notifications_open: bool,
     next_toast_id: u32,
     target: ProjectLevelTarget,
     workspace_name: String,
     project_display_name: String,
     level_display_name: String,
+    level_duration_seconds: f64,
+    level_configuration_open: bool,
+    level_configuration_name: String,
+    level_configuration_duration: String,
+    level_configuration_pending: bool,
+    level_configuration_error: Option<String>,
     can_edit_timeline: bool,
     rpc: Option<RpcClient>,
     rpc_state: RpcState,
     connection_attempt: u64,
+    reconnect_failures: u32,
+    reconnect_timer: Option<Timeout>,
+    presence: PresenceRoster,
+    desired_cursor: Option<GridPoint>,
+    last_sent_cursor: Option<Option<GridPoint>>,
+    cursor_timer: Option<Timeout>,
+    cursor_in_flight: bool,
     server_sequence: Option<u64>,
     server_hash: Option<String>,
     server_events: Vec<HistoryEvent>,
     remote_blame: BTreeMap<GridPoint, BlameEntry>,
+    remote_entity_blame: BTreeMap<EntityId, BlameEntry>,
     seen_commands: BTreeSet<String>,
     pending_commands: BTreeSet<String>,
     pending_cells: BTreeMap<GridPoint, PendingCell>,
+    pending_entities: BTreeMap<EntityId, String>,
+    pending_placements: BTreeMap<GridPoint, String>,
+    pending_grid: Option<String>,
 }
 
 pub enum Msg {
@@ -253,39 +563,115 @@ pub enum Msg {
     AuthPassword(String),
     SubmitAuth,
     AuthFinished(Result<UserSummary, ApiError>),
-    WorkspacesLoaded(Result<Vec<WorkspaceSummary>, ApiError>),
-    ProjectsLoaded(Result<Vec<ProjectSummary>, ApiError>),
-    SelectWorkspace(String),
+    CatalogLoaded(Result<CatalogSnapshot, ApiError>),
+    CatalogQuery(String),
+    ToggleCatalogWorkspace(String),
     SelectProject(ProjectSummary),
-    LevelsLoaded {
-        project_id: String,
-        result: Result<Vec<LevelSummary>, ApiError>,
-    },
     ProjectName(String),
     CreateProject,
     ProjectCreated(Result<ProjectSummary, ApiError>),
     LevelName(String),
+    LevelDuration(String),
     CreateLevel,
     LevelCreated {
         project: ProjectSummary,
         result: Result<LevelSummary, ApiError>,
     },
-    OpenLevel(LevelSummary),
+    OpenCatalogLevel(ProjectSummary, LevelSummary),
+    OpenLevelConfiguration,
+    CloseLevelConfiguration,
+    LevelConfigurationName(String),
+    LevelConfigurationDuration(String),
+    SaveLevelConfiguration,
+    LevelConfigurationLoaded(Result<LevelConfiguration, ApiError>),
+    LevelConfigurationUpdated(Result<LevelConfiguration, ApiError>),
+    OpenProjectConfiguration(ProjectSummary),
+    ProjectConfigurationLoaded {
+        project_id: String,
+        result: Result<ProjectConfiguration, ApiError>,
+    },
+    CloseProjectConfiguration,
+    InvitationEmail(String),
+    InvitationRole(String),
+    InviteProjectMember,
+    ProjectMemberInvited {
+        project_id: String,
+        result: Result<ProjectInvitationSummary, ApiError>,
+    },
+    AcceptProjectInvitation(ProjectInvitationSummary),
+    ProjectInvitationAccepted(Result<ProjectSummary, ApiError>),
+    SetProjectMemberRole(String, String),
+    ProjectMemberUpdated {
+        project_id: String,
+        result: Result<MembershipSummary, ApiError>,
+    },
+    SetProjectDefaultTheme(String),
+    ProjectConfigurationUpdated {
+        project_id: String,
+        result: Result<ProjectSummary, ApiError>,
+    },
     ShowCatalog,
     Logout,
     LogoutFinished(Result<(), ApiError>),
     SetMode(Mode),
     SetSelectedKind(CellKind),
+    EditEntity(EntityAction),
+    EditDecorator(DecoratorAction),
+    SetIceCount(String),
+    SetBlindColor(u8),
+    SetPoolResolution(u8),
+    ResizeWidth(String),
+    ResizeHeight(String),
+    SetResizeAnchor(GridAnchor),
+    ResizeGrid,
+    ZoomIn,
+    ZoomOut,
+    FrameGrid,
+    CanvasWheel(WheelEvent),
+    ShapeCatalogLoaded {
+        project_id: String,
+        result: Result<Vec<ShapeCatalogEntry>, ApiError>,
+    },
+    ShapeDraftName(String),
+    ToggleShapeCell(u8, u8),
+    NewShapeDraft,
+    SelectShape(String),
+    SaveShapeDraft,
+    UpdateShapeDraft,
+    ShapeSaved {
+        project_id: String,
+        result: Result<ShapeCatalogEntry, ApiError>,
+    },
+    DeleteShapeDraft,
+    ShapeDeleted {
+        project_id: String,
+        shape_id: String,
+        result: Result<(), ApiError>,
+    },
+    BeginPlacementDrag(PlacementKind, Shape),
+    EndPlacementDrag,
+    CanvasDragOver(DragEvent),
+    CanvasDrop(DragEvent),
+    CanvasResized(u32, u32),
+    ToggleBlindIsolation,
     CanvasDown(PointerEvent),
     CanvasMove(PointerEvent),
     CanvasUp(PointerEvent),
+    CanvasCancel(PointerEvent),
+    CanvasLeave,
     ClearSelection,
     KeyDown(KeyboardEvent),
     ToggleTheme,
     UseProjectTheme,
     Undo,
     ToggleMenu(TopMenu),
+    SetLeftTab(LeftTab),
     SetRightTab(RightTab),
+    SetWorkspaceTool(WorkspaceTool),
+    BeginSidebarResize(SidebarSide, PointerEvent),
+    SidebarResizeMove(PointerEvent),
+    EndSidebarResize(PointerEvent),
+    SetPanelLayout(SidebarSide, PanelLayout),
     TogglePalette,
     CloseOverlays,
     PaletteQuery(String),
@@ -293,7 +679,10 @@ pub enum Msg {
     SaveDraft,
     ResetDraft,
     Reconnect,
+    RetryConnection(u64),
     DismissToast(u32),
+    ToggleNotifications,
+    ClearNotifications,
     RpcReady {
         attempt: u64,
         result: Result<RpcClient, String>,
@@ -311,6 +700,12 @@ pub enum Msg {
         attempt: u64,
         command_id: String,
         result: Box<Result<UndoLatestResponse, String>>,
+    },
+    FlushCursor(u64),
+    CursorSent {
+        attempt: u64,
+        cursor: Option<GridPoint>,
+        result: Result<(), String>,
     },
 }
 
@@ -331,44 +726,112 @@ impl Component for App {
             selected_workspace_id: String::new(),
             catalog_project: None,
             levels: Vec::new(),
+            catalog_levels: BTreeMap::new(),
+            catalog_invitations: Vec::new(),
+            catalog_query: String::new(),
+            expanded_workspaces: BTreeSet::new(),
+            project_configuration: None,
+            configuration_project: None,
+            configuration_pending: false,
+            configuration_error: None,
+            invitation_email: String::new(),
+            invitation_role: "editor".to_owned(),
             auth_mode: AuthMode::Login,
             auth_email: String::new(),
             auth_password: String::new(),
             project_name: String::new(),
             level_name: String::new(),
+            level_duration: "0".to_owned(),
             request_pending: false,
             form_error: None,
             model: EditorModel::blank("bootstrapping", &session_id),
             mode: Mode::Select,
-            selected: None,
+            selection: None,
             drag_kind: None,
             last_drag: None,
+            blind_brush_tool: BlindBrushTool::Paint,
+            blind_color_index: 1,
+            blind_gesture: None,
+            entity_drag: None,
+            pan_gesture: None,
+            placement_drag: None,
+            sidebar_resize: None,
+            map_resize_gesture: None,
+            marquee_gesture: None,
+            pending_edge_view: None,
+            viewport: ViewportTransform::frame_rect(
+                GridSize::new(8, 8).expect("the initial viewport grid is valid"),
+                f64::from(CANVAS_WIDTH),
+                f64::from(CANVAS_HEIGHT),
+                BOARD_ORIGIN,
+                CELL_SIZE,
+            ),
+            canvas_width: CANVAS_WIDTH,
+            canvas_height: CANVAS_HEIGHT,
+            canvas_size_initialized: false,
+            canvas_resize_observer: None,
+            canvas_resize_callback: None,
+            left_sidebar_width: 252.0,
+            right_sidebar_width: 296.0,
+            left_panel_layout: PanelLayout::Docked,
+            right_panel_layout: PanelLayout::Docked,
+            resize_width: "8".to_owned(),
+            resize_height: "8".to_owned(),
+            resize_anchor: GridAnchor::Center,
+            shape_catalog: Vec::new(),
+            shape_catalog_pending: false,
+            shape_draft_name: String::new(),
+            shape_draft_mask: 1,
+            selected_shape_id: None,
+            isolated_blind: None,
+            key_locker_assignment: None,
             canvas_ref: NodeRef::default(),
             root_ref: NodeRef::default(),
             palette_input_ref: NodeRef::default(),
             canvas_dirty: true,
             theme: ThemeSettings::load(),
             open_menu: None,
-            right_tab: RightTab::Activity,
+            left_tab: LeftTab::Tool,
+            right_tab: RightTab::Inspector,
+            workspace_tool: WorkspaceTool::Place,
             palette_open: false,
             palette_query: String::new(),
             toasts: Vec::new(),
+            active_toasts: BTreeSet::new(),
+            notifications_open: false,
             next_toast_id: 1,
             target: ProjectLevelTarget::new(String::new(), String::new()),
             workspace_name: String::new(),
             project_display_name: String::new(),
             level_display_name: String::new(),
+            level_duration_seconds: 0.0,
+            level_configuration_open: false,
+            level_configuration_name: String::new(),
+            level_configuration_duration: String::new(),
+            level_configuration_pending: false,
+            level_configuration_error: None,
             can_edit_timeline: false,
             rpc: None,
             rpc_state: RpcState::Offline,
             connection_attempt: 0,
+            reconnect_failures: 0,
+            reconnect_timer: None,
+            presence: PresenceRoster::default(),
+            desired_cursor: None,
+            last_sent_cursor: None,
+            cursor_timer: None,
+            cursor_in_flight: false,
             server_sequence: None,
             server_hash: None,
             server_events: Vec::new(),
             remote_blame: BTreeMap::new(),
+            remote_entity_blame: BTreeMap::new(),
             seen_commands: BTreeSet::new(),
             pending_commands: BTreeSet::new(),
             pending_cells: BTreeMap::new(),
+            pending_entities: BTreeMap::new(),
+            pending_placements: BTreeMap::new(),
+            pending_grid: None,
         }
     }
 
@@ -437,15 +900,37 @@ impl Component for App {
                 }
                 true
             }
-            Msg::WorkspacesLoaded(result) => {
+            Msg::CatalogLoaded(result) => {
+                self.request_pending = false;
                 match result {
-                    Ok(workspaces) => {
-                        self.workspaces = workspaces;
-                        if self.selected_workspace_id.is_empty() {
+                    Ok(snapshot) => {
+                        self.workspaces = snapshot.workspaces;
+                        self.catalog_levels = snapshot
+                            .projects
+                            .iter()
+                            .map(|node| (node.project.id.clone(), node.levels.clone()))
+                            .collect();
+                        self.projects = snapshot
+                            .projects
+                            .into_iter()
+                            .map(|node| node.project)
+                            .collect();
+                        self.catalog_invitations = snapshot.invitations;
+                        self.expanded_workspaces
+                            .extend(self.workspaces.iter().map(|workspace| workspace.id.clone()));
+                        if self.selected_workspace_id.is_empty()
+                            || !self
+                                .workspaces
+                                .iter()
+                                .any(|workspace| workspace.id == self.selected_workspace_id)
+                        {
                             self.selected_workspace_id = self
                                 .user
                                 .as_ref()
                                 .map(|user| user.personal_workspace_id.clone())
+                                .filter(|id| {
+                                    self.workspaces.iter().any(|workspace| &workspace.id == id)
+                                })
                                 .or_else(|| {
                                     self.workspaces
                                         .first()
@@ -453,57 +938,48 @@ impl Component for App {
                                 })
                                 .unwrap_or_default();
                         }
+                        if let Some(selected_id) = self
+                            .catalog_project
+                            .as_ref()
+                            .map(|project| project.id.clone())
+                        {
+                            self.catalog_project = self
+                                .projects
+                                .iter()
+                                .find(|project| project.id == selected_id)
+                                .cloned();
+                            self.levels = self
+                                .catalog_levels
+                                .get(&selected_id)
+                                .cloned()
+                                .unwrap_or_default();
+                        }
+                        self.form_error = None;
                     }
                     Err(error) => return self.handle_authenticated_api_error(error),
                 }
-                self.request_pending = false;
                 true
             }
-            Msg::ProjectsLoaded(result) => {
-                match result {
-                    Ok(projects) => self.projects = projects,
-                    Err(error) => return self.handle_authenticated_api_error(error),
+            Msg::CatalogQuery(query) => {
+                self.catalog_query = query;
+                true
+            }
+            Msg::ToggleCatalogWorkspace(workspace_id) => {
+                self.selected_workspace_id = workspace_id.clone();
+                if !self.expanded_workspaces.remove(&workspace_id) {
+                    self.expanded_workspaces.insert(workspace_id);
                 }
-                self.request_pending = false;
-                true
-            }
-            Msg::SelectWorkspace(workspace_id) => {
-                self.selected_workspace_id = workspace_id;
-                self.catalog_project = None;
-                self.levels.clear();
-                self.form_error = None;
                 true
             }
             Msg::SelectProject(project) => {
+                self.selected_workspace_id = project.workspace_id.clone();
                 self.catalog_project = Some(project.clone());
-                self.levels.clear();
+                self.levels = self
+                    .catalog_levels
+                    .get(&project.id)
+                    .cloned()
+                    .unwrap_or_default();
                 self.form_error = None;
-                self.request_pending = true;
-                let project_id = project.id.clone();
-                let request_project_id = project_id.clone();
-                let link = ctx.link().clone();
-                wasm_bindgen_futures::spawn_local(async move {
-                    link.send_message(Msg::LevelsLoaded {
-                        project_id: request_project_id,
-                        result: RestClient.list_levels(&project_id).await,
-                    });
-                });
-                true
-            }
-            Msg::LevelsLoaded { project_id, result } => {
-                if self
-                    .catalog_project
-                    .as_ref()
-                    .map(|project| project.id.as_str())
-                    != Some(project_id.as_str())
-                {
-                    return false;
-                }
-                self.request_pending = false;
-                match result {
-                    Ok(levels) => self.levels = levels,
-                    Err(error) => return self.handle_authenticated_api_error(error),
-                }
                 true
             }
             Msg::ProjectName(value) => {
@@ -534,6 +1010,7 @@ impl Component for App {
                         self.projects.push(project.clone());
                         self.catalog_project = Some(project);
                         self.levels.clear();
+                        self.load_catalog(ctx);
                     }
                     Err(error) => return self.handle_authenticated_api_error(error),
                 }
@@ -543,12 +1020,22 @@ impl Component for App {
                 self.level_name = value;
                 true
             }
+            Msg::LevelDuration(value) => {
+                self.level_duration = value;
+                true
+            }
             Msg::CreateLevel => {
                 let Some(project) = self.catalog_project.clone() else {
                     return false;
                 };
+                let Ok(duration_seconds) = self.level_duration.parse::<f64>() else {
+                    self.form_error = Some("Duration must be a nonnegative number".to_owned());
+                    return true;
+                };
                 if self.request_pending
                     || self.level_name.trim().is_empty()
+                    || !duration_seconds.is_finite()
+                    || duration_seconds < 0.0
                     || !project.can_edit_timeline()
                 {
                     return false;
@@ -561,7 +1048,9 @@ impl Component for App {
                 wasm_bindgen_futures::spawn_local(async move {
                     link.send_message(Msg::LevelCreated {
                         project,
-                        result: RestClient.create_level(&project_id, &name).await,
+                        result: RestClient
+                            .create_level(&project_id, &name, duration_seconds)
+                            .await,
                     });
                 });
                 true
@@ -571,6 +1060,7 @@ impl Component for App {
                 match result {
                     Ok(level) => {
                         self.level_name.clear();
+                        self.level_duration = "0".to_owned();
                         self.levels.push(level.clone());
                         self.open_level(ctx, project, level);
                     }
@@ -578,18 +1068,319 @@ impl Component for App {
                 }
                 true
             }
-            Msg::OpenLevel(level) => {
-                let Some(project) = self.catalog_project.clone() else {
+            Msg::OpenCatalogLevel(project, level) => {
+                self.open_level(ctx, project, level);
+                true
+            }
+            Msg::OpenLevelConfiguration => {
+                if self.phase != Phase::Editor {
+                    return false;
+                }
+                self.level_configuration_open = true;
+                self.level_configuration_pending = true;
+                self.level_configuration_error = None;
+                self.level_configuration_name = self.level_display_name.clone();
+                self.level_configuration_duration = self.level_duration_seconds.to_string();
+                let project_id = self.target.project_id.to_string();
+                let level_id = self.target.level_id.to_string();
+                let link = ctx.link().clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    link.send_message(Msg::LevelConfigurationLoaded(
+                        RestClient.level_configuration(&project_id, &level_id).await,
+                    ));
+                });
+                true
+            }
+            Msg::CloseLevelConfiguration => {
+                self.level_configuration_open = false;
+                self.level_configuration_error = None;
+                true
+            }
+            Msg::LevelConfigurationName(value) => {
+                self.level_configuration_name = value;
+                true
+            }
+            Msg::LevelConfigurationDuration(value) => {
+                self.level_configuration_duration = value;
+                true
+            }
+            Msg::SaveLevelConfiguration => self.save_level_configuration(ctx),
+            Msg::LevelConfigurationLoaded(result) => {
+                self.level_configuration_pending = false;
+                match result {
+                    Ok(configuration) => self.accept_level_configuration(configuration),
+                    Err(error) if error.is_unauthorized() => {
+                        return self.handle_authenticated_api_error(error);
+                    }
+                    Err(error) => {
+                        self.level_configuration_error = Some(api_error_message(&error));
+                    }
+                }
+                true
+            }
+            Msg::LevelConfigurationUpdated(result) => {
+                self.level_configuration_pending = false;
+                match result {
+                    Ok(configuration) => {
+                        self.accept_level_configuration(configuration);
+                        self.level_configuration_open = false;
+                        self.push_toast("Level configuration saved".to_owned(), "success");
+                    }
+                    Err(error) if error.is_unauthorized() => {
+                        return self.handle_authenticated_api_error(error);
+                    }
+                    Err(error) => {
+                        self.level_configuration_error = Some(api_error_message(&error));
+                    }
+                }
+                true
+            }
+            Msg::OpenProjectConfiguration(project) => {
+                self.configuration_project = Some(project.clone());
+                self.project_configuration = None;
+                self.configuration_pending = true;
+                self.configuration_error = None;
+                self.invitation_email.clear();
+                let project_id = project.id.clone();
+                let request_project_id = project_id.clone();
+                let link = ctx.link().clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    link.send_message(Msg::ProjectConfigurationLoaded {
+                        project_id: request_project_id,
+                        result: RestClient.project_configuration(&project_id).await,
+                    });
+                });
+                true
+            }
+            Msg::ProjectConfigurationLoaded { project_id, result } => {
+                if self
+                    .configuration_project
+                    .as_ref()
+                    .map(|project| project.id.as_str())
+                    != Some(project_id.as_str())
+                {
+                    return false;
+                }
+                self.configuration_pending = false;
+                match result {
+                    Ok(configuration) => {
+                        self.configuration_project = Some(configuration.project.clone());
+                        self.project_configuration = Some(configuration);
+                        self.configuration_error = None;
+                    }
+                    Err(error) => {
+                        if error.is_unauthorized() {
+                            return self.handle_authenticated_api_error(error);
+                        }
+                        self.configuration_error = Some(api_error_message(&error));
+                    }
+                }
+                true
+            }
+            Msg::CloseProjectConfiguration => {
+                self.configuration_project = None;
+                self.project_configuration = None;
+                self.configuration_error = None;
+                true
+            }
+            Msg::InvitationEmail(email) => {
+                self.invitation_email = email;
+                true
+            }
+            Msg::InvitationRole(role) => {
+                self.invitation_role = role;
+                true
+            }
+            Msg::InviteProjectMember => self.invite_project_member(ctx),
+            Msg::ProjectMemberInvited { project_id, result } => {
+                if self
+                    .configuration_project
+                    .as_ref()
+                    .map(|project| project.id.as_str())
+                    != Some(project_id.as_str())
+                {
+                    return false;
+                }
+                self.configuration_pending = false;
+                match result {
+                    Ok(invitation) => {
+                        if let Some(configuration) = self.project_configuration.as_mut() {
+                            configuration.invitations.push(invitation);
+                        }
+                        self.invitation_email.clear();
+                        self.configuration_error = None;
+                    }
+                    Err(error) => self.configuration_error = Some(api_error_message(&error)),
+                }
+                true
+            }
+            Msg::AcceptProjectInvitation(invitation) => {
+                if self.request_pending {
+                    return false;
+                }
+                self.request_pending = true;
+                let project_id = invitation.project_id;
+                let invitation_id = invitation.id;
+                let link = ctx.link().clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    link.send_message(Msg::ProjectInvitationAccepted(
+                        RestClient
+                            .accept_project_invitation(&project_id, &invitation_id)
+                            .await,
+                    ));
+                });
+                true
+            }
+            Msg::ProjectInvitationAccepted(result) => {
+                self.request_pending = false;
+                match result {
+                    Ok(_) => self.load_catalog(ctx),
+                    Err(error) => return self.handle_authenticated_api_error(error),
+                }
+                true
+            }
+            Msg::SetProjectMemberRole(member_id, role) => {
+                let Some(project) = self.configuration_project.as_ref() else {
                     return false;
                 };
-                self.open_level(ctx, project, level);
+                if self.configuration_pending || !project.can_manage_members() {
+                    return false;
+                }
+                self.configuration_pending = true;
+                let project_id = project.id.clone();
+                let request_project_id = project_id.clone();
+                let roles = vec![role];
+                let link = ctx.link().clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    link.send_message(Msg::ProjectMemberUpdated {
+                        project_id: request_project_id,
+                        result: RestClient
+                            .update_project_member(&project_id, &member_id, &roles)
+                            .await,
+                    });
+                });
+                true
+            }
+            Msg::ProjectMemberUpdated { project_id, result } => {
+                if self
+                    .configuration_project
+                    .as_ref()
+                    .map(|project| project.id.as_str())
+                    != Some(project_id.as_str())
+                {
+                    return false;
+                }
+                self.configuration_pending = false;
+                match result {
+                    Ok(member) => {
+                        if self
+                            .user
+                            .as_ref()
+                            .is_some_and(|user| user.id == member.user_id)
+                        {
+                            if let Some(project) = self.configuration_project.as_mut() {
+                                project.roles.clone_from(&member.roles);
+                                project.capabilities.clone_from(&member.capabilities);
+                            }
+                            if let Some(project) = self
+                                .projects
+                                .iter_mut()
+                                .find(|project| project.id == project_id)
+                            {
+                                project.roles.clone_from(&member.roles);
+                                project.capabilities.clone_from(&member.capabilities);
+                            }
+                            if let Some(project) = self
+                                .catalog_project
+                                .as_mut()
+                                .filter(|project| project.id == project_id)
+                            {
+                                project.roles.clone_from(&member.roles);
+                                project.capabilities.clone_from(&member.capabilities);
+                            }
+                        }
+                        if let Some(existing) =
+                            self.project_configuration
+                                .as_mut()
+                                .and_then(|configuration| {
+                                    configuration
+                                        .members
+                                        .iter_mut()
+                                        .find(|existing| existing.user_id == member.user_id)
+                                })
+                        {
+                            *existing = member;
+                        }
+                        self.configuration_error = None;
+                    }
+                    Err(error) => self.configuration_error = Some(api_error_message(&error)),
+                }
+                true
+            }
+            Msg::SetProjectDefaultTheme(default_theme) => {
+                let Some(project) = self.configuration_project.as_ref() else {
+                    return false;
+                };
+                if self.configuration_pending || !project.can_manage_theme() {
+                    return false;
+                }
+                self.configuration_pending = true;
+                let project_id = project.id.clone();
+                let request_project_id = project_id.clone();
+                let link = ctx.link().clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    link.send_message(Msg::ProjectConfigurationUpdated {
+                        project_id: request_project_id,
+                        result: RestClient
+                            .update_project_configuration(&project_id, &default_theme)
+                            .await,
+                    });
+                });
+                true
+            }
+            Msg::ProjectConfigurationUpdated { project_id, result } => {
+                if self
+                    .configuration_project
+                    .as_ref()
+                    .map(|project| project.id.as_str())
+                    != Some(project_id.as_str())
+                {
+                    return false;
+                }
+                self.configuration_pending = false;
+                match result {
+                    Ok(project) => {
+                        self.configuration_project = Some(project.clone());
+                        if let Some(configuration) = self.project_configuration.as_mut() {
+                            configuration.project = project.clone();
+                        }
+                        if let Some(existing) = self
+                            .projects
+                            .iter_mut()
+                            .find(|existing| existing.id == project.id)
+                        {
+                            existing.clone_from(&project);
+                        }
+                        if let Some(selected) = self
+                            .catalog_project
+                            .as_mut()
+                            .filter(|selected| selected.id == project.id)
+                        {
+                            selected.clone_from(&project);
+                        }
+                        self.configuration_error = None;
+                    }
+                    Err(error) => self.configuration_error = Some(api_error_message(&error)),
+                }
                 true
             }
             Msg::ShowCatalog => {
                 self.invalidate_rpc();
+                self.disconnect_canvas_resize_observer();
                 self.phase = Phase::Catalog;
                 self.open_menu = None;
                 self.palette_open = false;
+                self.load_catalog(ctx);
                 true
             }
             Msg::Logout => {
@@ -616,23 +1407,132 @@ impl Component for App {
             }
             Msg::SetMode(mode) => self.set_mode(mode),
             Msg::SetSelectedKind(kind) => {
-                let Some(point) = self.selected else {
+                let Some(point) = self.selected_cell() else {
                     return false;
                 };
                 self.apply_cell(ctx, point, kind)
             }
+            Msg::EditEntity(action) => self.edit_selected_entity(ctx, action),
+            Msg::EditDecorator(action) => self.edit_selected_decorator(ctx, action),
+            Msg::SetIceCount(value) => self.set_selected_ice_count(ctx, &value),
+            Msg::SetBlindColor(color_index) => {
+                if !(1..=10).contains(&color_index) {
+                    return false;
+                }
+                self.blind_color_index = color_index;
+                true
+            }
+            Msg::SetPoolResolution(pixels_per_cell) => {
+                self.set_pool_resolution(ctx, pixels_per_cell)
+            }
+            Msg::ResizeWidth(value) => {
+                self.resize_width = value;
+                true
+            }
+            Msg::ResizeHeight(value) => {
+                self.resize_height = value;
+                true
+            }
+            Msg::SetResizeAnchor(anchor) => {
+                self.resize_anchor = anchor;
+                true
+            }
+            Msg::ResizeGrid => self.resize_grid(ctx),
+            Msg::ZoomIn => self.zoom_canvas(1.2),
+            Msg::ZoomOut => self.zoom_canvas(1.0 / 1.2),
+            Msg::FrameGrid => {
+                self.frame_grid();
+                true
+            }
+            Msg::CanvasWheel(event) => self.canvas_wheel(event),
+            Msg::ShapeCatalogLoaded { project_id, result } => {
+                if self.target.project_id.as_str() != project_id {
+                    return false;
+                }
+                self.shape_catalog_pending = false;
+                match result {
+                    Ok(shapes) => self.shape_catalog = shapes,
+                    Err(error) => return self.handle_authenticated_api_error(error),
+                }
+                true
+            }
+            Msg::ShapeDraftName(value) => {
+                self.shape_draft_name = value;
+                true
+            }
+            Msg::ToggleShapeCell(x, y) => {
+                self.shape_draft_mask ^= 1_u64 << (u32::from(x) + u32::from(y) * 8);
+                true
+            }
+            Msg::NewShapeDraft => {
+                self.selected_shape_id = None;
+                self.shape_draft_name.clear();
+                self.shape_draft_mask = 1;
+                true
+            }
+            Msg::SelectShape(shape_id) => self.select_shape_draft(&shape_id),
+            Msg::SaveShapeDraft => self.save_shape_draft(ctx, false),
+            Msg::UpdateShapeDraft => self.save_shape_draft(ctx, true),
+            Msg::ShapeSaved { project_id, result } => {
+                if self.target.project_id.as_str() != project_id {
+                    return false;
+                }
+                self.shape_catalog_pending = false;
+                match result {
+                    Ok(saved) => {
+                        if let Some(existing) = self
+                            .shape_catalog
+                            .iter_mut()
+                            .find(|entry| entry.id == saved.id)
+                        {
+                            *existing = saved.clone();
+                        } else {
+                            self.shape_catalog.push(saved.clone());
+                        }
+                        self.selected_shape_id = Some(saved.id);
+                        self.push_toast("Project shape saved".to_owned(), "success");
+                    }
+                    Err(error) => return self.handle_authenticated_api_error(error),
+                }
+                true
+            }
+            Msg::DeleteShapeDraft => self.delete_shape_draft(ctx),
+            Msg::ShapeDeleted {
+                project_id,
+                shape_id,
+                result,
+            } => {
+                if self.target.project_id.as_str() != project_id {
+                    return false;
+                }
+                self.shape_catalog_pending = false;
+                match result {
+                    Ok(()) => {
+                        self.shape_catalog.retain(|entry| entry.id != shape_id);
+                        self.selected_shape_id = None;
+                        self.shape_draft_name.clear();
+                        self.shape_draft_mask = 1;
+                        self.push_toast("Project shape deleted".to_owned(), "success");
+                    }
+                    Err(error) => return self.handle_authenticated_api_error(error),
+                }
+                true
+            }
+            Msg::BeginPlacementDrag(kind, shape) => self.begin_placement_drag(kind, shape),
+            Msg::EndPlacementDrag => self.end_placement_drag(),
+            Msg::CanvasDragOver(event) => self.canvas_drag_over(event),
+            Msg::CanvasDrop(event) => self.canvas_drop(ctx, event),
+            Msg::CanvasResized(width, height) => self.canvas_resized(width, height),
+            Msg::ToggleBlindIsolation => self.toggle_blind_isolation(),
             Msg::CanvasDown(event) => self.canvas_down(ctx, event),
             Msg::CanvasMove(event) => self.canvas_move(ctx, event),
-            Msg::CanvasUp(event) => {
-                if let Some(canvas) = self.canvas_ref.cast::<HtmlCanvasElement>() {
-                    let _ = canvas.release_pointer_capture(event.pointer_id());
-                }
-                self.drag_kind = None;
-                self.last_drag = None;
-                false
-            }
+            Msg::CanvasUp(event) => self.canvas_up(ctx, event),
+            Msg::CanvasCancel(event) => self.canvas_cancel(event),
+            Msg::CanvasLeave => self.queue_cursor(ctx, None),
             Msg::ClearSelection => {
-                self.selected = None;
+                self.blind_gesture = None;
+                self.key_locker_assignment = None;
+                self.selection = None;
                 self.canvas_dirty = true;
                 true
             }
@@ -662,8 +1562,25 @@ impl Component for App {
                 self.palette_open = false;
                 true
             }
+            Msg::SetLeftTab(tab) => {
+                self.left_tab = tab;
+                true
+            }
             Msg::SetRightTab(tab) => {
                 self.right_tab = tab;
+                true
+            }
+            Msg::SetWorkspaceTool(tool) => self.set_workspace_tool(tool),
+            Msg::BeginSidebarResize(side, event) => self.begin_sidebar_resize(side, event),
+            Msg::SidebarResizeMove(event) => self.resize_sidebar(event),
+            Msg::EndSidebarResize(event) => self.end_sidebar_resize(event),
+            Msg::SetPanelLayout(side, layout) => {
+                match side {
+                    SidebarSide::Left => self.left_panel_layout = layout,
+                    SidebarSide::Right => self.right_panel_layout = layout,
+                }
+                self.sidebar_resize = None;
+                self.canvas_dirty = true;
                 true
             }
             Msg::TogglePalette => {
@@ -690,39 +1607,40 @@ impl Component for App {
                 true
             }
             Msg::ResetDraft => {
-                if !self.can_edit_timeline {
-                    self.open_menu = None;
-                    self.push_toast(
-                        "Reset requires the exact edit_timeline capability".to_owned(),
-                        "warning",
-                    );
-                    return true;
-                }
-                if !matches!(self.rpc_state, RpcState::Offline) {
-                    self.open_menu = None;
-                    self.push_toast(
-                        "Reset is local-only and disabled during collaboration".to_owned(),
-                        "warning",
-                    );
-                    return true;
-                }
-                let snapshot = LevelSnapshot::new(8, 8).expect("the fixed editor grid is valid");
-                self.model
-                    .replace_snapshot(snapshot)
-                    .expect("the blank snapshot is valid");
-                self.selected = None;
-                self.canvas_dirty = true;
                 self.open_menu = None;
-                self.persist_draft();
-                self.push_toast("Local draft reset to 8 x 8 floor".to_owned(), "warning");
+                self.push_toast(
+                    "Reset is unavailable because live levels only accept timeline commands"
+                        .to_owned(),
+                    "warning",
+                );
                 true
             }
             Msg::Reconnect => {
+                self.reconnect_failures = 0;
+                self.start_connection(ctx);
+                true
+            }
+            Msg::RetryConnection(attempt) => {
+                if attempt != self.connection_attempt || self.phase != Phase::Editor {
+                    return false;
+                }
+                self.reconnect_timer = None;
                 self.start_connection(ctx);
                 true
             }
             Msg::DismissToast(id) => {
-                self.toasts.retain(|toast| toast.id != id);
+                self.active_toasts.remove(&id);
+                true
+            }
+            Msg::ToggleNotifications => {
+                self.notifications_open = !self.notifications_open;
+                self.open_menu = None;
+                self.palette_open = false;
+                true
+            }
+            Msg::ClearNotifications => {
+                self.toasts.clear();
+                self.active_toasts.clear();
                 true
             }
             Msg::RpcReady { attempt, result } => {
@@ -733,18 +1651,18 @@ impl Component for App {
                     Ok(client) => {
                         self.rpc = Some(client);
                         self.rpc_state = RpcState::Online;
+                        self.reconnect_failures = 0;
+                        self.reconnect_timer = None;
+                        if self.desired_cursor.is_some() {
+                            self.schedule_cursor_flush(ctx);
+                        }
                         self.push_toast(
                             format!("Collaboration connected for {}", self.level_display_name),
                             "success",
                         );
                     }
                     Err(error) => {
-                        self.rpc = None;
-                        self.rpc_state = RpcState::Offline;
-                        self.push_toast(
-                            format!("RPC connection failed; using local draft: {error}"),
-                            "warning",
-                        );
+                        self.schedule_reconnect(ctx, error);
                     }
                 }
                 true
@@ -775,10 +1693,35 @@ impl Component for App {
                 }
                 self.handle_undo_response(ctx, command_id, *result)
             }
+            Msg::FlushCursor(attempt) => {
+                if attempt != self.connection_attempt {
+                    return false;
+                }
+                self.cursor_timer = None;
+                self.flush_cursor(ctx);
+                false
+            }
+            Msg::CursorSent {
+                attempt,
+                cursor,
+                result,
+            } => {
+                if attempt != self.connection_attempt {
+                    return false;
+                }
+                self.cursor_in_flight = false;
+                if result.is_ok() {
+                    self.last_sent_cursor = Some(cursor);
+                }
+                if self.last_sent_cursor != Some(self.desired_cursor) {
+                    self.schedule_cursor_flush(ctx);
+                }
+                false
+            }
         }
     }
 
-    fn rendered(&mut self, _ctx: &Context<Self>, first_render: bool) {
+    fn rendered(&mut self, ctx: &Context<Self>, first_render: bool) {
         if first_render {
             if let Some(root) = self.root_ref.cast::<HtmlElement>() {
                 let _ = root.focus();
@@ -789,9 +1732,18 @@ impl Component for App {
                 let _ = input.focus();
             }
         }
-        if self.phase == Phase::Editor && self.canvas_dirty {
-            let _ = self.draw_canvas();
-            self.canvas_dirty = false;
+        if self.phase == Phase::Editor {
+            self.ensure_canvas_resize_observer(ctx);
+            if let Some(canvas) = self.canvas_ref.cast::<HtmlCanvasElement>() {
+                self.canvas_resized(
+                    u32::try_from(canvas.client_width().max(1)).unwrap_or(CANVAS_WIDTH),
+                    u32::try_from(canvas.client_height().max(1)).unwrap_or(CANVAS_HEIGHT),
+                );
+            }
+            if self.canvas_dirty {
+                let _ = self.draw_canvas();
+                self.canvas_dirty = false;
+            }
         }
     }
 
@@ -811,22 +1763,38 @@ impl Component for App {
                 </div>
             };
         }
+        let shell_style = format!(
+            "--left-sidebar-width: {:.0}px; --right-sidebar-width: {:.0}px;",
+            self.left_sidebar_width, self.right_sidebar_width
+        );
         html! {
             <div
-                class="app-shell"
+                class={classes!(
+                    "app-shell",
+                    self.sidebar_resize.is_some().then_some("resizing-sidebar"),
+                    (self.left_panel_layout != PanelLayout::Docked).then_some("left-overlay"),
+                    (self.right_panel_layout != PanelLayout::Docked).then_some("right-overlay"),
+                )}
                 data-theme={active_theme.name()}
+                style={shell_style}
                 tabindex="0"
                 ref={self.root_ref.clone()}
                 onkeydown={ctx.link().callback(Msg::KeyDown)}
+                onpointermove={ctx.link().callback(Msg::SidebarResizeMove)}
+                onpointerup={ctx.link().callback(Msg::EndSidebarResize)}
+                onpointercancel={ctx.link().callback(Msg::EndSidebarResize)}
             >
                 { self.view_header(ctx) }
-                { self.view_mode_rail(ctx) }
-                { self.view_inspector(ctx) }
+                { if self.left_panel_layout == PanelLayout::Hidden { Html::default() } else { self.view_left_sidebar(ctx) } }
+                { if self.left_panel_layout == PanelLayout::Docked { html! { <div class="sidebar-resizer left-resizer" title="Resize left sidebar" onpointerdown={ctx.link().callback(|event| Msg::BeginSidebarResize(SidebarSide::Left, event))}></div> } } else { Html::default() } }
                 { self.view_canvas(ctx) }
-                { self.view_activity(ctx) }
+                { if self.right_panel_layout == PanelLayout::Docked { html! { <div class="sidebar-resizer right-resizer" title="Resize right sidebar" onpointerdown={ctx.link().callback(|event| Msg::BeginSidebarResize(SidebarSide::Right, event))}></div> } } else { Html::default() } }
+                { if self.right_panel_layout == PanelLayout::Hidden { Html::default() } else { self.view_right_sidebar(ctx) } }
                 { self.view_status() }
                 { self.view_palette(ctx) }
                 { self.view_toasts(ctx) }
+                { self.view_notifications(ctx) }
+                { self.view_level_configuration(ctx) }
             </div>
         }
     }
@@ -884,76 +1852,156 @@ impl App {
     }
 
     fn view_catalog(&self, ctx: &Context<Self>) -> Html {
-        let projects = projects_for_workspace(&self.projects, &self.selected_workspace_id);
+        let query = self.catalog_query.trim().to_ascii_lowercase();
         let email = self
             .user
             .as_ref()
             .map(|user| user.email.as_str())
             .unwrap_or_default();
+        let can_create_project = self.workspaces.iter().any(|workspace| {
+            workspace.id == self.selected_workspace_id
+                && matches!(workspace.role.as_str(), "owner" | "admin")
+        });
         html! {
-            <main class="catalog-stage">
-                <header class="catalog-header">
-                    <div class="access-brand"><span class="mark-glyph">{"OR"}</span><strong>{"OREAK"}</strong><small>{"PROJECT CATALOG"}</small></div>
-                    <div class="catalog-account"><span>{email}</span><button disabled={self.request_pending} onclick={ctx.link().callback(|_| Msg::Logout)}>{"Logout"}</button></div>
-                </header>
-                <aside class="workspace-index">
-                    <div class="catalog-label"><span>{"WORKSPACES"}</span><code>{format!("{:02}", self.workspaces.len())}</code></div>
-                    { for self.workspaces.iter().map(|workspace| {
-                        let id = workspace.id.clone();
-                        html! {
-                            <button class={if self.selected_workspace_id == workspace.id { "workspace-row active" } else { "workspace-row" }} onclick={ctx.link().callback(move |_| Msg::SelectWorkspace(id.clone()))}>
-                                <span>{workspace.name.clone()}</span><small>{format!("{} / {} / {} PRJ", workspace.kind, workspace.role, workspace.project_count)}</small>
-                            </button>
-                        }
-                    }) }
-                </aside>
-                <section class="project-index">
-                    <div class="catalog-label"><span>{"PROJECT INDEX"}</span><code>{format!("{:02}", projects.len())}</code></div>
-                    <div class="project-grid">
-                        { for projects.into_iter().map(|project| {
-                            let selected = self.catalog_project.as_ref().is_some_and(|current| current.id == project.id);
-                            let project_message = project.clone();
-                            html! {
-                                <button class={if selected { "project-card active" } else { "project-card" }} onclick={ctx.link().callback(move |_| Msg::SelectProject(project_message.clone()))}>
-                                    <span class="project-code">{project.id.clone()}</span>
-                                    <strong>{project.name.clone()}</strong>
-                                    <small>{format!("{} LEVELS / MANIFEST V{}", project.level_count, project.plugin_manifest_format_version)}</small>
-                                    <span class={if project.can_edit_timeline() { "capability edit" } else { "capability view" }}>{if project.can_edit_timeline() { "EDIT TIMELINE" } else { "VIEW ONLY" }}</span>
-                                </button>
-                            }
-                        }) }
-                    </div>
-                    <div class="catalog-create">
-                        <label class="technical-field"><span>{"NEW PROJECT / SELECTED WORKSPACE"}</span><input value={self.project_name.clone()} placeholder="Project name" oninput={ctx.link().callback(|event: InputEvent| Msg::ProjectName(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
-                        <button class="primary-action compact" disabled={self.request_pending || self.selected_workspace_id.is_empty() || self.project_name.trim().is_empty()} onclick={ctx.link().callback(|_| Msg::CreateProject)}><span>{"Create project"}</span><code>{"+P"}</code></button>
-                    </div>
-                    { self.form_error.as_ref().map(|error| html! { <div class="access-error catalog-error"><strong>{"API ERROR"}</strong><span>{error}</span></div> }).unwrap_or_default() }
+            <>
+                <main class="catalog-stage hierarchy-catalog">
+                    <header class="catalog-header">
+                        <div class="access-brand"><span class="mark-glyph">{"OR"}</span><strong>{"OREAK"}</strong><small>{"PROJECT HIERARCHY"}</small></div>
+                        <label class="catalog-search"><span>{"SEARCH"}</span><input type="search" placeholder="Workspace, project, level, or ID" value={self.catalog_query.clone()} oninput={ctx.link().callback(|event: InputEvent| Msg::CatalogQuery(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
+                        <div class="catalog-account"><span>{email}</span><button disabled={self.request_pending} onclick={ctx.link().callback(|_| Msg::Logout)}>{"Logout"}</button></div>
+                    </header>
+                    <section class="catalog-tree">
+                        <div class="catalog-label"><span>{"WORKSPACE / PROJECT / LEVEL"}</span><code>{format!("{:02}", self.projects.len())}</code></div>
+                        { if !self.catalog_invitations.is_empty() { html! {
+                            <section class="catalog-invitations">
+                                <div class="tree-section-label"><span>{"PENDING INVITATIONS"}</span><code>{self.catalog_invitations.len()}</code></div>
+                                { for self.catalog_invitations.iter().map(|invitation| {
+                                    let invitation_message = invitation.clone();
+                                    html! { <article><div><strong>{invitation.project_name.clone()}</strong><small>{format!("{} / {}", invitation.roles.join(" + "), invitation.project_id)}</small></div><button disabled={self.request_pending} onclick={ctx.link().callback(move |_| Msg::AcceptProjectInvitation(invitation_message.clone()))}>{"Accept"}</button></article> }
+                                }) }
+                            </section>
+                        } } else { Html::default() } }
+                        <div class="hierarchy-tree">
+                            { for self.workspaces.iter().filter_map(|workspace| {
+                                let workspace_matches = catalog_text_matches(&query, [&workspace.name, &workspace.id]);
+                                let projects = self.projects.iter().filter(|project| project.workspace_id == workspace.id).filter(|project| {
+                                    workspace_matches || catalog_project_matches(project, self.catalog_levels.get(&project.id).map(Vec::as_slice).unwrap_or_default(), &query)
+                                }).collect::<Vec<_>>();
+                                if !query.is_empty() && !workspace_matches && projects.is_empty() { return None; }
+                                let workspace_id = workspace.id.clone();
+                                let expanded = !query.is_empty() || self.expanded_workspaces.contains(&workspace.id);
+                                Some(html! {
+                                    <section class="workspace-branch" key={workspace.id.clone()}>
+                                        <button class="workspace-node" onclick={ctx.link().callback(move |_| Msg::ToggleCatalogWorkspace(workspace_id.clone()))}><span class="tree-toggle">{if expanded { "-" } else { "+" }}</span><span><strong>{workspace.name.clone()}</strong><small>{format!("{} / {} / {} visible", workspace.kind, workspace.role, projects.len())}</small></span><code title={workspace.id.clone()}>{workspace.id.clone()}</code></button>
+                                        { if expanded { html! { <div class="project-branches">{ for projects.into_iter().map(|project| self.view_catalog_project_node(ctx, project, &query)) }</div> } } else { Html::default() } }
+                                    </section>
+                                })
+                            }) }
+                        </div>
+                    </section>
+                    <aside class="catalog-detail">
+                        { if let Some(project) = &self.catalog_project { html! {
+                            <>
+                                <div class="catalog-label"><span>{"PROJECT TARGET"}</span><code>{format!("{:02}", self.levels.len())}</code></div>
+                                <div class="level-project"><small>{"PROJECT"}</small><strong>{project.name.clone()}</strong><code title={project.id.clone()}>{project.id.clone()}</code></div>
+                                <div class="project-detail-actions"><button onclick={{ let project = project.clone(); ctx.link().callback(move |_| Msg::OpenProjectConfiguration(project.clone())) }}>{"Configuration"}</button><span class={if project.can_edit_timeline() { "capability edit" } else { "capability view" }}>{if project.can_edit_timeline() { "EDIT TIMELINE" } else { "VIEW ONLY" }}</span></div>
+                                <div class="level-create">
+                                    <label class="technical-field"><span>{"NEW LEVEL"}</span><input value={self.level_name.clone()} placeholder="Level name" disabled={!project.can_edit_timeline()} oninput={ctx.link().callback(|event: InputEvent| Msg::LevelName(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
+                                    <label class="technical-field duration-field"><span>{"DURATION / SEC"}</span><input type="number" min="0" step="0.1" value={self.level_duration.clone()} disabled={!project.can_edit_timeline()} oninput={ctx.link().callback(|event: InputEvent| Msg::LevelDuration(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
+                                    <button class="primary-action compact" disabled={self.request_pending || !project.can_edit_timeline() || self.level_name.trim().is_empty()} onclick={ctx.link().callback(|_| Msg::CreateLevel)}><span>{"Create and open"}</span><code>{"+L"}</code></button>
+                                </div>
+                            </>
+                        } } else { html! { <div class="catalog-empty"><span>{"NO PROJECT TARGET"}</span><p>{"Choose a project in the hierarchy to inspect it."}</p></div> } } }
+                        <div class="catalog-create">
+                            <label class="technical-field"><span>{"NEW PROJECT / SELECTED WORKSPACE"}</span><input value={self.project_name.clone()} placeholder="Project name" oninput={ctx.link().callback(|event: InputEvent| Msg::ProjectName(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
+                            <button class="primary-action compact" disabled={self.request_pending || !can_create_project || self.project_name.trim().is_empty()} onclick={ctx.link().callback(|_| Msg::CreateProject)}><span>{"Create project"}</span><code>{"+P"}</code></button>
+                        </div>
+                        { self.form_error.as_ref().map(|error| html! { <div class="access-error catalog-error"><strong>{"API ERROR"}</strong><span>{error}</span></div> }).unwrap_or_default() }
+                    </aside>
+                </main>
+                { self.view_project_configuration(ctx) }
+            </>
+        }
+    }
+
+    fn view_catalog_project_node(
+        &self,
+        ctx: &Context<Self>,
+        project: &ProjectSummary,
+        query: &str,
+    ) -> Html {
+        let selected = self
+            .catalog_project
+            .as_ref()
+            .is_some_and(|current| current.id == project.id);
+        let levels = self
+            .catalog_levels
+            .get(&project.id)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let visible_levels = levels
+            .iter()
+            .filter(|level| query.is_empty() || catalog_level_matches(level, query))
+            .collect::<Vec<_>>();
+        let select_project = project.clone();
+        let configure_project = project.clone();
+        html! {
+            <article class={classes!("project-branch", selected.then_some("active"))} key={project.id.clone()}>
+                <div class="project-node"><button class="project-select" onclick={ctx.link().callback(move |_| Msg::SelectProject(select_project.clone()))}><span class="tree-icon">{"P"}</span><span><strong>{project.name.clone()}</strong><small>{format!("{} levels / {}", levels.len(), if project.can_edit_timeline() { "edit" } else { "view" })}</small></span><code title={project.id.clone()}>{project.id.clone()}</code></button><button class="project-config-trigger" title="Project configuration" onclick={ctx.link().callback(move |_| Msg::OpenProjectConfiguration(configure_project.clone()))}>{"CFG"}</button></div>
+                <div class="level-branches">{ for visible_levels.into_iter().map(|level| {
+                    let project = project.clone();
+                    let level_message = level.clone();
+                    html! { <button class="level-node" onclick={ctx.link().callback(move |_| Msg::OpenCatalogLevel(project.clone(), level_message.clone()))}><span class="tree-icon">{"L"}</span><span><strong>{level.name.clone()}</strong><small>{format!("{} revisions", level.revision_count)}</small></span><code title={level.id.clone()}>{level.id.clone()}</code></button> }
+                }) }</div>
+            </article>
+        }
+    }
+
+    fn view_project_configuration(&self, ctx: &Context<Self>) -> Html {
+        let Some(project) = self.configuration_project.as_ref() else {
+            return Html::default();
+        };
+        html! {
+            <div class="configuration-backdrop" onclick={ctx.link().callback(|_| Msg::CloseProjectConfiguration)}>
+                <section class="project-configuration" role="dialog" aria-modal="true" onclick={Callback::from(|event: MouseEvent| event.stop_propagation())}>
+                    <header><div><small>{"PROJECT CONFIGURATION"}</small><strong>{project.name.clone()}</strong><code title={project.id.clone()}>{project.id.clone()}</code></div><button aria-label="Close configuration" onclick={ctx.link().callback(|_| Msg::CloseProjectConfiguration)}>{"x"}</button></header>
+                    { if self.configuration_pending && self.project_configuration.is_none() { html! { <div class="configuration-loading">{"Loading authoritative project configuration..."}</div> } } else if let Some(configuration) = self.project_configuration.as_ref() { html! {
+                        <div class="configuration-body">
+                            <section><div class="configuration-heading"><span>{"DEFAULT THEME"}</span><code>{configuration.project.default_theme.clone()}</code></div><div class="configuration-theme"><button class={classes!((configuration.project.default_theme == "dark").then_some("active"))} disabled={self.configuration_pending || !project.can_manage_theme()} onclick={ctx.link().callback(|_| Msg::SetProjectDefaultTheme("dark".to_owned()))}>{"Dark"}</button><button class={classes!((configuration.project.default_theme == "light").then_some("active"))} disabled={self.configuration_pending || !project.can_manage_theme()} onclick={ctx.link().callback(|_| Msg::SetProjectDefaultTheme("light".to_owned()))}>{"Light"}</button></div></section>
+                            <section><div class="configuration-heading"><span>{"MEMBERS"}</span><code>{configuration.members.len()}</code></div>{ if configuration.members_visible { html! { <div class="configuration-members">{ for configuration.members.iter().map(|member| {
+                                let member_id = member.user_id.clone();
+                                let selected_role = member.roles.first().cloned().unwrap_or_else(|| "viewer".to_owned());
+                                html! { <article><div><strong>{member.email.clone().unwrap_or_else(|| member.user_id.clone())}</strong><code title={member.user_id.clone()}>{member.user_id.clone()}</code></div><select disabled={self.configuration_pending || !project.can_manage_members()} value={selected_role} onchange={ctx.link().callback(move |event: Event| Msg::SetProjectMemberRole(member_id.clone(), event.target_unchecked_into::<HtmlSelectElement>().value()))}><option value="owner">{"Owner"}</option><option value="admin">{"Admin"}</option><option value="editor">{"Editor"}</option><option value="viewer">{"Viewer"}</option></select></article> }
+                            }) }</div> } } else { html! { <p class="configuration-note">{"Member roster requires manage_members permission."}</p> } } }</section>
+                            { if project.can_manage_members() { html! { <section><div class="configuration-heading"><span>{"INVITE REGISTERED USER"}</span><code>{configuration.invitations.len()}</code></div><form class="configuration-invite" onsubmit={ctx.link().callback(|event: SubmitEvent| { event.prevent_default(); Msg::InviteProjectMember })}><input type="email" placeholder="person@example.com" value={self.invitation_email.clone()} oninput={ctx.link().callback(|event: InputEvent| Msg::InvitationEmail(event.target_unchecked_into::<HtmlInputElement>().value()))} /><select value={self.invitation_role.clone()} onchange={ctx.link().callback(|event: Event| Msg::InvitationRole(event.target_unchecked_into::<HtmlSelectElement>().value()))}><option value="editor">{"Editor"}</option><option value="viewer">{"Viewer"}</option><option value="admin">{"Admin"}</option></select><button type="submit" disabled={self.configuration_pending || self.invitation_email.trim().is_empty()}>{"Send invite"}</button></form><div class="pending-invites">{ for configuration.invitations.iter().map(|invitation| html! { <div><span>{invitation.invitee_email.clone()}</span><code>{invitation.roles.join(" + ")}</code></div> }) }</div></section> } } else { Html::default() } }
+                        </div>
+                    } } else { Html::default() } }
+                    { self.configuration_error.as_ref().map(|error| html! { <div class="configuration-error">{error}</div> }).unwrap_or_default() }
                 </section>
-                <aside class="level-index">
-                    <div class="catalog-label"><span>{"LEVELS"}</span><code>{format!("{:02}", self.levels.len())}</code></div>
-                    {
-                        if let Some(project) = &self.catalog_project {
-                            html! {
-                                <>
-                                    <div class="level-project"><small>{"PROJECT"}</small><strong>{project.name.clone()}</strong><code>{project.id.clone()}</code></div>
-                                    <div class="level-list">
-                                        { for self.levels.iter().map(|level| {
-                                            let level_message = level.clone();
-                                            html! { <button onclick={ctx.link().callback(move |_| Msg::OpenLevel(level_message.clone()))}><span><strong>{level.name.clone()}</strong><small>{format!("{} REVISIONS", level.revision_count)}</small></span><code>{"OPEN >"}</code></button> }
-                                        }) }
-                                    </div>
-                                    <div class="level-create">
-                                        <label class="technical-field"><span>{"NEW LEVEL"}</span><input value={self.level_name.clone()} placeholder="Level name" disabled={!project.can_edit_timeline()} oninput={ctx.link().callback(|event: InputEvent| Msg::LevelName(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
-                                        <button class="primary-action compact" disabled={self.request_pending || !project.can_edit_timeline() || self.level_name.trim().is_empty()} onclick={ctx.link().callback(|_| Msg::CreateLevel)}><span>{"Create and open"}</span><code>{"+L"}</code></button>
-                                    </div>
-                                </>
-                            }
-                        } else {
-                            html! { <div class="catalog-empty"><span>{"NO PROJECT TARGET"}</span><p>{"Select a project to inspect or create levels."}</p></div> }
-                        }
-                    }
-                </aside>
-            </main>
+            </div>
+        }
+    }
+
+    fn view_level_configuration(&self, ctx: &Context<Self>) -> Html {
+        if !self.level_configuration_open {
+            return Html::default();
+        }
+        html! {
+            <div class="configuration-backdrop" onclick={ctx.link().callback(|_| Msg::CloseLevelConfiguration)}>
+                <section class="level-configuration" role="dialog" aria-modal="true" aria-label="Level configuration" onclick={Callback::from(|event: MouseEvent| event.stop_propagation())}>
+                    <header>
+                        <div><small>{"LEVEL CONFIGURATION"}</small><strong>{self.level_display_name.clone()}</strong><code>{self.target.level_id.to_string()}</code></div>
+                        <button aria-label="Close level configuration" onclick={ctx.link().callback(|_| Msg::CloseLevelConfiguration)}>{"x"}</button>
+                    </header>
+                    <div class="level-configuration-body">
+                        <label><span>{"NAME"}</span><input value={self.level_configuration_name.clone()} disabled={self.level_configuration_pending || !self.can_edit_timeline} oninput={ctx.link().callback(|event: InputEvent| Msg::LevelConfigurationName(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
+                        <label><span>{"DURATION / SECONDS"}</span><input type="number" min="0" step="0.1" value={self.level_configuration_duration.clone()} disabled={self.level_configuration_pending || !self.can_edit_timeline} oninput={ctx.link().callback(|event: InputEvent| Msg::LevelConfigurationDuration(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
+                        <p>{"Name and duration are authoritative project settings and do not create timeline revisions."}</p>
+                    </div>
+                    { self.level_configuration_error.as_ref().map(|error| html! { <div class="configuration-error">{error}</div> }).unwrap_or_default() }
+                    <footer><button onclick={ctx.link().callback(|_| Msg::CloseLevelConfiguration)}>{"Cancel"}</button><button class="primary-action compact" disabled={self.level_configuration_pending || !self.can_edit_timeline || self.level_configuration_name.trim().is_empty()} onclick={ctx.link().callback(|_| Msg::SaveLevelConfiguration)}>{if self.level_configuration_pending { "Saving..." } else { "Save level" }}</button></footer>
+                </section>
+            </div>
         }
     }
 
@@ -978,7 +2026,7 @@ impl App {
                         <small>{"PROJECT"}</small><span>{self.project_display_name.clone()}</span>
                     </button>
                     <span class="context-slash">{"/"}</span>
-                    <button class="context-part context-level" title="Switch level">
+                    <button class="context-part context-level" title="Configure level" onclick={ctx.link().callback(|_| Msg::OpenLevelConfiguration)}>
                         <small>{"LEVEL"}</small><span>{self.level_display_name.clone()}</span>
                     </button>
                 </div>
@@ -991,8 +2039,10 @@ impl App {
                     >
                         <span>{"Command"}</span><kbd>{"Ctrl K"}</kbd>
                     </button>
-                    <div class="presence-stack presence-unknown" aria-label="Collaborator presence unavailable">
-                        <span class="presence-protocol">{"--"}</span>
+                    <button class={classes!("notification-trigger", self.notifications_open.then_some("active"))} aria-expanded={self.notifications_open.to_string()} title="Open notification history" onclick={ctx.link().callback(|_| Msg::ToggleNotifications)}><span>{"Notices"}</span><code>{self.toasts.len()}</code></button>
+                    <div class="presence-stack" aria-label={format!("{} actors in {} connections", self.presence.actor_count(), self.presence.participant_count())}>
+                        { for self.presence.participants().filter(|participant| !self.presence.is_self(&participant.id)).take(3).map(|participant| html! { <span class="presence" style={format!("background:{}", presence_color(participant.actor.as_str()))}>{actor_mark(participant.actor.as_str())}</span> }) }
+                        <span class="presence-protocol">{self.presence.actor_count()}</span>
                         <small>{"PRESENCE"}</small>
                     </div>
                     <button
@@ -1057,6 +2107,12 @@ impl App {
                     <>
                         <button onclick={ctx.link().callback(|_| Msg::ToggleTheme)}><span>{"Toggle theme"}</span><kbd>{self.theme.active().label()}</kbd></button>
                         <button onclick={ctx.link().callback(|_| Msg::UseProjectTheme)}><span>{"Use project default"}</span><kbd>{self.theme.project_default.label()}</kbd></button>
+                        <button onclick={ctx.link().callback(|_| Msg::SetPanelLayout(SidebarSide::Left, PanelLayout::Docked))}><span>{"Dock tools panel"}</span><kbd>{self.left_panel_layout.label()}</kbd></button>
+                        <button onclick={ctx.link().callback(|_| Msg::SetPanelLayout(SidebarSide::Left, PanelLayout::Floating))}><span>{"Float tools panel"}</span><kbd>{"LEFT"}</kbd></button>
+                        <button onclick={ctx.link().callback(|_| Msg::SetPanelLayout(SidebarSide::Left, PanelLayout::Hidden))}><span>{"Hide tools panel"}</span><kbd>{"LEFT"}</kbd></button>
+                        <button onclick={ctx.link().callback(|_| Msg::SetPanelLayout(SidebarSide::Right, PanelLayout::Docked))}><span>{"Dock inspector panel"}</span><kbd>{self.right_panel_layout.label()}</kbd></button>
+                        <button onclick={ctx.link().callback(|_| Msg::SetPanelLayout(SidebarSide::Right, PanelLayout::Floating))}><span>{"Float inspector panel"}</span><kbd>{"RIGHT"}</kbd></button>
+                        <button onclick={ctx.link().callback(|_| Msg::SetPanelLayout(SidebarSide::Right, PanelLayout::Hidden))}><span>{"Hide inspector panel"}</span><kbd>{"RIGHT"}</kbd></button>
                     </>
                 },
             ),
@@ -1064,130 +2120,447 @@ impl App {
         html! { <div class={classes!("top-menu-popover", class)}>{body}</div> }
     }
 
-    fn view_mode_rail(&self, ctx: &Context<Self>) -> Html {
+    fn view_mode_selector(&self, ctx: &Context<Self>) -> Html {
         html! {
-            <nav class="mode-rail" aria-label="Editor modes">
-                <div class="mode-rail-label">{"MODE"}</div>
-                { html! { for mode in Mode::ALL {
-                    <button
-                        key={mode.label()}
-                        class={if self.mode == mode { "mode-button active" } else { "mode-button" }}
-                        aria-pressed={(self.mode == mode).to_string()}
-                        title={mode.description()}
-                        onclick={ctx.link().callback(move |_| Msg::SetMode(mode))}
-                    >
-                        <kbd>{mode.key()}</kbd>
-                        <span>{mode.label()}</span>
-                    </button>
-                } } }
-                <div class="rail-spacer"></div>
-                <button class="rail-tool" title="Grid snapping enabled">{"#"}</button>
-                <button class="rail-tool" title="Guides visible">{"+"}</button>
-            </nav>
+            <div class="mode-selector">
+                <span class="selector-label">{"MODE"}</span>
+                <nav class="mode-tabs" aria-label="Editor modes">
+                    { html! { for mode in Mode::ALL {
+                        <button
+                            key={mode.label()}
+                            class={classes!((self.mode == mode).then_some("active"), mode.is_parity_gated().then_some("gated"))}
+                            aria-pressed={(self.mode == mode).to_string()}
+                            title={mode.description()}
+                            onclick={ctx.link().callback(move |_| Msg::SetMode(mode))}
+                        ><span class="selector-icon">{mode_icon(mode)}</span><span>{mode.label()}</span><kbd>{mode.key()}</kbd></button>
+                    } } }
+                </nav>
+            </div>
         }
     }
 
-    fn view_inspector(&self, ctx: &Context<Self>) -> Html {
-        let selected_kind = self.selected.and_then(|point| self.effective_cell(point));
+    fn view_left_sidebar(&self, ctx: &Context<Self>) -> Html {
         html! {
-            <aside class="inspector panel">
+            <aside class={classes!("left-sidebar", "panel", (self.left_panel_layout == PanelLayout::Floating).then_some("panel-floating"))}>
+                <div class="panel-tabs left-tabs">
+                    <button
+                        class={classes!((self.left_tab == LeftTab::Tool).then_some("active"))}
+                        title="Current selected tool behavior"
+                        onclick={ctx.link().callback(|_| Msg::SetLeftTab(LeftTab::Tool))}
+                    >{"Tool behavior"}</button>
+                    <button
+                        class={classes!((self.left_tab == LeftTab::Templates).then_some("active"))}
+                        title="Template entities"
+                        onclick={ctx.link().callback(|_| Msg::SetLeftTab(LeftTab::Templates))}
+                    >{"Entity templates"}</button>
+                    <div class="panel-layout-actions"><button title="Dock panel" onclick={ctx.link().callback(|_| Msg::SetPanelLayout(SidebarSide::Left, PanelLayout::Docked))}>{"D"}</button><button title="Float panel" onclick={ctx.link().callback(|_| Msg::SetPanelLayout(SidebarSide::Left, PanelLayout::Floating))}>{"F"}</button><button title="Hide panel" onclick={ctx.link().callback(|_| Msg::SetPanelLayout(SidebarSide::Left, PanelLayout::Hidden))}>{"x"}</button></div>
+                </div>
+                <div class="left-panel-content">
+                    {
+                        match self.left_tab {
+                            LeftTab::Tool => self.view_tool_behavior(ctx),
+                            LeftTab::Templates => self.view_shape_designer(ctx),
+                        }
+                    }
+                </div>
+            </aside>
+        }
+    }
+
+    fn view_tool_behavior(&self, ctx: &Context<Self>) -> Html {
+        let sync_blocked = !matches!(self.rpc_state, RpcState::Online);
+        html! {
+            <>
                 <div class="panel-heading">
-                    <div><small>{"INSPECTOR"}</small><strong>{self.mode.label()}</strong></div>
-                    <span class="panel-code">{"I-01"}</span>
+                    <div><small>{format!("{} MODE", self.mode.label().to_ascii_uppercase())}</small><strong>{self.workspace_tool.label()}</strong></div>
+                    <span class="panel-code">{"T-01"}</span>
                 </div>
                 <section class={classes!("inspector-section", "mode-summary", self.mode.is_parity_gated().then_some("parity-gated"))}>
                     <span class="section-rule"></span>
-                    <p>{self.mode.description()}</p>
+                    <p>{self.workspace_tool.description()}</p>
                 </section>
+                {
+                    match self.workspace_tool {
+                        WorkspaceTool::Place => self.view_place_tool(ctx, sync_blocked),
+                        WorkspaceTool::Transform => self.view_transform_tool(ctx, sync_blocked),
+                        WorkspaceTool::Decorate => self.selected_entity().filter(|entity| matches!(entity.kind(), PlaceableEntityKind::Block(_))).map_or_else(
+                            || html! { <section class="inspector-section"><div class="empty-selection"><span>{"NO BLOCK SELECTED"}</span><p>{"Select one Block to edit its decorators."}</p></div></section> },
+                            |entity| self.view_decorator_controls(ctx, entity, sync_blocked),
+                        ),
+                        WorkspaceTool::Cells => self.view_cell_tool(ctx, sync_blocked),
+                        WorkspaceTool::Resize => self.view_resize_tool(ctx, sync_blocked),
+                        WorkspaceTool::Paint | WorkspaceTool::Fill => self.selected_entity().filter(|entity| entity.as_blind().is_some()).map_or_else(
+                            || html! { <section class="inspector-section"><div class="empty-selection"><span>{"NO POOL SELECTED"}</span><p>{"Select one Pool before editing its pixel canvas."}</p></div></section> },
+                            |entity| self.view_blind_brush_controls(ctx, entity, sync_blocked),
+                        ),
+                        WorkspaceTool::SandboxMove => html! {
+                            <section class="inspector-section"><div class="empty-selection"><span>{"PARITY GATED"}</span><p>{"Sandbox movement is visible as a mode target but has no browser command yet."}</p></div></section>
+                        },
+                    }
+                }
+            </>
+        }
+    }
+
+    fn view_place_tool(&self, ctx: &Context<Self>, sync_blocked: bool) -> Html {
+        let template_disabled =
+            self.mode != Mode::Select || !self.can_edit_timeline || sync_blocked;
+        let shape = Shape::new(1, 1, 1).expect("single-cell template is valid");
+        html! {
+            <section class="inspector-section">
+                <h2>{"Drag template onto canvas"}</h2>
+                <div class="entity-command-row placement-row template-row">
+                    <button disabled={template_disabled} draggable={(!template_disabled).to_string()} ondragstart={template_drag_callback(ctx, PlacementKind::Block, shape)} ondragend={ctx.link().callback(|_| Msg::EndPlacementDrag)}><span class="swatch block"></span>{"Block"}<kbd>{"DRAG"}</kbd></button>
+                    <button disabled={template_disabled} draggable={(!template_disabled).to_string()} ondragstart={template_drag_callback(ctx, PlacementKind::Blind, shape)} ondragend={ctx.link().callback(|_| Msg::EndPlacementDrag)}><span class="swatch blind"></span>{"Pool"}<kbd>{"DRAG"}</kbd></button>
+                </div>
+                <p class="inspector-note">{"Drop on an unoccupied floor cell. Each drop creates one entity and one undoable event."}</p>
+            </section>
+        }
+    }
+
+    fn view_transform_tool(&self, ctx: &Context<Self>, sync_blocked: bool) -> Html {
+        let entity_ids = self.selected_entity_ids();
+        let edit_disabled = entity_ids.is_empty()
+            || !self.can_edit_timeline
+            || sync_blocked
+            || entity_ids
+                .iter()
+                .any(|entity_id| self.pending_entities.contains_key(entity_id));
+        html! {
+            <section class="inspector-section">
+                <h2>{if entity_ids.len() > 1 { "Group transform" } else { "Entity transform" }}</h2>
+                <div class="entity-move-grid">
+                    <span></span>
+                    <button disabled={edit_disabled} title="Move one cell up" onclick={ctx.link().callback(|_| Msg::EditEntity(EntityAction::Move(MoveDirection::Up)))}>{"Y-"}</button>
+                    <span></span>
+                    <button disabled={edit_disabled} title="Move one cell left" onclick={ctx.link().callback(|_| Msg::EditEntity(EntityAction::Move(MoveDirection::Left)))}>{"X-"}</button>
+                    <button disabled={edit_disabled} title="Move one cell down" onclick={ctx.link().callback(|_| Msg::EditEntity(EntityAction::Move(MoveDirection::Down)))}>{"Y+"}</button>
+                    <button disabled={edit_disabled} title="Move one cell right" onclick={ctx.link().callback(|_| Msg::EditEntity(EntityAction::Move(MoveDirection::Right)))}>{"X+"}</button>
+                </div>
+                <div class="entity-command-row">
+                    <button disabled={edit_disabled || entity_ids.len() != 1} onclick={ctx.link().callback(|_| Msg::EditEntity(EntityAction::RotateClockwise))}>{"Rotate CW"}</button>
+                    <button disabled={edit_disabled || entity_ids.len() != 1} onclick={ctx.link().callback(|_| Msg::EditEntity(EntityAction::FlipHorizontal))}>{"Flip H"}</button>
+                </div>
+                <button class="entity-delete" disabled={edit_disabled || entity_ids.len() != 1} onclick={ctx.link().callback(|_| Msg::EditEntity(EntityAction::Delete))}>{"Delete entity"}</button>
+                <p class="inspector-note">{"Shift-click forms an ordered group. Drag or use arrows to commit one atomic move."}</p>
+            </section>
+        }
+    }
+
+    fn view_cell_tool(&self, ctx: &Context<Self>, sync_blocked: bool) -> Html {
+        let selected_cell = self.selected_cell();
+        let selected_kind = selected_cell.and_then(|point| self.effective_cell(point));
+        let disabled = selected_cell.is_none() || !self.can_edit_timeline || sync_blocked;
+        html! {
+            <section class="inspector-section">
+                <h2>{"Cell material"}</h2>
+                <div class="segmented-control">
+                    <button class={classes!((selected_kind == Some(CellKind::Floor)).then_some("active"))} disabled={disabled} onclick={ctx.link().callback(|_| Msg::SetSelectedKind(CellKind::Floor))}><span class="swatch floor"></span>{"Floor"}</button>
+                    <button class={classes!((selected_kind == Some(CellKind::Wall)).then_some("active"))} disabled={disabled} onclick={ctx.link().callback(|_| Msg::SetSelectedKind(CellKind::Wall))}><span class="swatch wall"></span>{"Wall"}</button>
+                </div>
+                <p class="inspector-note">{"Drag across the canvas to paint the toggled material."}</p>
+            </section>
+        }
+    }
+
+    fn view_resize_tool(&self, ctx: &Context<Self>, sync_blocked: bool) -> Html {
+        html! {
+            <section class="inspector-section resize-controls">
+                <h2>{"Map dimensions"}</h2>
+                <div class="resize-dimensions">
+                    <label><span>{"Width"}</span><input type="number" min="1" max="256" value={self.resize_width.clone()} oninput={ctx.link().callback(|event: InputEvent| Msg::ResizeWidth(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
+                    <label><span>{"Height"}</span><input type="number" min="1" max="256" value={self.resize_height.clone()} oninput={ctx.link().callback(|event: InputEvent| Msg::ResizeHeight(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
+                </div>
+                <div class="resize-anchor-grid" aria-label="Resize anchor">
+                    { for [
+                        GridAnchor::TopLeft, GridAnchor::Top, GridAnchor::TopRight,
+                        GridAnchor::Left, GridAnchor::Center, GridAnchor::Right,
+                        GridAnchor::BottomLeft, GridAnchor::Bottom, GridAnchor::BottomRight,
+                    ].into_iter().map(|anchor| html! {
+                        <button class={classes!((self.resize_anchor == anchor).then_some("active"))} title={grid_anchor_label(anchor)} onclick={ctx.link().callback(move |_| Msg::SetResizeAnchor(anchor))}></button>
+                    }) }
+                </div>
+                <button class="resize-apply" disabled={!self.can_edit_timeline || sync_blocked || self.pending_grid.is_some()} onclick={ctx.link().callback(|_| Msg::ResizeGrid)}>{"Resize without clipping"}</button>
+            </section>
+        }
+    }
+
+    fn view_selection_inspector(&self, ctx: &Context<Self>) -> Html {
+        let selected_cell = self.selected_cell();
+        let selected_kind = selected_cell.and_then(|point| self.effective_cell(point));
+        let selected_entity = self.selected_entity();
+        let selected_entity_count = self.selected_entity_ids().len();
+        let size = self.model.timeline().snapshot().size();
+        html! {
+            <div class="activity-content inspector-content">
+                <div class="panel-heading compact-heading">
+                    <div><small>{"CURRENT TARGET"}</small><strong>{selection_status(self.selection.as_ref())}</strong></div>
+                    <span class="panel-code">{"I-01"}</span>
+                </div>
                 <section class="inspector-section">
                     <h2>{"Selection"}</h2>
                     {
-                        if let Some(point) = self.selected {
+                        if selected_entity_count > 1 {
+                            html! {
+                                <div class="property-table">
+                                    <div><span>{"Target"}</span><strong>{"Entity group"}</strong></div>
+                                    <div><span>{"Count"}</span><strong>{selected_entity_count}</strong></div>
+                                    <div><span>{"Order"}</span><code>{self.selected_entity_ids().iter().map(ToString::to_string).collect::<Vec<_>>().join(" -> ")}</code></div>
+                                </div>
+                            }
+                        } else if let Some(entity) = selected_entity {
+                            let shape = entity.shape();
+                            html! {
+                                <div class="property-table">
+                                    <div><span>{"Target"}</span><strong>{"Placeable entity"}</strong></div>
+                                    <div><span>{"ID"}</span><code title={entity.id().to_string()}>{entity.id().to_string()}</code></div>
+                                    <div><span>{"Kind"}</span><strong>{entity_kind_label(entity.kind())}</strong></div>
+                                    <div><span>{"Origin"}</span><code>{format!("x{:02} / y{:02}", entity.origin().x, entity.origin().y)}</code></div>
+                                    <div><span>{"Shape"}</span><code>{format!("{} x {} / {} cells", shape.width(), shape.height(), shape.occupied_count())}</code></div>
+                                </div>
+                            }
+                        } else if let Some(point) = selected_cell {
                             html! {
                                 <div class="property-table">
                                     <div><span>{"Target"}</span><strong>{"Logical cell"}</strong></div>
                                     <div><span>{"Coordinate"}</span><code>{format!("x{:02} / y{:02}", point.x, point.y)}</code></div>
                                     <div><span>{"Kind"}</span><strong>{cell_kind_label(selected_kind.unwrap_or(CellKind::Floor))}</strong></div>
-                                    <div><span>{"Index"}</span><code>{format!("{:03}", point.x + point.y * 8)}</code></div>
+                                    <div><span>{"Index"}</span><code>{format!("{:03}", point.x + point.y * size.width())}</code></div>
                                 </div>
                             }
                         } else {
-                            html! { <div class="empty-selection"><span>{"NO TARGET"}</span><p>{"Select a cell on the canvas."}</p></div> }
+                            html! { <div class="empty-selection"><span>{"NO TARGET"}</span><p>{"Select a cell or entity footprint on the canvas."}</p></div> }
                         }
                     }
                 </section>
-                <section class="inspector-section">
-                    <h2>{"Cell material"}</h2>
-                    <div class="segmented-control">
-                        <button
-                            class={if selected_kind == Some(CellKind::Floor) { "active" } else { "" }}
-                            disabled={self.selected.is_none() || self.mode != Mode::Map || !self.can_edit_timeline}
-                            onclick={ctx.link().callback(|_| Msg::SetSelectedKind(CellKind::Floor))}
-                        ><span class="swatch floor"></span>{"Floor"}</button>
-                        <button
-                            class={if selected_kind == Some(CellKind::Wall) { "active" } else { "" }}
-                            disabled={self.selected.is_none() || self.mode != Mode::Map || !self.can_edit_timeline}
-                            onclick={ctx.link().callback(|_| Msg::SetSelectedKind(CellKind::Wall))}
-                        ><span class="swatch wall"></span>{"Wall"}</button>
-                    </div>
-                </section>
+                { selected_entity.map(view_entity_kind_details).unwrap_or_default() }
+                { self.view_pool_resolution(ctx, selected_entity) }
                 <section class="inspector-section scene-tree">
                     <h2>{"Level structure"}</h2>
                     <button class="tree-row expanded"><span>{"v"}</span><strong>{self.level_display_name.clone()}</strong><code>{"ROOT"}</code></button>
-                    <button class="tree-row child active"><span>{"#"}</span><strong>{"Logical map"}</strong><code>{"8x8"}</code></button>
-                    <button class="tree-row child muted"><span>{"*"}</span><strong>{"Brush parity"}</strong><code>{"GATED"}</code></button>
-                    <button class="tree-row child muted"><span>{"@"}</span><strong>{"Sandbox parity"}</strong><code>{"GATED"}</code></button>
+                    <button class="tree-row child active"><span>{"#"}</span><strong>{"Logical map"}</strong><code>{format!("{}x{}", size.width(), size.height())}</code></button>
+                    <button class="tree-row child"><span>{"E"}</span><strong>{"Core placeables"}</strong><code>{self.model.timeline().snapshot().entities().len()}</code></button>
                 </section>
                 <section class="inspector-section project-theme">
                     <h2>{"Theme source"}</h2>
                     <div class="theme-source-line">
                         <span class="source-dot"></span>
-                        <div>
-                            <strong>{self.theme.active().label()}</strong>
-                            <small>{if self.theme.user_override.is_some() { "User override" } else { "Project default" }}</small>
-                        </div>
+                        <div><strong>{self.theme.active().label()}</strong><small>{if self.theme.user_override.is_some() { "User override" } else { "Project default" }}</small></div>
                         <button onclick={ctx.link().callback(|_| Msg::UseProjectTheme)}>{"Reset"}</button>
                     </div>
                 </section>
-            </aside>
+            </div>
+        }
+    }
+
+    fn view_pool_resolution(
+        &self,
+        ctx: &Context<Self>,
+        selected_entity: Option<&PlaceableEntity>,
+    ) -> Html {
+        let Some(entity) = selected_entity else {
+            return Html::default();
+        };
+        let Some(blind) = entity.as_blind() else {
+            return Html::default();
+        };
+        let disabled = !self.can_edit_timeline
+            || !matches!(self.rpc_state, RpcState::Online)
+            || self.pending_entities.contains_key(entity.id());
+        html! {
+            <section class="inspector-section pool-resolution">
+                <h2>{"Pool resolution"}</h2>
+                <label><span>{"Pixels per cell"}</span><input type="number" min="1" max="32" value={blind.pixels_per_cell().to_string()} disabled={disabled} onchange={ctx.link().callback(|event: Event| {
+                    let value = event.target_unchecked_into::<HtmlInputElement>().value().parse().unwrap_or(0);
+                    Msg::SetPoolResolution(value)
+                })} /></label>
+                <small>{"Changing resolution resamples paint to nearest pixel center and is undoable."}</small>
+            </section>
+        }
+    }
+
+    fn view_shape_designer(&self, ctx: &Context<Self>) -> Html {
+        let shape = shape_from_designer_mask(self.shape_draft_mask).ok();
+        let can_drag = self.mode == Mode::Select
+            && self.can_edit_timeline
+            && matches!(self.rpc_state, RpcState::Online)
+            && shape.is_some();
+        html! {
+            <section class="inspector-section shape-designer">
+                <div class="shape-designer-heading"><h2>{"Shape designer"}</h2><code>{shape.map_or_else(|| "INVALID".to_owned(), |shape| format!("{}x{} / {}", shape.width(), shape.height(), shape.occupied_count()))}</code></div>
+                <div class="shape-grid" aria-label="8 by 8 shape designer">
+                    { html! { for index in 0_u8..64 {
+                        <button
+                            key={index}
+                            class={classes!((self.shape_draft_mask & (1_u64 << u32::from(index)) != 0).then_some("active"))}
+                            aria-label={format!("Shape cell {}, {}", index % 8, index / 8)}
+                            onclick={ctx.link().callback(move |_| Msg::ToggleShapeCell(index % 8, index / 8))}
+                        ></button>
+                    } } }
+                </div>
+                <label class="shape-name"><span>{"Sample name"}</span><input value={self.shape_draft_name.clone()} placeholder="Connected shape" oninput={ctx.link().callback(|event: InputEvent| Msg::ShapeDraftName(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
+                <div class="shape-save-row">
+                    <button disabled={self.shape_catalog_pending || !self.can_edit_timeline || shape.is_none() || self.shape_draft_name.trim().is_empty()} onclick={ctx.link().callback(|_| Msg::SaveShapeDraft)}>{"Save new"}</button>
+                    <button disabled={self.shape_catalog_pending || !self.can_edit_timeline || self.selected_shape_id.is_none() || shape.is_none()} onclick={ctx.link().callback(|_| Msg::UpdateShapeDraft)}>{"Update"}</button>
+                    <button disabled={self.shape_catalog_pending || !self.can_edit_timeline || self.selected_shape_id.is_none()} onclick={ctx.link().callback(|_| Msg::DeleteShapeDraft)}>{"Delete"}</button>
+                    <button onclick={ctx.link().callback(|_| Msg::NewShapeDraft)}>{"New"}</button>
+                </div>
+                <div class="shape-catalog">
+                    { if self.shape_catalog_pending && self.shape_catalog.is_empty() {
+                        html! { <span>{"Loading project shapes..."}</span> }
+                    } else if self.shape_catalog.is_empty() {
+                        html! { <span>{"No project shapes saved."}</span> }
+                    } else {
+                        html! { for sample in &self.shape_catalog {
+                            <button class={classes!((self.selected_shape_id.as_ref() == Some(&sample.id)).then_some("active"))} title={format!("{} x {}", sample.shape.width, sample.shape.height)} onclick={{ let id = sample.id.clone(); ctx.link().callback(move |_| Msg::SelectShape(id.clone())) }}><strong>{&sample.name}</strong><code>{format!("{}x{}", sample.shape.width, sample.shape.height)}</code></button>
+                        } }
+                    } }
+                </div>
+                <div class="shape-place-row">
+                    <button disabled={!can_drag} draggable={can_drag.to_string()} ondragstart={template_drag_callback(ctx, PlacementKind::Block, shape.unwrap_or_else(|| Shape::new(1, 1, 1).expect("fallback shape is valid")))} ondragend={ctx.link().callback(|_| Msg::EndPlacementDrag)}><span class="swatch block"></span>{"Block"}<kbd>{"DRAG"}</kbd></button>
+                    <button disabled={!can_drag} draggable={can_drag.to_string()} ondragstart={template_drag_callback(ctx, PlacementKind::Blind, shape.unwrap_or_else(|| Shape::new(1, 1, 1).expect("fallback shape is valid")))} ondragend={ctx.link().callback(|_| Msg::EndPlacementDrag)}><span class="swatch blind"></span>{"Pool"}<kbd>{"DRAG"}</kbd></button>
+                </div>
+                <p class="inspector-note">{"Toggle cells, keep the footprint edge-connected, then save it for the project or drag either template onto the canvas."}</p>
+            </section>
+        }
+    }
+
+    fn view_blind_brush_controls(
+        &self,
+        ctx: &Context<Self>,
+        entity: &PlaceableEntity,
+        sync_blocked: bool,
+    ) -> Html {
+        if self.mode != Mode::Brush || entity.as_blind().is_none() {
+            return Html::default();
+        }
+        let disabled = !self.can_edit_timeline
+            || sync_blocked
+            || self.blind_gesture.is_some()
+            || self.pending_entities.contains_key(entity.id());
+        html! {
+            <section class="inspector-section blind-brush-controls">
+                <h2>{if self.blind_brush_tool == BlindBrushTool::Paint { "Pool paint color" } else { "Pool fill color" }}</h2>
+                <div class="brush-color-grid" aria-label="Pool paint color">
+                    { for (1_u8..=10).map(|color_index| {
+                        let style = format!("--brush-color: {}", blind_color(color_index));
+                        html! {
+                            <button
+                                key={color_index}
+                                class={classes!((self.blind_color_index == color_index).then_some("active"))}
+                                style={style}
+                                title={format!("Color {color_index}")}
+                                aria-label={format!("Color {color_index}")}
+                                aria-pressed={(self.blind_color_index == color_index).to_string()}
+                                disabled={disabled}
+                                onclick={ctx.link().callback(move |_| Msg::SetBlindColor(color_index))}
+                            ><span></span><kbd>{if color_index == 10 { "0".to_owned() } else { color_index.to_string() }}</kbd></button>
+                        }
+                    }) }
+                </div>
+                <button class={classes!("blind-isolation", (self.isolated_blind.as_ref() == Some(entity.id())).then_some("active"))} disabled={self.blind_gesture.is_some()} onclick={ctx.link().callback(|_| Msg::ToggleBlindIsolation)}>{if self.isolated_blind.as_ref() == Some(entity.id()) { "Exit isolation" } else { "Isolate Pool canvas" }}</button>
+                <p class="inspector-note">{if self.blind_brush_tool == BlindBrushTool::Paint { "LMB paints and Shift+LMB drags erase. Right or middle drag pans the board." } else { "LMB fills one connected empty region. Right or middle drag pans the board." }}</p>
+            </section>
+        }
+    }
+
+    fn view_decorator_controls(
+        &self,
+        ctx: &Context<Self>,
+        entity: &PlaceableEntity,
+        sync_blocked: bool,
+    ) -> Html {
+        if self.mode != Mode::Select || !matches!(entity.kind(), PlaceableEntityKind::Block(_)) {
+            return Html::default();
+        }
+        let snapshot = self.model.timeline().snapshot();
+        let ice_count = snapshot.ice_blocking_count(entity.id());
+        let direction = snapshot.direction_mode(entity.id());
+        let outgoing = key_locker_for_key(snapshot, entity.id());
+        let incoming = key_locker_for_lock(snapshot, entity.id());
+        let pending_assignment = self.key_locker_assignment.as_ref() == Some(entity.id());
+        let disabled = !self.can_edit_timeline
+            || sync_blocked
+            || self.pending_entities.contains_key(entity.id());
+        let outgoing_label = outgoing.and_then(|decorator| match decorator.kind() {
+            DecoratorKind::KeyLocker { entity, .. } => Some(entity.to_string()),
+            _ => None,
+        });
+        let incoming_label = incoming.and_then(|decorator| match decorator.kind() {
+            DecoratorKind::KeyLocker { key, .. } => Some(key.to_string()),
+            _ => None,
+        });
+        html! {
+            <section class="inspector-section decorator-controls">
+                <h2>{"Decorators"}</h2>
+                <div class="decorator-row">
+                    <div><strong>{"Ice"}</strong><small>{if ice_count == 0 { "disabled".to_owned() } else { format!("blocks {ice_count}") }}</small></div>
+                    <button class={classes!((ice_count > 0).then_some("active"))} disabled={disabled} onclick={ctx.link().callback(|_| Msg::EditDecorator(DecoratorAction::ToggleIce))}>{if ice_count > 0 { "On" } else { "Off" }}<kbd>{"I"}</kbd></button>
+                </div>
+                <label class="decorator-count"><span>{"Blocking count"}</span><input type="number" min="0" value={ice_count.to_string()} disabled={disabled} onchange={ctx.link().callback(|event: Event| Msg::SetIceCount(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
+                <div class="decorator-heading"><span>{"Direction"}</span><kbd>{"D / cycle"}</kbd></div>
+                <div class="direction-control">
+                    { for [
+                        (DirectionMode::Disabled, "None"),
+                        (DirectionMode::Horizontal, "Horizontal"),
+                        (DirectionMode::Vertical, "Vertical"),
+                    ].into_iter().map(|(mode, label)| html! {
+                        <button class={classes!((direction == mode).then_some("active"))} disabled={disabled} onclick={ctx.link().callback(move |_| Msg::EditDecorator(DecoratorAction::SetDirection(mode)))}>{label}</button>
+                    }) }
+                </div>
+                <div class="decorator-heading"><span>{"Key & Locker"}</span><kbd>{"K"}</kbd></div>
+                <div class="key-locker-state">
+                    <div><span>{"Carries key"}</span><code title={outgoing_label.clone().unwrap_or_default()}>{outgoing_label.unwrap_or_else(|| "none".to_owned())}</code></div>
+                    <div><span>{"Unlocked by"}</span><code title={incoming_label.clone().unwrap_or_default()}>{incoming_label.unwrap_or_else(|| "none".to_owned())}</code></div>
+                </div>
+                <button class={classes!("key-locker-action", pending_assignment.then_some("active"))} disabled={disabled} onclick={ctx.link().callback(|_| Msg::EditDecorator(DecoratorAction::BeginKeyLocker))}>{if pending_assignment { "Cancel assignment" } else if outgoing.is_some() { "Reassign locker" } else { "Assign locker" }}</button>
+                { if pending_assignment { html! { <p class="inspector-note assignment-prompt">{"Click a different available Block on the canvas. Invalid targets keep assignment active."}</p> } } else { Html::default() } }
+            </section>
         }
     }
 
     fn view_canvas(&self, ctx: &Context<Self>) -> Html {
-        let blame = self.selected.and_then(|point| self.blame_for_cell(point));
+        let blame = self.blame_for_selection();
+        let size = self.model.timeline().snapshot().size();
         let connection_label = match self.rpc_state {
             RpcState::Online => "SERVER LIVE",
             RpcState::Connecting => "CONNECTING",
             RpcState::Resyncing => "RESYNCING",
-            RpcState::Offline => "LOCAL DRAFT",
+            RpcState::Offline => "RECONNECTING",
         };
         html! {
             <main class="workbench">
                 <div class="canvas-toolbar">
-                    <div class="tool-group">
-                        <button class="tool-button active">{format!("{} tool", self.mode.label())}</button>
-                        <span class="tool-divider"></span>
-                        <button class="tool-button">{"Grid 8 x 8"}</button>
-                        <button class="tool-button">{"Snap 1.0"}</button>
+                    { self.view_mode_selector(ctx) }
+                    <div class="viewport-tools">
+                        <button class="tool-button" title="Zoom out" onclick={ctx.link().callback(|_| Msg::ZoomOut)}>{"-"}</button>
+                        <button class="tool-button" title="Frame the full grid" onclick={ctx.link().callback(|_| Msg::FrameGrid)}>{"Frame"}</button>
+                        <button class="tool-button" title="Zoom in" onclick={ctx.link().callback(|_| Msg::ZoomIn)}>{"+"}</button>
                     </div>
                     <div class="canvas-readout">
                         <span><i class={classes!("status-dot", if matches!(self.rpc_state, RpcState::Online) { "online" } else { "local" })}></i>{connection_label}</span>
                         <code>{format!("{} EV", self.activity_events().len())}</code>
                         <code>{format!("{} PENDING", self.pending_commands.len())}</code>
-                        <span>{"100%"}</span>
+                        <span>{format!("{:.0}%", self.viewport.scale * 100.0)}</span>
                     </div>
                 </div>
                 <div class="canvas-stage">
                     <div class="axis-label axis-y">{"Y / ROW"}</div>
                     <canvas
                         ref={self.canvas_ref.clone()}
-                        width={CANVAS_SIZE.to_string()}
-                        height={CANVAS_SIZE.to_string()}
-                        aria-label="8 by 8 editable logical map"
+                        width={self.canvas_width.to_string()}
+                        height={self.canvas_height.to_string()}
+                        class={classes!(self.entity_drag.as_ref().is_some_and(|drag| drag.active).then_some("entity-dragging"), self.pan_gesture.is_some().then_some("panning"), self.placement_drag.is_some().then_some("placement-target"), self.map_resize_gesture.as_ref().is_some_and(|gesture| matches!(gesture.edge, MapResizeEdge::Left | MapResizeEdge::Right)).then_some("resize-horizontal"), self.map_resize_gesture.as_ref().is_some_and(|gesture| matches!(gesture.edge, MapResizeEdge::Top | MapResizeEdge::Bottom)).then_some("resize-vertical"))}
+                        aria-label={format!("{} by {} editable logical map", size.width(), size.height())}
+                        ondragover={ctx.link().callback(Msg::CanvasDragOver)}
+                        ondrop={ctx.link().callback(Msg::CanvasDrop)}
                         onpointerdown={ctx.link().callback(Msg::CanvasDown)}
                         onpointermove={ctx.link().callback(Msg::CanvasMove)}
                         onpointerup={ctx.link().callback(Msg::CanvasUp)}
-                        onpointercancel={ctx.link().callback(Msg::CanvasUp)}
+                        onpointercancel={ctx.link().callback(Msg::CanvasCancel)}
+                        onpointerleave={ctx.link().callback(|_| Msg::CanvasLeave)}
+                        onwheel={ctx.link().callback(Msg::CanvasWheel)}
+                        oncontextmenu={Callback::from(|event: web_sys::MouseEvent| event.prevent_default())}
                     ></canvas>
                     <div class="axis-label axis-x">{"X / COLUMN"}</div>
                     {
@@ -1199,19 +2572,67 @@ impl App {
                     }
                     { self.view_blame_popover(ctx, blame) }
                 </div>
+                { self.view_tool_selector(ctx) }
             </main>
         }
     }
 
+    fn view_tool_selector(&self, ctx: &Context<Self>) -> Html {
+        html! {
+            <div class="workspace-tool-selector">
+                <span class="selector-label">{"TOOL"}</span>
+                <nav class="workspace-tool-tabs" aria-label={format!("{} mode tools", self.mode.label())}>
+                    { for WorkspaceTool::for_mode(self.mode).iter().copied().map(|tool| html! {
+                        <button
+                            class={classes!((self.workspace_tool == tool).then_some("active"))}
+                            aria-pressed={(self.workspace_tool == tool).to_string()}
+                            title={tool.description()}
+                            onclick={ctx.link().callback(move |_| Msg::SetWorkspaceTool(tool))}
+                        ><span class="selector-icon">{tool.icon()}</span><span>{tool.label()}</span><kbd>{tool.key()}</kbd></button>
+                    }) }
+                </nav>
+                <div class="tool-context-readout"><code>{format!("{} x {}", self.model.timeline().snapshot().size().width(), self.model.timeline().snapshot().size().height())}</code><span>{format!("{:.0}%", self.viewport.scale * 100.0)}</span></div>
+            </div>
+        }
+    }
+
     fn view_blame_popover(&self, ctx: &Context<Self>, blame: Option<BlameEntry>) -> Html {
-        let Some(point) = self.selected else {
+        let Some(selection) = self.selection.as_ref() else {
             return Html::default();
         };
+        let (target_label, target_code, empty_detail) = match selection {
+            Selection::Cell(point) => (
+                "CELL BLAME",
+                format!("{:02}:{:02}", point.x, point.y),
+                if matches!(self.rpc_state, RpcState::Online | RpcState::Resyncing) {
+                    "Base cell with no recorded change"
+                } else {
+                    "Base or restored local draft cell"
+                },
+            ),
+            Selection::Entities(entity_ids) => (
+                if entity_ids.len() == 1 {
+                    "ENTITY BLAME"
+                } else {
+                    "GROUP SELECTION"
+                },
+                if entity_ids.len() == 1 {
+                    entity_ids[0].to_string()
+                } else {
+                    format!("{} entities", entity_ids.len())
+                },
+                if entity_ids.len() == 1 {
+                    "Entity has no observed provenance in this session"
+                } else {
+                    "Select one entity to inspect its provenance"
+                },
+            ),
+        };
         html! {
-            <div class="blame-popover" role="dialog" aria-label="Cell blame">
+            <div class="blame-popover" role="dialog" aria-label="Selection blame">
                 <div class="popover-head">
-                    <span>{"CELL BLAME"}</span>
-                    <code>{format!("{:02}:{:02}", point.x, point.y)}</code>
+                    <span>{target_label}</span>
+                    <code title={target_code.clone()}>{target_code}</code>
                     <button aria-label="Close blame" onclick={ctx.link().callback(|_| Msg::ClearSelection)}>{"x"}</button>
                 </div>
                 {
@@ -1225,7 +2646,7 @@ impl App {
                         }
                     } else {
                         html! {
-                            <div class="popover-empty"><strong>{"No observed provenance"}</strong><small>{if matches!(self.rpc_state, RpcState::Online | RpcState::Resyncing) { "Base cell with no recorded change" } else { "Base or restored local draft cell" }}</small></div>
+                            <div class="popover-empty"><strong>{"No observed provenance"}</strong><small>{empty_detail}</small></div>
                         }
                     }
                 }
@@ -1233,11 +2654,15 @@ impl App {
         }
     }
 
-    fn view_activity(&self, ctx: &Context<Self>) -> Html {
-        let selected_blame = self.selected.and_then(|point| self.blame_for_cell(point));
+    fn view_right_sidebar(&self, ctx: &Context<Self>) -> Html {
+        let selected_blame = self.blame_for_selection();
         html! {
-            <aside class="activity panel">
+            <aside class={classes!("right-sidebar", "panel", (self.right_tab == RightTab::Activity).then_some("with-presence"), (self.right_panel_layout == PanelLayout::Floating).then_some("panel-floating"))}>
                 <div class="panel-tabs">
+                    <button
+                        class={if self.right_tab == RightTab::Inspector { "active" } else { "" }}
+                        onclick={ctx.link().callback(|_| Msg::SetRightTab(RightTab::Inspector))}
+                    >{"Inspector"}</button>
                     <button
                         class={if self.right_tab == RightTab::Activity { "active" } else { "" }}
                         onclick={ctx.link().callback(|_| Msg::SetRightTab(RightTab::Activity))}
@@ -1246,17 +2671,30 @@ impl App {
                         class={if self.right_tab == RightTab::Blame { "active" } else { "" }}
                         onclick={ctx.link().callback(|_| Msg::SetRightTab(RightTab::Blame))}
                     >{"Blame"}</button>
+                    <div class="panel-layout-actions"><button title="Dock panel" onclick={ctx.link().callback(|_| Msg::SetPanelLayout(SidebarSide::Right, PanelLayout::Docked))}>{"D"}</button><button title="Float panel" onclick={ctx.link().callback(|_| Msg::SetPanelLayout(SidebarSide::Right, PanelLayout::Floating))}>{"F"}</button><button title="Hide panel" onclick={ctx.link().callback(|_| Msg::SetPanelLayout(SidebarSide::Right, PanelLayout::Hidden))}>{"x"}</button></div>
                 </div>
                 {
                     match self.right_tab {
+                        RightTab::Inspector => self.view_selection_inspector(ctx),
                         RightTab::Activity => self.view_activity_feed(),
                         RightTab::Blame => self.view_blame_panel(selected_blame),
                     }
                 }
-                <section class="collaborators">
-                    <div class="section-title"><span>{"PRESENCE"}</span><code>{"UNAVAILABLE"}</code></div>
-                    <div class="presence-unavailable"><strong>{"No roster in protocol"}</strong><small>{"Level events include actor IDs; online collaborator counts are not exposed yet."}</small></div>
-                </section>
+                { if self.right_tab == RightTab::Activity { html! {
+                    <section class="collaborators">
+                        <div class="section-title"><span>{"PRESENCE"}</span><code>{format!("{} ACTORS / {} TABS", self.presence.actor_count(), self.presence.participant_count())}</code></div>
+                        <div class="collaborator-list">
+                            { for self.presence.participants().map(|participant| html! {
+                                <article class="collaborator" key={participant.id.as_str().to_owned()}>
+                                    <span class="presence" style={format!("background:{}", presence_color(participant.actor.as_str()))}>{actor_mark(participant.actor.as_str())}</span>
+                                    <div><strong>{participant.actor.to_string()}</strong><small>{if self.presence.is_self(&participant.id) { "This tab" } else if participant.cursor.is_some() { "Editing canvas" } else { "Viewing level" }}</small></div>
+                                    <code>{participant.cursor.map(|point| format!("{:02}:{:02}", point.x, point.y)).unwrap_or_else(|| "--:--".to_owned())}</code>
+                                </article>
+                            }) }
+                            { if self.presence.participant_count() == 0 { html! { <div class="presence-unavailable"><strong>{"Connecting roster"}</strong><small>{"Presence appears after the collaboration stream is ready."}</small></div> } } else { Html::default() } }
+                        </div>
+                    </section>
+                } } else { Html::default() } }
             </aside>
         }
     }
@@ -1279,7 +2717,7 @@ impl App {
                 <div class="event-list">
                     {
                         if events.is_empty() {
-                            html! { <div class="empty-feed"><span>{"NO LOCAL EVENTS"}</span><p>{"Paint a map cell to start the timeline."}</p></div> }
+                            html! { <div class="empty-feed"><span>{"NO LOCAL EVENTS"}</span><p>{"Edit a map cell or placeable to start the timeline."}</p></div> }
                         } else {
                             html! { for event in events.iter().rev().take(14) {
                                 {view_history_event(event)}
@@ -1296,8 +2734,12 @@ impl App {
             <div class="activity-content blame-detail">
                 <div class="section-title"><span>{"SELECTED PROVENANCE"}</span><code>{"LIVE"}</code></div>
                 {
-                    if let (Some(point), Some(entry)) = (self.selected, blame) {
-                        let history = self.history_for_cell(point);
+                    if let (Some(selection), Some(entry)) = (self.selection.as_ref(), blame) {
+                        let history = self.history_for_selection(selection);
+                        let (target_kind, target_value, history_label) = match selection {
+                            Selection::Cell(point) => ("Cell", format!("{:02}:{:02}", point.x, point.y), "CELL HISTORY"),
+                            Selection::Entities(entity_ids) => ("Entity", entity_ids[0].to_string(), "ENTITY HISTORY"),
+                        };
                         html! {
                             <>
                                 <div class="blame-hero">
@@ -1305,19 +2747,19 @@ impl App {
                                     <div><small>{"CURRENT ACTOR"}</small><strong>{entry.actor.to_string()}</strong><span>{format_time(entry.occurred_at_ms)}</span></div>
                                 </div>
                                 <div class="property-table right-properties">
-                                    <div><span>{"Cell"}</span><code>{format!("{:02}:{:02}", point.x, point.y)}</code></div>
+                                    <div><span>{target_kind}</span><code title={target_value.clone()}>{target_value}</code></div>
                                     <div><span>{"Sequence"}</span><strong>{format!("#{:04}", entry.sequence)}</strong></div>
                                     <div><span>{"Command"}</span><code>{entry.command_id.to_string()}</code></div>
                                     <div><span>{"Reverts"}</span><strong>{entry.reverts_sequence.map(|seq| format!("#{seq:04}")).unwrap_or_else(|| "none".to_owned())}</strong></div>
                                 </div>
-                                <div class="section-title"><span>{"CELL HISTORY"}</span><code>{history.len()}</code></div>
+                                <div class="section-title"><span>{history_label}</span><code>{history.len()}</code></div>
                                 <div class="event-list">{ html! { for event in history.into_iter().rev() {
                                     {view_history_event(event)}
                                 } } }</div>
                             </>
                         }
                     } else {
-                        html! { <div class="empty-feed"><span>{"NO PROVENANCE"}</span><p>{"Select a changed cell to inspect actor, time, and sequence."}</p></div> }
+                        html! { <div class="empty-feed"><span>{"NO PROVENANCE"}</span><p>{"Select a changed cell or entity to inspect actor, time, and sequence."}</p></div> }
                     }
                 }
             </div>
@@ -1335,7 +2777,7 @@ impl App {
             RpcState::Connecting => "RPC CONNECTING",
             RpcState::Online => "RPC ONLINE",
             RpcState::Resyncing => "RPC RESYNCING",
-            RpcState::Offline => "OFFLINE / LOCAL",
+            RpcState::Offline => "LIVE RETRY / READ ONLY",
         };
         let endpoint = self
             .rpc
@@ -1347,12 +2789,13 @@ impl App {
                 <span class="status-primary"><i class={classes!("status-dot", if matches!(self.rpc_state, RpcState::Online) { "online" } else { "local" })}></i>{rpc_label}</span>
                 <span title={endpoint.to_owned()}>{format!("{} / {}", self.project_display_name, self.level_display_name)}</span>
                 <span>{format!("MODE {}", self.mode.key())}</span>
-                <span>{self.selected.map(|point| format!("CELL {:02}:{:02}", point.x, point.y)).unwrap_or_else(|| "CELL --:--".to_owned())}</span>
+                <span>{selection_status(self.selection.as_ref())}</span>
                 <span>{self.server_sequence.map(|sequence| if matches!(self.rpc_state, RpcState::Online | RpcState::Resyncing) { format!("SEQ #{sequence:04}") } else { format!("LAST #{sequence:04}") }).unwrap_or_else(|| "SEQ LOCAL".to_owned())}</span>
                 <span class="status-hash">{format!("HASH {}", &hash[..12.min(hash.len())])}</span>
                 <span title={self.model.actor().to_string()}>{format!("ACTOR {}", actor_mark(self.model.actor().as_str()))}</span>
                 <span class="status-spacer"></span>
                 <span>{"Q/W/B/P modes"}</span>
+                <span>{"Z/X/C tools"}</span>
                 <span>{"Ctrl+K commands"}</span>
                 <span>{"Ctrl+Z my undo"}</span>
             </footer>
@@ -1408,9 +2851,16 @@ impl App {
     }
 
     fn view_toasts(&self, ctx: &Context<Self>) -> Html {
+        let visible_toasts = self
+            .toasts
+            .iter()
+            .rev()
+            .filter(|toast| self.active_toasts.contains(&toast.id))
+            .take(4)
+            .collect::<Vec<_>>();
         html! {
             <div class="toast-stack" aria-live="polite">
-                { html! { for toast in &self.toasts {
+                { html! { for toast in visible_toasts.into_iter().rev() {
                     <div key={toast.id} class={classes!("toast", toast.tone)}>
                         <span class="toast-signal"></span>
                         <p>{&toast.message}</p>
@@ -1427,6 +2877,29 @@ impl App {
         }
     }
 
+    fn view_notifications(&self, ctx: &Context<Self>) -> Html {
+        if !self.notifications_open {
+            return Html::default();
+        }
+        html! {
+            <section class="notification-center" role="dialog" aria-label="Notification history">
+                <header><div><small>{"NOTIFICATION CENTER"}</small><strong>{format!("{} recorded", self.toasts.len())}</strong></div><button disabled={self.toasts.is_empty()} onclick={ctx.link().callback(|_| Msg::ClearNotifications)}>{"Clear all"}</button></header>
+                <div class="notification-list">
+                    { if self.toasts.is_empty() {
+                        html! { <div class="notification-empty">{"No notifications recorded."}</div> }
+                    } else {
+                        html! { for notification in self.toasts.iter().rev() {
+                            <article key={notification.id} class={classes!("notification-record", notification.tone)}>
+                                <span class="toast-signal"></span>
+                                <div><p>{&notification.message}</p><small>{format_time(notification.occurred_at_ms)}</small></div>
+                            </article>
+                        } }
+                    } }
+                </div>
+            </section>
+        }
+    }
+
     fn enter_catalog(&mut self, ctx: &Context<Self>, user: UserSummary) {
         self.invalidate_rpc();
         self.selected_workspace_id = user.personal_workspace_id.clone();
@@ -1437,16 +2910,43 @@ impl App {
         self.catalog_project = None;
         self.levels.clear();
         self.form_error = None;
-        self.request_pending = true;
+        self.load_catalog(ctx);
+    }
 
-        let workspace_link = ctx.link().clone();
+    fn load_catalog(&mut self, ctx: &Context<Self>) {
+        self.request_pending = true;
+        let link = ctx.link().clone();
         wasm_bindgen_futures::spawn_local(async move {
-            workspace_link.send_message(Msg::WorkspacesLoaded(RestClient.list_workspaces().await));
+            link.send_message(Msg::CatalogLoaded(RestClient.catalog().await));
         });
-        let project_link = ctx.link().clone();
+    }
+
+    fn invite_project_member(&mut self, ctx: &Context<Self>) -> bool {
+        let Some(project) = self.configuration_project.as_ref() else {
+            return false;
+        };
+        if self.configuration_pending
+            || !project.can_manage_members()
+            || self.invitation_email.trim().is_empty()
+        {
+            return false;
+        }
+        self.configuration_pending = true;
+        self.configuration_error = None;
+        let project_id = project.id.clone();
+        let request_project_id = project_id.clone();
+        let email = self.invitation_email.trim().to_owned();
+        let roles = vec![self.invitation_role.clone()];
+        let link = ctx.link().clone();
         wasm_bindgen_futures::spawn_local(async move {
-            project_link.send_message(Msg::ProjectsLoaded(RestClient.list_projects().await));
+            link.send_message(Msg::ProjectMemberInvited {
+                project_id: request_project_id,
+                result: RestClient
+                    .invite_project_member(&project_id, &email, &roles)
+                    .await,
+            });
         });
+        true
     }
 
     fn open_level(&mut self, ctx: &Context<Self>, project: ProjectSummary, level: LevelSummary) {
@@ -1466,18 +2966,93 @@ impl App {
             .unwrap_or_else(|| project.workspace_id.clone());
         self.project_display_name = project.name.clone();
         self.level_display_name = level.name.clone();
+        self.level_duration_seconds = level.duration_seconds;
         self.target = ProjectLevelTarget::new(project.id.clone(), level.id.clone());
         self.can_edit_timeline = project.can_edit_timeline();
+        self.theme.project_default =
+            Theme::from_name(&project.default_theme).unwrap_or(Theme::Dark);
         self.catalog_project = Some(project);
         self.phase = Phase::Editor;
-        self.selected = None;
+        self.selection = None;
+        self.isolated_blind = None;
+        self.shape_catalog.clear();
+        self.selected_shape_id = None;
+        self.shape_draft_name.clear();
+        self.shape_draft_mask = 1;
+        self.shape_catalog_pending = true;
         self.server_events.clear();
         self.remote_blame.clear();
+        self.remote_entity_blame.clear();
         self.seen_commands.clear();
         self.server_sequence = None;
         self.server_hash = None;
+        self.sync_resize_fields();
+        self.frame_grid();
         self.canvas_dirty = true;
         self.start_connection(ctx);
+        let project_id = self.target.project_id.to_string();
+        let request_project_id = project_id.clone();
+        let link = ctx.link().clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            link.send_message(Msg::ShapeCatalogLoaded {
+                project_id: request_project_id,
+                result: RestClient.list_shape_catalog(&project_id).await,
+            });
+        });
+    }
+
+    fn accept_level_configuration(&mut self, configuration: LevelConfiguration) {
+        self.level_display_name = configuration.name.clone();
+        self.level_duration_seconds = configuration.duration_seconds;
+        self.level_configuration_name = configuration.name.clone();
+        self.level_configuration_duration = configuration.duration_seconds.to_string();
+        for levels in self.catalog_levels.values_mut() {
+            if let Some(level) = levels
+                .iter_mut()
+                .find(|level| level.id == self.target.level_id.as_str())
+            {
+                level.name.clone_from(&configuration.name);
+                level.duration_seconds = configuration.duration_seconds;
+            }
+        }
+        if let Some(level) = self
+            .levels
+            .iter_mut()
+            .find(|level| level.id == self.target.level_id.as_str())
+        {
+            level.name = configuration.name;
+            level.duration_seconds = configuration.duration_seconds;
+        }
+    }
+
+    fn save_level_configuration(&mut self, ctx: &Context<Self>) -> bool {
+        if self.level_configuration_pending || !self.can_edit_timeline {
+            return false;
+        }
+        let name = self.level_configuration_name.trim().to_owned();
+        let Ok(duration_seconds) = self.level_configuration_duration.parse::<f64>() else {
+            self.level_configuration_error =
+                Some("Duration must be a nonnegative number".to_owned());
+            return true;
+        };
+        if name.is_empty() || !duration_seconds.is_finite() || duration_seconds < 0.0 {
+            self.level_configuration_error =
+                Some("Name is required and duration must be nonnegative".to_owned());
+            return true;
+        }
+        self.level_configuration_pending = true;
+        self.level_configuration_error = None;
+        let project_id = self.target.project_id.to_string();
+        let level_id = self.target.level_id.to_string();
+        let link = ctx.link().clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            link.send_message(Msg::LevelConfigurationUpdated(
+                RestClient
+                    .update_level_configuration(&project_id, &level_id, &name, duration_seconds)
+                    .await,
+            ));
+        });
+        true
     }
 
     fn handle_authenticated_api_error(&mut self, error: ApiError) -> bool {
@@ -1499,10 +3074,16 @@ impl App {
         self.projects.clear();
         self.catalog_project = None;
         self.levels.clear();
+        self.catalog_levels.clear();
+        self.catalog_invitations.clear();
+        self.project_configuration = None;
+        self.configuration_project = None;
         self.target = ProjectLevelTarget::new(String::new(), String::new());
         self.workspace_name.clear();
         self.project_display_name.clear();
         self.level_display_name.clear();
+        self.level_duration_seconds = 0.0;
+        self.level_configuration_open = false;
         self.can_edit_timeline = false;
         self.auth_password.clear();
     }
@@ -1510,13 +3091,33 @@ impl App {
     fn invalidate_rpc(&mut self) {
         self.connection_attempt += 1;
         self.rpc = None;
+        self.reconnect_timer = None;
+        self.reconnect_failures = 0;
         self.rpc_state = RpcState::Offline;
+        self.presence.clear();
+        self.desired_cursor = None;
+        self.last_sent_cursor = None;
+        self.cursor_timer = None;
+        self.cursor_in_flight = false;
         self.pending_commands.clear();
         self.pending_cells.clear();
+        self.pending_entities.clear();
+        self.pending_placements.clear();
+        self.pending_grid = None;
+        self.pending_edge_view = None;
+        self.blind_gesture = None;
+        self.entity_drag = None;
+        self.pan_gesture = None;
+        self.map_resize_gesture = None;
+        self.marquee_gesture = None;
+        self.placement_drag = None;
+        self.key_locker_assignment = None;
+        self.isolated_blind = None;
         self.server_sequence = None;
         self.server_hash = None;
         self.server_events.clear();
         self.remote_blame.clear();
+        self.remote_entity_blame.clear();
         self.seen_commands.clear();
     }
 
@@ -1525,9 +3126,20 @@ impl App {
             return false;
         }
         self.mode = mode;
+        self.workspace_tool = WorkspaceTool::default_for(mode);
+        self.left_tab = LeftTab::Tool;
+        self.blind_brush_tool = BlindBrushTool::Paint;
         self.drag_kind = None;
-        if mode == Mode::Select {
-            self.right_tab = RightTab::Blame;
+        self.last_drag = None;
+        self.blind_gesture = None;
+        self.entity_drag = None;
+        self.placement_drag = None;
+        self.pan_gesture = None;
+        self.map_resize_gesture = None;
+        self.marquee_gesture = None;
+        self.key_locker_assignment = None;
+        if mode != Mode::Brush {
+            self.isolated_blind = None;
         }
         if mode.is_parity_gated() {
             self.push_toast(
@@ -1540,19 +3152,217 @@ impl App {
         true
     }
 
+    fn set_workspace_tool(&mut self, tool: WorkspaceTool) -> bool {
+        if !WorkspaceTool::for_mode(self.mode).contains(&tool) || self.workspace_tool == tool {
+            return false;
+        }
+        self.workspace_tool = tool;
+        self.drag_kind = None;
+        self.last_drag = None;
+        self.blind_gesture = None;
+        self.entity_drag = None;
+        self.placement_drag = None;
+        self.map_resize_gesture = None;
+        self.marquee_gesture = None;
+        self.key_locker_assignment = None;
+        match tool {
+            WorkspaceTool::Paint => self.blind_brush_tool = BlindBrushTool::Paint,
+            WorkspaceTool::Fill => self.blind_brush_tool = BlindBrushTool::FloodFill,
+            _ => {}
+        }
+        self.canvas_dirty = true;
+        true
+    }
+
+    fn begin_placement_drag(&mut self, kind: PlacementKind, shape: Shape) -> bool {
+        if self.mode != Mode::Select
+            || !self.can_edit_timeline
+            || !matches!(self.rpc_state, RpcState::Online)
+        {
+            return false;
+        }
+        self.placement_drag = Some(PlacementDrag {
+            kind,
+            shape,
+            hover: None,
+        });
+        self.canvas_dirty = true;
+        true
+    }
+
+    fn end_placement_drag(&mut self) -> bool {
+        let changed = self.placement_drag.take().is_some();
+        self.canvas_dirty |= changed;
+        changed
+    }
+
+    fn canvas_drag_over(&mut self, event: DragEvent) -> bool {
+        if self.placement_drag.is_none() {
+            return false;
+        }
+        event.prevent_default();
+        if let Some(data_transfer) = event.data_transfer() {
+            data_transfer.set_drop_effect("copy");
+        }
+        let hover = self
+            .canvas_position_from_client(event.client_x(), event.client_y())
+            .and_then(|(x, y)| self.point_from_canvas_position(x, y));
+        let changed = self
+            .placement_drag
+            .as_ref()
+            .is_some_and(|drag| drag.hover != hover);
+        if let Some(drag) = self.placement_drag.as_mut() {
+            drag.hover = hover;
+        }
+        self.canvas_dirty |= changed;
+        changed
+    }
+
+    fn canvas_drop(&mut self, ctx: &Context<Self>, event: DragEvent) -> bool {
+        if self.placement_drag.is_none() {
+            return false;
+        }
+        event.prevent_default();
+        let point = self
+            .canvas_position_from_client(event.client_x(), event.client_y())
+            .and_then(|(x, y)| self.point_from_canvas_position(x, y));
+        let Some(drag) = self.placement_drag.take() else {
+            return false;
+        };
+        self.canvas_dirty = true;
+        let Some(point) = point else {
+            self.push_toast("Drop the template inside the level".to_owned(), "info");
+            return true;
+        };
+        self.place_shape_at(ctx, drag.kind, drag.shape, point)
+    }
+
     fn canvas_down(&mut self, ctx: &Context<Self>, event: PointerEvent) -> bool {
         event.prevent_default();
+        if event.button() == 1 || event.button() == 2 {
+            let Some((start_x, start_y)) = self.canvas_position(&event) else {
+                return false;
+            };
+            self.capture_pointer(event.pointer_id());
+            self.pan_gesture = Some(PanGesture {
+                pointer_id: event.pointer_id(),
+                start_x,
+                start_y,
+                offset_x: self.viewport.offset_x,
+                offset_y: self.viewport.offset_y,
+            });
+            return true;
+        }
+        if event.button() == 0
+            && self.mode == Mode::Map
+            && self.workspace_tool == WorkspaceTool::Resize
+            && self.can_edit_timeline
+            && matches!(self.rpc_state, RpcState::Online)
+            && self.pending_commands.is_empty()
+        {
+            let Some((start_x, start_y)) = self.canvas_position(&event) else {
+                return false;
+            };
+            if let Some(edge) = self.map_resize_edge_at(start_x, start_y) {
+                let snapshot = self.model.timeline().snapshot();
+                let size = snapshot.size();
+                let (_, anchor) = plan_content_aware_edge_resize(snapshot, edge, 0);
+                self.capture_pointer(event.pointer_id());
+                self.map_resize_gesture = Some(MapResizeGesture {
+                    pointer_id: event.pointer_id(),
+                    edge,
+                    start_x,
+                    start_y,
+                    start_size: size,
+                    preview_size: size,
+                    anchor,
+                    cell_size: CELL_SIZE * self.viewport.scale,
+                });
+                self.canvas_dirty = true;
+                return true;
+            }
+        }
+        if self.mode == Mode::Brush {
+            return self.blind_brush_down(event);
+        }
+        if self.key_locker_assignment.is_some() {
+            if event.button() == 0
+                && !event.shift_key()
+                && !event.ctrl_key()
+                && !event.meta_key()
+                && !event.alt_key()
+            {
+                return self.complete_key_locker_assignment(ctx, event);
+            }
+            self.key_locker_assignment = None;
+        }
         let Some(point) = self.point_from_pointer(&event) else {
             return false;
         };
-        if let Some(canvas) = self.canvas_ref.cast::<HtmlCanvasElement>() {
-            let _ = canvas.set_pointer_capture(event.pointer_id());
+        self.capture_pointer(event.pointer_id());
+        if self.mode == Mode::Select {
+            let additive = event.shift_key() || event.ctrl_key() || event.meta_key();
+            if let Some(entity) = self.model.timeline().snapshot().entity_at(point) {
+                let entity_id = entity.id().clone();
+                self.selection = select_entity(self.selection.as_ref(), entity_id, additive);
+                if event.button() == 0 && !additive && self.can_edit_timeline {
+                    let origins = self
+                        .selected_entity_ids()
+                        .iter()
+                        .filter_map(|entity_id| {
+                            self.model
+                                .timeline()
+                                .snapshot()
+                                .entity(entity_id)
+                                .map(|entity| (entity_id.clone(), entity.origin()))
+                        })
+                        .collect::<Vec<_>>();
+                    if !origins.is_empty()
+                        && origins
+                            .iter()
+                            .all(|(entity_id, _)| !self.pending_entities.contains_key(entity_id))
+                    {
+                        let Some((start_canvas_x, start_canvas_y)) = self.canvas_position(&event)
+                        else {
+                            return true;
+                        };
+                        self.entity_drag = Some(EntityDrag {
+                            pointer_id: event.pointer_id(),
+                            start: point,
+                            current: point,
+                            origins,
+                            start_canvas_x,
+                            start_canvas_y,
+                            active: false,
+                        });
+                    }
+                }
+            } else if event.button() == 0 {
+                let Some((canvas_x, canvas_y)) = self.canvas_position(&event) else {
+                    return false;
+                };
+                if !additive {
+                    self.selection = None;
+                }
+                self.marquee_gesture = Some(MarqueeGesture {
+                    pointer_id: event.pointer_id(),
+                    start: point,
+                    current: point,
+                    start_canvas_x: canvas_x,
+                    start_canvas_y: canvas_y,
+                    current_canvas_x: canvas_x,
+                    current_canvas_y: canvas_y,
+                    additive,
+                    active: false,
+                });
+            }
+        } else {
+            self.selection = Some(Selection::Cell(point));
         }
-        self.selected = Some(point);
         self.last_drag = Some(point);
         self.canvas_dirty = true;
 
-        if self.mode != Mode::Map {
+        if self.mode != Mode::Map || self.workspace_tool != WorkspaceTool::Cells {
             self.drag_kind = None;
             return true;
         }
@@ -1570,6 +3380,106 @@ impl App {
     }
 
     fn canvas_move(&mut self, ctx: &Context<Self>, event: PointerEvent) -> bool {
+        let cursor = self.point_from_pointer(&event);
+        self.queue_cursor(ctx, cursor);
+        if let Some(pan) = self.pan_gesture.as_ref() {
+            if pan.pointer_id != event.pointer_id() {
+                return false;
+            }
+            let Some((x, y)) = self.canvas_position(&event) else {
+                return false;
+            };
+            self.viewport.offset_x = pan.offset_x + x - pan.start_x;
+            self.viewport.offset_y = pan.offset_y + y - pan.start_y;
+            self.canvas_dirty = true;
+            return true;
+        }
+        if let Some(gesture) = self.map_resize_gesture.as_ref() {
+            if gesture.pointer_id != event.pointer_id() {
+                return false;
+            }
+            let Some((x, y)) = self.canvas_position(&event) else {
+                return false;
+            };
+            let outward_pixels = match gesture.edge {
+                MapResizeEdge::Top => gesture.start_y - y,
+                MapResizeEdge::Right => x - gesture.start_x,
+                MapResizeEdge::Bottom => y - gesture.start_y,
+                MapResizeEdge::Left => gesture.start_x - x,
+            };
+            let outward_cells = (outward_pixels / gesture.cell_size).round() as i32;
+            let (preview_size, anchor) = plan_content_aware_edge_resize(
+                self.model.timeline().snapshot(),
+                gesture.edge,
+                outward_cells,
+            );
+            if preview_size == gesture.preview_size {
+                return false;
+            }
+            let gesture = self
+                .map_resize_gesture
+                .as_mut()
+                .expect("resize gesture exists");
+            gesture.preview_size = preview_size;
+            gesture.anchor = anchor;
+            self.canvas_dirty = true;
+            return true;
+        }
+        if let Some(drag) = self.entity_drag.as_ref() {
+            if drag.pointer_id != event.pointer_id() {
+                return false;
+            }
+            let Some((canvas_x, canvas_y)) = self.canvas_position(&event) else {
+                return false;
+            };
+            let active = drag.active
+                || (canvas_x - drag.start_canvas_x).hypot(canvas_y - drag.start_canvas_y) >= 4.0;
+            if !active {
+                return false;
+            }
+            let Some(point) = self.point_from_canvas_position(canvas_x, canvas_y) else {
+                return false;
+            };
+            if drag.current == point && drag.active {
+                return false;
+            }
+            let drag = self.entity_drag.as_mut().expect("drag exists");
+            drag.current = point;
+            drag.active = true;
+            self.canvas_dirty = true;
+            return true;
+        }
+        if let Some(gesture) = self.marquee_gesture.as_ref() {
+            if gesture.pointer_id != event.pointer_id() {
+                return false;
+            }
+            let Some((canvas_x, canvas_y)) = self.canvas_position(&event) else {
+                return false;
+            };
+            let active = gesture.active
+                || (canvas_x - gesture.start_canvas_x).hypot(canvas_y - gesture.start_canvas_y)
+                    >= 4.0;
+            let current = self
+                .point_from_canvas_position(canvas_x, canvas_y)
+                .unwrap_or(gesture.current);
+            if gesture.active == active
+                && gesture.current == current
+                && gesture.current_canvas_x == canvas_x
+                && gesture.current_canvas_y == canvas_y
+            {
+                return false;
+            }
+            let gesture = self.marquee_gesture.as_mut().expect("marquee exists");
+            gesture.current = current;
+            gesture.current_canvas_x = canvas_x;
+            gesture.current_canvas_y = canvas_y;
+            gesture.active = active;
+            self.canvas_dirty = true;
+            return true;
+        }
+        if self.blind_gesture.is_some() {
+            return self.blind_brush_move(event);
+        }
         let Some(kind) = self.drag_kind else {
             return false;
         };
@@ -1580,34 +3490,388 @@ impl App {
             return false;
         }
         self.last_drag = Some(point);
-        self.selected = Some(point);
+        self.selection = Some(Selection::Cell(point));
         self.apply_cell(ctx, point, kind);
         true
     }
 
+    fn canvas_up(&mut self, ctx: &Context<Self>, event: PointerEvent) -> bool {
+        if self
+            .pan_gesture
+            .as_ref()
+            .is_some_and(|pan| pan.pointer_id == event.pointer_id())
+        {
+            self.release_pointer(event.pointer_id());
+            self.pan_gesture = None;
+            return true;
+        }
+        if self
+            .map_resize_gesture
+            .as_ref()
+            .is_some_and(|gesture| gesture.pointer_id == event.pointer_id())
+        {
+            self.canvas_move(ctx, event.clone());
+            self.release_pointer(event.pointer_id());
+            let gesture = self
+                .map_resize_gesture
+                .take()
+                .expect("resize gesture exists");
+            self.canvas_dirty = true;
+            if gesture.preview_size == gesture.start_size {
+                return true;
+            }
+            return self.submit_resize_grid(
+                ctx,
+                gesture.preview_size,
+                gesture.anchor,
+                Some(gesture.edge),
+            );
+        }
+        if self
+            .entity_drag
+            .as_ref()
+            .is_some_and(|drag| drag.pointer_id == event.pointer_id())
+        {
+            self.canvas_move(ctx, event.clone());
+            self.release_pointer(event.pointer_id());
+            let drag = self.entity_drag.take().expect("drag exists");
+            self.canvas_dirty = true;
+            if !drag.active {
+                return true;
+            }
+            let delta_x = i32::from(drag.current.x) - i32::from(drag.start.x);
+            let delta_y = i32::from(drag.current.y) - i32::from(drag.start.y);
+            if delta_x == 0 && delta_y == 0 {
+                return true;
+            }
+            return self.move_entities_from_origins(ctx, drag.origins, delta_x, delta_y);
+        }
+        if self
+            .marquee_gesture
+            .as_ref()
+            .is_some_and(|gesture| gesture.pointer_id == event.pointer_id())
+        {
+            self.canvas_move(ctx, event.clone());
+            self.release_pointer(event.pointer_id());
+            let gesture = self.marquee_gesture.take().expect("marquee exists");
+            if gesture.active {
+                let mut entity_ids = if gesture.additive {
+                    self.selected_entity_ids().to_vec()
+                } else {
+                    Vec::new()
+                };
+                for entity_id in entity_ids_in_rect(
+                    self.model.timeline().snapshot(),
+                    gesture.start,
+                    gesture.current,
+                ) {
+                    if !entity_ids.contains(&entity_id) {
+                        entity_ids.push(entity_id);
+                    }
+                }
+                if !entity_ids.is_empty() {
+                    self.selection = Some(Selection::Entities(entity_ids));
+                } else if !gesture.additive {
+                    self.selection = None;
+                }
+            } else if !gesture.additive {
+                self.selection = Some(Selection::Cell(gesture.current));
+            }
+            self.canvas_dirty = true;
+            return true;
+        }
+        if self.blind_gesture.is_some() {
+            return self.finish_blind_gesture(ctx, event);
+        }
+        self.release_pointer(event.pointer_id());
+        self.drag_kind = None;
+        self.last_drag = None;
+        false
+    }
+
+    fn canvas_cancel(&mut self, event: PointerEvent) -> bool {
+        self.release_pointer(event.pointer_id());
+        self.drag_kind = None;
+        self.last_drag = None;
+        let changed = self.blind_gesture.take().is_some()
+            | self.entity_drag.take().is_some()
+            | self.pan_gesture.take().is_some()
+            | self.map_resize_gesture.take().is_some()
+            | self.marquee_gesture.take().is_some();
+        self.canvas_dirty |= changed;
+        changed
+    }
+
+    fn blind_brush_down(&mut self, event: PointerEvent) -> bool {
+        if let Some(gesture) = self.blind_gesture.as_ref() {
+            if matches!(gesture.operation, BlindGestureOperation::FloodFill { .. })
+                && event.button() == 2
+            {
+                let pointer_id = gesture.pointer_id;
+                self.release_pointer(pointer_id);
+                self.blind_gesture = None;
+                self.canvas_dirty = true;
+                return true;
+            }
+            return false;
+        }
+        let Some(entity_id) = self.selected_entity_id().cloned() else {
+            self.push_toast("Select a Pool before using Brush mode".to_owned(), "info");
+            return true;
+        };
+        let Some(entity) = self.model.timeline().snapshot().entity(&entity_id).cloned() else {
+            self.selection = None;
+            return true;
+        };
+        let Some(blind) = entity.as_blind() else {
+            self.push_toast("Brush mode requires a selected Pool".to_owned(), "info");
+            return true;
+        };
+        if !self.can_edit_timeline {
+            self.push_toast(
+                "Editing requires the exact edit_timeline capability".to_owned(),
+                "warning",
+            );
+            return true;
+        }
+        if !matches!(self.rpc_state, RpcState::Online) {
+            self.push_toast(
+                "Wait for collaboration sync before editing".to_owned(),
+                "info",
+            );
+            return true;
+        }
+        if self.pending_entities.contains_key(&entity_id) {
+            return false;
+        }
+        let Some(pixel) = self.blind_pixel_from_pointer(&event, &entity) else {
+            return true;
+        };
+
+        let operation = match (self.blind_brush_tool, event.button(), event.shift_key()) {
+            (BlindBrushTool::Paint, 0, true) => BlindGestureOperation::Erase,
+            (BlindBrushTool::Paint, 0, false) => BlindGestureOperation::Paint {
+                color_index: self.blind_color_index,
+            },
+            (BlindBrushTool::FloodFill, 0, _) => {
+                let pixels: BTreeSet<_> = blind
+                    .empty_fill_region(entity.shape(), pixel)
+                    .into_iter()
+                    .collect();
+                if pixels.is_empty() {
+                    self.push_toast("Fill requires an empty Pool pixel".to_owned(), "info");
+                    return true;
+                }
+                self.capture_pointer(event.pointer_id());
+                self.blind_gesture = Some(BlindGesture {
+                    pointer_id: event.pointer_id(),
+                    entity_id,
+                    operation: BlindGestureOperation::FloodFill {
+                        start: pixel,
+                        color_index: self.blind_color_index,
+                    },
+                    partition: pixels.clone(),
+                    pixels,
+                    last_pixel: None,
+                });
+                self.canvas_dirty = true;
+                return true;
+            }
+            _ => return true,
+        };
+
+        self.capture_pointer(event.pointer_id());
+        let partition = blind
+            .paintable_partition(entity.shape(), pixel)
+            .into_iter()
+            .collect();
+        self.blind_gesture = Some(BlindGesture {
+            pointer_id: event.pointer_id(),
+            entity_id,
+            operation,
+            pixels: BTreeSet::from([pixel]),
+            partition,
+            last_pixel: Some(pixel),
+        });
+        self.canvas_dirty = true;
+        true
+    }
+
+    fn blind_brush_move(&mut self, event: PointerEvent) -> bool {
+        let Some(gesture) = self.blind_gesture.as_ref() else {
+            return false;
+        };
+        if gesture.pointer_id != event.pointer_id()
+            || matches!(gesture.operation, BlindGestureOperation::FloodFill { .. })
+        {
+            return false;
+        }
+        let entity_id = gesture.entity_id.clone();
+        let last_pixel = gesture.last_pixel;
+        let Some(entity) = self.model.timeline().snapshot().entity(&entity_id) else {
+            self.blind_gesture = None;
+            self.selection = None;
+            self.canvas_dirty = true;
+            return true;
+        };
+        let Some(pixel) = self.blind_pixel_from_pointer(&event, entity) else {
+            if let Some(gesture) = self.blind_gesture.as_mut() {
+                gesture.last_pixel = None;
+            }
+            return false;
+        };
+        if last_pixel == Some(pixel) {
+            return false;
+        }
+
+        let segment =
+            last_pixel.map_or_else(|| vec![pixel], |last| rasterize_blind_segment(last, pixel));
+        let continuous = segment
+            .iter()
+            .all(|sample| gesture.partition.contains(sample));
+        let samples = if continuous { segment } else { vec![pixel] };
+        let Some(gesture) = self.blind_gesture.as_mut() else {
+            return false;
+        };
+        gesture.pixels.extend(
+            samples
+                .into_iter()
+                .filter(|sample| gesture.partition.contains(sample)),
+        );
+        gesture.last_pixel = Some(pixel);
+        self.canvas_dirty = true;
+        true
+    }
+
+    fn finish_blind_gesture(&mut self, ctx: &Context<Self>, event: PointerEvent) -> bool {
+        let Some(gesture) = self.blind_gesture.as_ref() else {
+            return false;
+        };
+        if gesture.pointer_id != event.pointer_id() {
+            return false;
+        }
+        if !matches!(gesture.operation, BlindGestureOperation::FloodFill { .. }) {
+            self.blind_brush_move(event.clone());
+        }
+        self.release_pointer(event.pointer_id());
+        let Some(gesture) = self.blind_gesture.take() else {
+            return false;
+        };
+        self.canvas_dirty = true;
+
+        let entity_id = gesture.entity_id;
+        let envelope = match gesture.operation {
+            BlindGestureOperation::Paint { color_index } => {
+                let stroke = BlindStroke::new(gesture.pixels.into_iter().collect())
+                    .expect("a browser stroke stays within the core pixel bound");
+                self.model.prepare_paint_blind_stroke(
+                    entity_id.clone(),
+                    color_index,
+                    stroke,
+                    now_ms(),
+                )
+            }
+            BlindGestureOperation::Erase => {
+                let stroke = BlindStroke::new(gesture.pixels.into_iter().collect())
+                    .expect("a browser stroke stays within the core pixel bound");
+                self.model
+                    .prepare_erase_blind_stroke(entity_id.clone(), stroke, now_ms())
+            }
+            BlindGestureOperation::FloodFill { start, color_index } => self
+                .model
+                .prepare_flood_fill_blind(entity_id.clone(), start, color_index, now_ms()),
+        };
+        self.submit_entity_command(ctx, envelope, [entity_id], Vec::new())
+    }
+
+    fn capture_pointer(&self, pointer_id: i32) {
+        if let Some(canvas) = self.canvas_ref.cast::<HtmlCanvasElement>() {
+            let _ = canvas.set_pointer_capture(pointer_id);
+        }
+    }
+
+    fn release_pointer(&self, pointer_id: i32) {
+        if let Some(canvas) = self.canvas_ref.cast::<HtmlCanvasElement>() {
+            let _ = canvas.release_pointer_capture(pointer_id);
+        }
+    }
+
     fn point_from_pointer(&self, event: &PointerEvent) -> Option<GridPoint> {
+        let (x, y) = self.canvas_position(event)?;
+        self.point_from_canvas_position(x, y)
+    }
+
+    fn canvas_position(&self, event: &PointerEvent) -> Option<(f64, f64)> {
+        self.canvas_position_from_client(event.client_x(), event.client_y())
+    }
+
+    fn canvas_position_from_client(&self, client_x: i32, client_y: i32) -> Option<(f64, f64)> {
         let canvas = self.canvas_ref.cast::<HtmlCanvasElement>()?;
         let bounds = canvas.get_bounding_client_rect();
         if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
             return None;
         }
-        let x = (f64::from(event.client_x()) - bounds.left()) * f64::from(canvas.width())
-            / bounds.width();
-        let y = (f64::from(event.client_y()) - bounds.top()) * f64::from(canvas.height())
-            / bounds.height();
-        let board_x = x - BOARD_ORIGIN;
-        let board_y = y - BOARD_ORIGIN;
-        if board_x < 0.0
-            || board_y < 0.0
-            || board_x >= CELL_SIZE * 8.0
-            || board_y >= CELL_SIZE * 8.0
-        {
-            return None;
+        let x = (f64::from(client_x) - bounds.left()) * f64::from(canvas.width()) / bounds.width();
+        let y = (f64::from(client_y) - bounds.top()) * f64::from(canvas.height()) / bounds.height();
+        Some((x, y))
+    }
+
+    fn point_from_canvas_position(&self, x: f64, y: f64) -> Option<GridPoint> {
+        self.viewport
+            .point_at(x, y, self.model.timeline().snapshot().size(), CELL_SIZE)
+    }
+
+    fn map_resize_edge_at(&self, x: f64, y: f64) -> Option<MapResizeEdge> {
+        const HANDLE_RADIUS: f64 = 13.0;
+        [
+            MapResizeEdge::Top,
+            MapResizeEdge::Right,
+            MapResizeEdge::Bottom,
+            MapResizeEdge::Left,
+        ]
+        .into_iter()
+        .find(|edge| {
+            let (handle_x, handle_y) =
+                self.map_resize_handle_position(*edge, self.model.timeline().snapshot().size());
+            (x - handle_x).abs() <= HANDLE_RADIUS && (y - handle_y).abs() <= HANDLE_RADIUS
+        })
+    }
+
+    fn map_resize_handle_position(&self, edge: MapResizeEdge, size: GridSize) -> (f64, f64) {
+        let width = f64::from(size.width()) * CELL_SIZE * self.viewport.scale;
+        let height = f64::from(size.height()) * CELL_SIZE * self.viewport.scale;
+        let left = self.viewport.offset_x;
+        let top = self.viewport.offset_y;
+        match edge {
+            MapResizeEdge::Top => (left + width / 2.0, top),
+            MapResizeEdge::Right => (left + width, top + height / 2.0),
+            MapResizeEdge::Bottom => (left + width / 2.0, top + height),
+            MapResizeEdge::Left => (left, top + height / 2.0),
         }
-        Some(GridPoint::new(
-            (board_x / CELL_SIZE).floor() as u16,
-            (board_y / CELL_SIZE).floor() as u16,
-        ))
+    }
+
+    fn blind_pixel_from_pointer(
+        &self,
+        event: &PointerEvent,
+        entity: &PlaceableEntity,
+    ) -> Option<BlindPixel> {
+        let blind = entity.as_blind()?;
+        let (x, y) = self.canvas_position(event)?;
+        let world_cell = self.point_from_canvas_position(x, y)?;
+        let (cell_left, cell_top) = self.viewport.cell_origin(world_cell, CELL_SIZE);
+        let cell_x = u8::try_from(world_cell.x.checked_sub(entity.origin().x)?).ok()?;
+        let cell_y = u8::try_from(world_cell.y.checked_sub(entity.origin().y)?).ok()?;
+        let cell = ShapeCell::new(cell_x, cell_y);
+        blind.tile_for_cell(entity.shape(), cell)?;
+        let geometry = pool_tile_geometry(
+            shape_boundary_edges(entity.shape(), cell),
+            CELL_SIZE * self.viewport.scale,
+            BLIND_INSET * self.viewport.scale,
+        );
+        let resolution = blind.pixels_per_cell();
+        let (pixel_x, pixel_y_from_top) =
+            geometry.pixel_at(x - cell_left, y - cell_top, resolution)?;
+        blind_pixel_from_top_left_sample(entity, world_cell, pixel_x, pixel_y_from_top)
     }
 
     fn apply_cell(&mut self, ctx: &Context<Self>, point: GridPoint, kind: CellKind) -> bool {
@@ -1621,7 +3885,7 @@ impl App {
         if self.pending_cells.contains_key(&point) {
             return false;
         }
-        if matches!(self.rpc_state, RpcState::Connecting | RpcState::Resyncing) {
+        if !matches!(self.rpc_state, RpcState::Online) {
             self.push_toast(
                 "Wait for collaboration sync before editing".to_owned(),
                 "info",
@@ -1629,61 +3893,662 @@ impl App {
             return true;
         }
 
-        if matches!(self.rpc_state, RpcState::Online) {
-            let Some(rpc) = self.rpc.clone() else {
-                return false;
-            };
-            let command = self.model.prepare_set_cell(point, kind, now_ms());
-            let command_id = command.metadata.id.to_string();
-            self.pending_commands.insert(command_id.clone());
-            self.pending_cells.insert(
-                point,
-                PendingCell {
-                    kind,
-                    command_id: command_id.clone(),
-                },
-            );
-            self.canvas_dirty = true;
+        let Some(rpc) = self.rpc.clone() else {
+            return false;
+        };
+        let command = self.model.prepare_set_cell(point, kind, now_ms());
+        let command_id = command.metadata.id.to_string();
+        self.pending_commands.insert(command_id.clone());
+        self.pending_cells.insert(
+            point,
+            PendingCell {
+                kind,
+                command_id: command_id.clone(),
+            },
+        );
+        self.canvas_dirty = true;
 
-            let request = ApplyCommandRequest {
-                target: self.target.clone(),
-                command,
-            };
-            let link = ctx.link().clone();
-            let attempt = self.connection_attempt;
-            wasm_bindgen_futures::spawn_local(async move {
-                link.send_message(Msg::RpcApplyFinished {
-                    attempt,
-                    command_id,
-                    result: Box::new(rpc.apply_command(request).await),
-                });
+        let request = ApplyCommandRequest {
+            target: self.target.clone(),
+            command,
+        };
+        let link = ctx.link().clone();
+        let attempt = self.connection_attempt;
+        wasm_bindgen_futures::spawn_local(async move {
+            link.send_message(Msg::RpcApplyFinished {
+                attempt,
+                command_id,
+                result: Box::new(rpc.apply_command(request).await),
             });
-            true
-        } else {
-            let result = self.model.set_cell(point, kind, now_ms());
-            self.finish_local_edit(result)
-        }
+        });
+        true
     }
 
-    fn finish_local_edit(
-        &mut self,
-        result: Result<ModelChange, oreak_core::TimelineError>,
-    ) -> bool {
-        match result {
-            Ok(ModelChange::Applied { .. }) => {
-                self.canvas_dirty = true;
-                self.persist_draft();
-                true
-            }
-            Ok(ModelChange::NoChange) => false,
-            Err(error) => {
-                self.push_toast(format!("Edit rejected: {error}"), "warning");
-                true
-            }
+    fn resize_grid(&mut self, ctx: &Context<Self>) -> bool {
+        if !self.can_edit_timeline {
+            self.push_toast(
+                "Editing requires the exact edit_timeline capability".to_owned(),
+                "warning",
+            );
+            return true;
         }
+        if !matches!(self.rpc_state, RpcState::Online)
+            || self.pending_grid.is_some()
+            || self.blind_gesture.is_some()
+            || self.entity_drag.is_some()
+            || self.drag_kind.is_some()
+        {
+            return false;
+        }
+        let (Ok(width), Ok(height)) = (
+            self.resize_width.parse::<u16>(),
+            self.resize_height.parse::<u16>(),
+        ) else {
+            self.push_toast(
+                "Grid dimensions must be whole numbers".to_owned(),
+                "warning",
+            );
+            return true;
+        };
+        let Ok(size) = GridSize::new(width, height) else {
+            self.push_toast(
+                "Grid dimensions must each be between 1 and 256".to_owned(),
+                "warning",
+            );
+            return true;
+        };
+        self.submit_resize_grid(ctx, size, visual_anchor_to_grid(self.resize_anchor), None)
+    }
+
+    fn submit_resize_grid(
+        &mut self,
+        ctx: &Context<Self>,
+        size: GridSize,
+        anchor: GridAnchor,
+        edge_view: Option<MapResizeEdge>,
+    ) -> bool {
+        if !matches!(self.rpc_state, RpcState::Online)
+            || self.pending_grid.is_some()
+            || size == self.model.timeline().snapshot().size()
+        {
+            return false;
+        }
+        let Some(rpc) = self.rpc.clone() else {
+            return false;
+        };
+        let envelope = self.model.prepare_resize_grid(size, anchor, now_ms());
+        let command_id = envelope.metadata.id.to_string();
+        self.pending_commands.insert(command_id.clone());
+        self.pending_grid = Some(command_id.clone());
+        self.pending_edge_view = edge_view;
+        let request = ApplyCommandRequest {
+            target: self.target.clone(),
+            command: envelope,
+        };
+        let link = ctx.link().clone();
+        let attempt = self.connection_attempt;
+        wasm_bindgen_futures::spawn_local(async move {
+            link.send_message(Msg::RpcApplyFinished {
+                attempt,
+                command_id,
+                result: Box::new(rpc.apply_command(request).await),
+            });
+        });
+        true
+    }
+
+    fn place_shape_at(
+        &mut self,
+        ctx: &Context<Self>,
+        kind: PlacementKind,
+        shape: Shape,
+        point: GridPoint,
+    ) -> bool {
+        if self.mode != Mode::Select {
+            return false;
+        }
+        if !self.can_edit_timeline {
+            self.push_toast(
+                "Editing requires the exact edit_timeline capability".to_owned(),
+                "warning",
+            );
+            return true;
+        }
+        if !matches!(self.rpc_state, RpcState::Online) {
+            self.push_toast(
+                "Wait for collaboration sync before editing".to_owned(),
+                "info",
+            );
+            return true;
+        }
+        let Some(placement_points) = shape_world_points(point, shape) else {
+            self.push_toast(
+                "Template footprint exceeds the level bounds".to_owned(),
+                "warning",
+            );
+            return true;
+        };
+        if !self.can_place_shape(point, shape) {
+            self.push_toast(
+                "The complete template footprint requires unoccupied floor cells".to_owned(),
+                "warning",
+            );
+            return true;
+        }
+
+        let single_cell = Shape::new(1, 1, 1).expect("single-cell template is valid");
+        let envelope = match (kind, shape == single_cell) {
+            (PlacementKind::Block, true) => self.model.prepare_place_default_block(point, now_ms()),
+            (PlacementKind::Blind, true) => self.model.prepare_place_default_blind(point, now_ms()),
+            (PlacementKind::Block, false) => self.model.prepare_place_block(point, shape, now_ms()),
+            (PlacementKind::Blind, false) => self.model.prepare_place_blind(point, shape, now_ms()),
+        };
+        let LevelCommand::PlaceEntity { entity } = &envelope.command else {
+            unreachable!("default placement preparation returns PlaceEntity");
+        };
+        let entity_id = entity.id().clone();
+        self.selection = Some(Selection::Cell(point));
+        self.submit_entity_command(ctx, envelope, [entity_id], placement_points)
+    }
+
+    fn can_place_shape(&self, point: GridPoint, shape: Shape) -> bool {
+        let size = self.model.timeline().snapshot().size();
+        shape_world_points(point, shape).is_some_and(|points| {
+            points.into_iter().all(|sample| {
+                sample.x < size.width()
+                    && sample.y < size.height()
+                    && self.effective_cell(sample) == Some(CellKind::Floor)
+                    && self.model.timeline().snapshot().entity_at(sample).is_none()
+                    && !self.pending_placements.contains_key(&sample)
+            })
+        })
+    }
+
+    fn select_shape_draft(&mut self, shape_id: &str) -> bool {
+        let Some(entry) = self.shape_catalog.iter().find(|entry| entry.id == shape_id) else {
+            return false;
+        };
+        let Ok(shape) = Shape::new(
+            entry.shape.width,
+            entry.shape.height,
+            entry.shape.occupied_mask,
+        ) else {
+            self.push_toast("Project shape is invalid".to_owned(), "warning");
+            return true;
+        };
+        self.selected_shape_id = Some(entry.id.clone());
+        self.shape_draft_name = entry.name.clone();
+        self.shape_draft_mask = designer_mask_from_shape(shape);
+        true
+    }
+
+    fn save_shape_draft(&mut self, ctx: &Context<Self>, update: bool) -> bool {
+        if self.shape_catalog_pending || !self.can_edit_timeline {
+            return false;
+        }
+        let name = self.shape_draft_name.trim().to_owned();
+        if name.is_empty() {
+            self.push_toast("Name the shape before saving".to_owned(), "info");
+            return true;
+        }
+        let Ok(shape) = shape_from_designer_mask(self.shape_draft_mask) else {
+            self.push_toast(
+                "Shape must be non-empty and connected by cell edges".to_owned(),
+                "warning",
+            );
+            return true;
+        };
+        let definition = ShapeDefinition {
+            width: shape.width(),
+            height: shape.height(),
+            occupied_mask: shape.occupied_mask(),
+        };
+        let project_id = self.target.project_id.to_string();
+        let response_project_id = project_id.clone();
+        let selected_shape_id = self.selected_shape_id.clone();
+        if update && selected_shape_id.is_none() {
+            return false;
+        }
+        self.shape_catalog_pending = true;
+        let link = ctx.link().clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            let result = if let Some(shape_id) = selected_shape_id.filter(|_| update) {
+                RestClient
+                    .update_shape_catalog_entry(&project_id, &shape_id, &name, definition)
+                    .await
+            } else {
+                RestClient
+                    .create_shape_catalog_entry(&project_id, &name, definition)
+                    .await
+            };
+            link.send_message(Msg::ShapeSaved {
+                project_id: response_project_id,
+                result,
+            });
+        });
+        true
+    }
+
+    fn delete_shape_draft(&mut self, ctx: &Context<Self>) -> bool {
+        if self.shape_catalog_pending || !self.can_edit_timeline {
+            return false;
+        }
+        let Some(shape_id) = self.selected_shape_id.clone() else {
+            return false;
+        };
+        let project_id = self.target.project_id.to_string();
+        let response_project_id = project_id.clone();
+        let response_shape_id = shape_id.clone();
+        self.shape_catalog_pending = true;
+        let link = ctx.link().clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            link.send_message(Msg::ShapeDeleted {
+                project_id: response_project_id,
+                shape_id: response_shape_id,
+                result: RestClient
+                    .delete_shape_catalog_entry(&project_id, &shape_id)
+                    .await,
+            });
+        });
+        true
+    }
+
+    fn toggle_blind_isolation(&mut self) -> bool {
+        let Some(entity_id) = self.selected_entity_id().cloned() else {
+            return false;
+        };
+        if self
+            .model
+            .timeline()
+            .snapshot()
+            .entity(&entity_id)
+            .is_none_or(|entity| entity.as_blind().is_none())
+        {
+            return false;
+        }
+        self.isolated_blind =
+            (self.isolated_blind.as_ref() != Some(&entity_id)).then_some(entity_id);
+        self.canvas_dirty = true;
+        true
+    }
+
+    fn edit_selected_entity(&mut self, ctx: &Context<Self>, action: EntityAction) -> bool {
+        if self.mode != Mode::Select {
+            return false;
+        }
+        if let EntityAction::Move(direction) = action {
+            let (delta_x, delta_y) = direction.offset();
+            return self.move_selected_entities(ctx, i32::from(delta_x), i32::from(delta_y));
+        }
+        let Some(entity_id) = self.selected_entity_id().cloned() else {
+            return false;
+        };
+        if !self.can_edit_timeline {
+            self.push_toast(
+                "Editing requires the exact edit_timeline capability".to_owned(),
+                "warning",
+            );
+            return true;
+        }
+        if !matches!(self.rpc_state, RpcState::Online) {
+            self.push_toast(
+                "Wait for collaboration sync before editing".to_owned(),
+                "info",
+            );
+            return true;
+        }
+        if self.pending_entities.contains_key(&entity_id) {
+            return false;
+        }
+        if self
+            .model
+            .timeline()
+            .snapshot()
+            .entity(&entity_id)
+            .is_none()
+        {
+            self.selection = None;
+            return true;
+        }
+
+        let envelope = match action {
+            EntityAction::Move(_) => unreachable!(),
+            EntityAction::RotateClockwise => self
+                .model
+                .prepare_rotate_entity_clockwise(entity_id.clone(), now_ms()),
+            EntityAction::FlipHorizontal => self
+                .model
+                .prepare_flip_entity_horizontal(entity_id.clone(), now_ms()),
+            EntityAction::Delete => self
+                .model
+                .prepare_delete_entity(entity_id.clone(), now_ms()),
+        };
+        self.submit_entity_command(ctx, envelope, [entity_id], Vec::new())
+    }
+
+    fn set_pool_resolution(&mut self, ctx: &Context<Self>, pixels_per_cell: u8) -> bool {
+        let Some(entity_id) = self.selected_entity_id().cloned() else {
+            return false;
+        };
+        if !(1..=32).contains(&pixels_per_cell) {
+            self.push_toast(
+                "Pool resolution must be between 1 and 32".to_owned(),
+                "warning",
+            );
+            return true;
+        }
+        let Some(entity) = self.model.timeline().snapshot().entity(&entity_id) else {
+            return false;
+        };
+        let Some(blind) = entity.as_blind() else {
+            return false;
+        };
+        if blind.pixels_per_cell() == pixels_per_cell {
+            return false;
+        }
+        if !self.can_edit_timeline || !matches!(self.rpc_state, RpcState::Online) {
+            self.push_toast(
+                "Wait for collaboration sync before editing".to_owned(),
+                "info",
+            );
+            return true;
+        }
+        if self.pending_entities.contains_key(&entity_id) {
+            return false;
+        }
+        let envelope =
+            self.model
+                .prepare_set_blind_resolution(entity_id.clone(), pixels_per_cell, now_ms());
+        self.submit_entity_command(ctx, envelope, [entity_id], Vec::new())
+    }
+
+    fn move_selected_entities(&mut self, ctx: &Context<Self>, delta_x: i32, delta_y: i32) -> bool {
+        let origins = self
+            .selected_entity_ids()
+            .iter()
+            .filter_map(|entity_id| {
+                self.model
+                    .timeline()
+                    .snapshot()
+                    .entity(entity_id)
+                    .map(|entity| (entity_id.clone(), entity.origin()))
+            })
+            .collect::<Vec<_>>();
+        self.move_entities_from_origins(ctx, origins, delta_x, delta_y)
+    }
+
+    fn move_entities_from_origins(
+        &mut self,
+        ctx: &Context<Self>,
+        origins: Vec<(EntityId, GridPoint)>,
+        delta_x: i32,
+        delta_y: i32,
+    ) -> bool {
+        if origins.is_empty() || self.mode != Mode::Select {
+            return false;
+        }
+        if !self.can_edit_timeline {
+            self.push_toast(
+                "Editing requires the exact edit_timeline capability".to_owned(),
+                "warning",
+            );
+            return true;
+        }
+        if !matches!(self.rpc_state, RpcState::Online) {
+            self.push_toast(
+                "Wait for collaboration sync before editing".to_owned(),
+                "info",
+            );
+            return true;
+        }
+        if origins
+            .iter()
+            .any(|(entity_id, _)| self.pending_entities.contains_key(entity_id))
+        {
+            return false;
+        }
+        let Ok(delta_x) = i16::try_from(delta_x) else {
+            return false;
+        };
+        let Ok(delta_y) = i16::try_from(delta_y) else {
+            return false;
+        };
+        let mut moves = Vec::with_capacity(origins.len());
+        let mut entity_ids = Vec::with_capacity(origins.len());
+        for (entity_id, origin) in origins {
+            let (Some(x), Some(y)) = (
+                origin.x.checked_add_signed(delta_x),
+                origin.y.checked_add_signed(delta_y),
+            ) else {
+                self.push_toast(
+                    "Move rejected: selection would leave the grid".to_owned(),
+                    "warning",
+                );
+                return true;
+            };
+            entity_ids.push(entity_id.clone());
+            moves.push(EntityMove::new(entity_id, GridPoint::new(x, y)));
+        }
+        let envelope = self.model.prepare_move_entities(moves, now_ms());
+        self.submit_entity_command(ctx, envelope, entity_ids, Vec::new())
+    }
+
+    fn edit_selected_decorator(&mut self, ctx: &Context<Self>, action: DecoratorAction) -> bool {
+        if self.mode != Mode::Select {
+            return false;
+        }
+        let Some(entity_id) = self.selected_entity_id().cloned() else {
+            return false;
+        };
+        let is_block = self
+            .model
+            .timeline()
+            .snapshot()
+            .entity(&entity_id)
+            .is_some_and(|entity| matches!(entity.kind(), PlaceableEntityKind::Block(_)));
+        if !is_block {
+            return false;
+        }
+        if !self.can_edit_timeline {
+            self.push_toast(
+                "Editing requires the exact edit_timeline capability".to_owned(),
+                "warning",
+            );
+            return true;
+        }
+        if !matches!(self.rpc_state, RpcState::Online) {
+            self.push_toast(
+                "Wait for collaboration sync before editing".to_owned(),
+                "info",
+            );
+            return true;
+        }
+        if self.pending_entities.contains_key(&entity_id) {
+            return false;
+        }
+
+        if action == DecoratorAction::BeginKeyLocker {
+            self.key_locker_assignment =
+                (self.key_locker_assignment.as_ref() != Some(&entity_id)).then_some(entity_id);
+            self.canvas_dirty = true;
+            return true;
+        }
+
+        self.key_locker_assignment = None;
+        let envelope = match action {
+            DecoratorAction::ToggleIce => {
+                self.model.prepare_toggle_ice(entity_id.clone(), now_ms())
+            }
+            DecoratorAction::CycleDirection => self
+                .model
+                .prepare_cycle_direction(entity_id.clone(), now_ms()),
+            DecoratorAction::SetDirection(mode) => {
+                self.model
+                    .prepare_set_direction(entity_id.clone(), mode, now_ms())
+            }
+            DecoratorAction::BeginKeyLocker => unreachable!(),
+        };
+        self.submit_decorator_command(ctx, envelope, [entity_id])
+    }
+
+    fn set_selected_ice_count(&mut self, ctx: &Context<Self>, value: &str) -> bool {
+        let Ok(blocking_count) = value.parse::<u32>() else {
+            return false;
+        };
+        if self.mode != Mode::Select
+            || !self.can_edit_timeline
+            || !matches!(self.rpc_state, RpcState::Online)
+        {
+            return false;
+        }
+        let Some(entity_id) = self.selected_entity_id().cloned() else {
+            return false;
+        };
+        if self.pending_entities.contains_key(&entity_id)
+            || !self
+                .model
+                .timeline()
+                .snapshot()
+                .entity(&entity_id)
+                .is_some_and(|entity| matches!(entity.kind(), PlaceableEntityKind::Block(_)))
+        {
+            return false;
+        }
+        let envelope = self
+            .model
+            .prepare_set_ice(entity_id.clone(), blocking_count, now_ms());
+        self.submit_decorator_command(ctx, envelope, [entity_id])
+    }
+
+    fn complete_key_locker_assignment(&mut self, ctx: &Context<Self>, event: PointerEvent) -> bool {
+        let Some(key_entity_id) = self.key_locker_assignment.clone() else {
+            return false;
+        };
+        let Some(point) = self.point_from_pointer(&event) else {
+            self.push_toast("Choose a Block inside the level".to_owned(), "info");
+            return true;
+        };
+        let snapshot = self.model.timeline().snapshot();
+        let Some(target) = snapshot.entity_at(point) else {
+            self.push_toast("Locker target must be a Block".to_owned(), "info");
+            return true;
+        };
+        let lock_entity_id = target.id().clone();
+        if key_entity_id == lock_entity_id
+            || !matches!(target.kind(), PlaceableEntityKind::Block(_))
+        {
+            self.push_toast("Choose a different Block as the Locker".to_owned(), "info");
+            return true;
+        }
+        let current_relation_id =
+            key_locker_for_key(snapshot, &key_entity_id).map(|decorator| decorator.id().clone());
+        if key_locker_for_lock(snapshot, &lock_entity_id)
+            .is_some_and(|decorator| Some(decorator.id()) != current_relation_id.as_ref())
+        {
+            self.push_toast(
+                "That Block is already another Key's Locker".to_owned(),
+                "warning",
+            );
+            return true;
+        }
+        if self.pending_entities.contains_key(&key_entity_id)
+            || self.pending_entities.contains_key(&lock_entity_id)
+        {
+            return false;
+        }
+
+        self.key_locker_assignment = None;
+        let envelope = self.model.prepare_assign_key_locker(
+            key_entity_id.clone(),
+            lock_entity_id.clone(),
+            now_ms(),
+        );
+        self.submit_decorator_command(ctx, envelope, [key_entity_id, lock_entity_id])
+    }
+
+    fn submit_entity_command(
+        &mut self,
+        ctx: &Context<Self>,
+        envelope: CommandEnvelope,
+        entity_ids: impl IntoIterator<Item = EntityId>,
+        placement_points: Vec<GridPoint>,
+    ) -> bool {
+        let Some(rpc) = self
+            .rpc
+            .clone()
+            .filter(|_| matches!(self.rpc_state, RpcState::Online))
+        else {
+            return false;
+        };
+        let command_id = envelope.metadata.id.to_string();
+        self.pending_commands.insert(command_id.clone());
+        for entity_id in entity_ids {
+            self.pending_entities.insert(entity_id, command_id.clone());
+        }
+        for point in placement_points {
+            self.pending_placements.insert(point, command_id.clone());
+        }
+        let request = ApplyCommandRequest {
+            target: self.target.clone(),
+            command: envelope,
+        };
+        let link = ctx.link().clone();
+        let attempt = self.connection_attempt;
+        wasm_bindgen_futures::spawn_local(async move {
+            link.send_message(Msg::RpcApplyFinished {
+                attempt,
+                command_id,
+                result: Box::new(rpc.apply_command(request).await),
+            });
+        });
+        self.canvas_dirty = true;
+        true
+    }
+
+    fn submit_decorator_command(
+        &mut self,
+        ctx: &Context<Self>,
+        envelope: CommandEnvelope,
+        entity_ids: impl IntoIterator<Item = EntityId>,
+    ) -> bool {
+        let Some(rpc) = self
+            .rpc
+            .clone()
+            .filter(|_| matches!(self.rpc_state, RpcState::Online))
+        else {
+            return false;
+        };
+        let command_id = envelope.metadata.id.to_string();
+        self.pending_commands.insert(command_id.clone());
+        for entity_id in entity_ids {
+            self.pending_entities.insert(entity_id, command_id.clone());
+        }
+        let request = ApplyCommandRequest {
+            target: self.target.clone(),
+            command: envelope,
+        };
+        let link = ctx.link().clone();
+        let attempt = self.connection_attempt;
+        wasm_bindgen_futures::spawn_local(async move {
+            link.send_message(Msg::RpcApplyFinished {
+                attempt,
+                command_id,
+                result: Box::new(rpc.apply_command(request).await),
+            });
+        });
+        self.canvas_dirty = true;
+        true
     }
 
     fn undo(&mut self, ctx: &Context<Self>) -> bool {
+        if self.blind_gesture.is_some() {
+            self.push_toast(
+                "Finish or cancel the active Brush gesture first".to_owned(),
+                "info",
+            );
+            return true;
+        }
+        self.key_locker_assignment = None;
         if !self.can_edit_timeline {
             self.push_toast(
                 "Undo requires the exact edit_timeline capability".to_owned(),
@@ -1691,48 +4556,31 @@ impl App {
             );
             return true;
         }
-        if matches!(self.rpc_state, RpcState::Connecting | RpcState::Resyncing) {
+        if !matches!(self.rpc_state, RpcState::Online) {
             self.push_toast("Wait for collaboration sync before undo".to_owned(), "info");
             return true;
         }
-        if matches!(self.rpc_state, RpcState::Online) {
-            let Some(rpc) = self.rpc.clone() else {
-                return false;
-            };
-            let metadata = self.model.prepare_undo(now_ms());
-            let command_id = metadata.id.to_string();
-            self.pending_commands.insert(command_id.clone());
-            let request = UndoLatestRequest {
-                target: self.target.clone(),
-                metadata,
-            };
-            let link = ctx.link().clone();
-            let attempt = self.connection_attempt;
-            wasm_bindgen_futures::spawn_local(async move {
-                link.send_message(Msg::RpcUndoFinished {
-                    attempt,
-                    command_id,
-                    result: Box::new(rpc.undo_latest(request).await),
-                });
+        let Some(rpc) = self.rpc.clone() else {
+            return false;
+        };
+        let metadata = self.model.prepare_undo(now_ms());
+        let command_id = metadata.id.to_string();
+        self.pending_commands.insert(command_id.clone());
+        let request = UndoLatestRequest {
+            target: self.target.clone(),
+            metadata,
+        };
+        let link = ctx.link().clone();
+        let attempt = self.connection_attempt;
+        wasm_bindgen_futures::spawn_local(async move {
+            link.send_message(Msg::RpcUndoFinished {
+                attempt,
+                command_id,
+                result: Box::new(rpc.undo_latest(request).await),
             });
-            self.open_menu = None;
-            self.palette_open = false;
-            return true;
-        }
-
-        match self.model.undo(now_ms()) {
-            Ok(event) => {
-                self.canvas_dirty = true;
-                self.persist_draft();
-                self.open_menu = None;
-                self.palette_open = false;
-                self.push_toast(
-                    format!("Appended undo as sequence #{:04}", event.sequence),
-                    "success",
-                );
-            }
-            Err(error) => self.push_toast(error.to_string(), "warning"),
-        }
+        });
+        self.open_menu = None;
+        self.palette_open = false;
         true
     }
 
@@ -1744,6 +4592,88 @@ impl App {
         } else {
             ShortcutScope::Workspace
         };
+        if scope == ShortcutScope::Workspace
+            && !event.ctrl_key()
+            && !event.meta_key()
+            && !event.alt_key()
+            && !event.shift_key()
+        {
+            if let Some(tool) = WorkspaceTool::from_key(self.mode, &event.key()) {
+                event.prevent_default();
+                return self.set_workspace_tool(tool);
+            }
+        }
+        if scope == ShortcutScope::Workspace
+            && self.blind_gesture.is_some()
+            && event.key() == "Escape"
+        {
+            event.prevent_default();
+            self.blind_gesture = None;
+            self.canvas_dirty = true;
+            return true;
+        }
+        if scope == ShortcutScope::Workspace
+            && self.key_locker_assignment.is_some()
+            && event.key() == "Escape"
+        {
+            event.prevent_default();
+            self.key_locker_assignment = None;
+            self.canvas_dirty = true;
+            return true;
+        }
+        if scope == ShortcutScope::Workspace
+            && self.mode == Mode::Select
+            && self.workspace_tool == WorkspaceTool::Decorate
+            && !event.ctrl_key()
+            && !event.meta_key()
+            && !event.alt_key()
+            && !event.shift_key()
+        {
+            let action = match event.key().to_ascii_lowercase().as_str() {
+                "i" => Some(DecoratorAction::ToggleIce),
+                "d" => Some(DecoratorAction::CycleDirection),
+                "k" => Some(DecoratorAction::BeginKeyLocker),
+                _ => None,
+            };
+            if let Some(action) = action {
+                event.prevent_default();
+                return self.edit_selected_decorator(ctx, action);
+            }
+        }
+        if scope == ShortcutScope::Workspace
+            && self.mode == Mode::Brush
+            && !event.ctrl_key()
+            && !event.meta_key()
+            && !event.alt_key()
+            && self.blind_gesture.is_none()
+        {
+            let key = event.key().to_ascii_lowercase();
+            let brush_change = match key.as_str() {
+                "b" => {
+                    self.blind_brush_tool = BlindBrushTool::Paint;
+                    self.workspace_tool = WorkspaceTool::Paint;
+                    true
+                }
+                "f" => {
+                    self.blind_brush_tool = BlindBrushTool::FloodFill;
+                    self.workspace_tool = WorkspaceTool::Fill;
+                    true
+                }
+                "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" => {
+                    self.blind_color_index = key.parse().expect("matched ASCII brush color");
+                    true
+                }
+                "0" => {
+                    self.blind_color_index = 10;
+                    true
+                }
+                _ => false,
+            };
+            if brush_change {
+                event.prevent_default();
+                return true;
+            }
+        }
         let Some(shortcut) = resolve_shortcut(
             &event.key(),
             event.ctrl_key() || event.meta_key(),
@@ -1752,10 +4682,20 @@ impl App {
         ) else {
             return false;
         };
+        if matches!(shortcut, Shortcut::MoveSelection(_))
+            && (self.mode != Mode::Select
+                || self.workspace_tool != WorkspaceTool::Transform
+                || self.selected_entity_ids().is_empty())
+        {
+            return false;
+        }
         event.prevent_default();
 
         match shortcut {
             Shortcut::SelectMode(mode) => self.set_mode(mode),
+            Shortcut::MoveSelection(direction) => {
+                self.edit_selected_entity(ctx, EntityAction::Move(direction))
+            }
             Shortcut::Undo => self.undo(ctx),
             Shortcut::TogglePalette => {
                 self.palette_open = !self.palette_open;
@@ -1816,25 +4756,40 @@ impl App {
     }
 
     fn start_connection(&mut self, ctx: &Context<Self>) {
+        self.reconnect_timer = None;
         self.connection_attempt += 1;
         self.rpc = None;
         self.rpc_state = RpcState::Connecting;
+        self.presence.clear();
+        self.last_sent_cursor = None;
+        self.cursor_timer = None;
+        self.cursor_in_flight = false;
         self.pending_commands.clear();
         self.pending_cells.clear();
+        self.pending_entities.clear();
+        self.pending_placements.clear();
+        self.pending_grid = None;
+        self.pending_edge_view = None;
+        self.blind_gesture = None;
+        self.entity_drag = None;
+        self.pan_gesture = None;
+        self.map_resize_gesture = None;
+        self.marquee_gesture = None;
+        self.key_locker_assignment = None;
         self.canvas_dirty = true;
         spawn_connection(ctx, self.connection_attempt, self.target.clone());
     }
 
     fn handle_rpc_update(&mut self, ctx: &Context<Self>, update: RpcUpdate) -> bool {
         match update {
-            RpcUpdate::Snapshot(snapshot) => self.accept_server_snapshot(snapshot),
+            RpcUpdate::Snapshot(snapshot) => self.accept_server_snapshot(ctx, snapshot),
             RpcUpdate::History {
                 target,
                 through_sequence,
                 events,
-            } => self.accept_server_history(target, through_sequence, events),
+            } => self.accept_server_history(ctx, target, through_sequence, events),
             RpcUpdate::Subscription(LevelSubscriptionItem::Snapshot { snapshot }) => {
-                self.accept_server_snapshot(*snapshot)
+                self.accept_server_snapshot(ctx, *snapshot)
             }
             RpcUpdate::Subscription(LevelSubscriptionItem::Event { event }) => {
                 self.accept_server_event(ctx, *event)
@@ -1848,38 +4803,140 @@ impl App {
                 }
                 true
             }
+            RpcUpdate::Presence(item) => {
+                let notice = match &item {
+                    LevelPresenceItem::Joined { participant, .. } => {
+                        Some((format!("{} joined the level", participant.actor), "info"))
+                    }
+                    LevelPresenceItem::Left { presence_id, .. } => {
+                        self.presence.participant(presence_id).map(|participant| {
+                            (format!("{} left the level", participant.actor), "info")
+                        })
+                    }
+                    _ => None,
+                };
+                let changed = self.presence.apply(&self.target, item);
+                if changed {
+                    self.canvas_dirty = true;
+                    if let Some((message, level)) = notice {
+                        self.push_toast(message, level);
+                    }
+                }
+                changed
+            }
             RpcUpdate::Closed(error) => {
-                self.connection_attempt += 1;
+                if matches!(self.rpc_state, RpcState::Offline) {
+                    return false;
+                }
                 self.rpc = None;
-                self.rpc_state = RpcState::Offline;
+                self.presence.clear();
                 self.pending_commands.clear();
                 self.pending_cells.clear();
-                let snapshot = self.model.timeline().snapshot().clone();
-                let _ = self.model.replace_snapshot(snapshot);
+                self.pending_entities.clear();
+                self.pending_placements.clear();
+                self.pending_grid = None;
+                self.pending_edge_view = None;
+                self.blind_gesture = None;
+                self.entity_drag = None;
+                self.pan_gesture = None;
+                self.map_resize_gesture = None;
+                self.marquee_gesture = None;
+                self.placement_drag = None;
+                self.key_locker_assignment = None;
                 self.canvas_dirty = true;
-                self.push_toast(
-                    format!("Collaboration disconnected; local editing remains active: {error}"),
-                    "warning",
-                );
+                self.schedule_reconnect(ctx, error);
                 true
             }
         }
     }
 
-    fn accept_server_snapshot(&mut self, response: LevelSnapshotResponse) -> bool {
+    fn queue_cursor(&mut self, ctx: &Context<Self>, cursor: Option<GridPoint>) -> bool {
+        if self.desired_cursor == cursor {
+            return false;
+        }
+        self.desired_cursor = cursor;
+        if matches!(self.rpc_state, RpcState::Online) {
+            self.schedule_cursor_flush(ctx);
+        }
+        false
+    }
+
+    fn schedule_cursor_flush(&mut self, ctx: &Context<Self>) {
+        if self.cursor_timer.is_some() || self.cursor_in_flight {
+            return;
+        }
+        let attempt = self.connection_attempt;
+        let link = ctx.link().clone();
+        self.cursor_timer = Some(Timeout::new(50, move || {
+            link.send_message(Msg::FlushCursor(attempt));
+        }));
+    }
+
+    fn flush_cursor(&mut self, ctx: &Context<Self>) {
+        if self.cursor_in_flight
+            || !matches!(self.rpc_state, RpcState::Online)
+            || self.last_sent_cursor == Some(self.desired_cursor)
+        {
+            return;
+        }
+        let Some(rpc) = self.rpc.clone() else {
+            return;
+        };
+        let cursor = self.desired_cursor;
+        let request = UpdateLevelCursorRequest {
+            target: self.target.clone(),
+            cursor,
+        };
+        let attempt = self.connection_attempt;
+        let link = ctx.link().clone();
+        self.cursor_in_flight = true;
+        wasm_bindgen_futures::spawn_local(async move {
+            link.send_message(Msg::CursorSent {
+                attempt,
+                cursor,
+                result: rpc.update_level_cursor(request).await,
+            });
+        });
+    }
+
+    fn schedule_reconnect(&mut self, ctx: &Context<Self>, reason: String) {
+        self.rpc = None;
+        self.rpc_state = RpcState::Offline;
+        self.reconnect_failures = self.reconnect_failures.saturating_add(1);
+        let delay_ms = reconnect_delay_ms(self.reconnect_failures);
+        let attempt = self.connection_attempt;
+        let link = ctx.link().clone();
+        self.reconnect_timer = Some(Timeout::new(delay_ms, move || {
+            link.send_message(Msg::RetryConnection(attempt));
+        }));
+        self.push_toast(
+            format!(
+                "Live session unavailable; editor is read-only and retries in {:.0}s: {reason}",
+                f64::from(delay_ms) / 1_000.0
+            ),
+            "warning",
+        );
+    }
+
+    fn accept_server_snapshot(
+        &mut self,
+        ctx: &Context<Self>,
+        response: LevelSnapshotResponse,
+    ) -> bool {
         if response.target != self.target {
             self.connection_attempt += 1;
             self.rpc = None;
-            self.rpc_state = RpcState::Offline;
             self.pending_commands.clear();
             self.pending_cells.clear();
+            self.pending_entities.clear();
+            self.pending_placements.clear();
             self.canvas_dirty = true;
-            self.push_toast(
+            self.schedule_reconnect(
+                ctx,
                 format!(
-                    "Ignored snapshot for unexpected target {} / {}",
+                    "snapshot referenced unexpected target {} / {}",
                     response.target.project_id, response.target.level_id
                 ),
-                "warning",
             );
             return true;
         }
@@ -1887,13 +4944,14 @@ impl App {
         if computed_hash != response.level_hash {
             self.connection_attempt += 1;
             self.rpc = None;
-            self.rpc_state = RpcState::Offline;
             self.pending_commands.clear();
             self.pending_cells.clear();
+            self.pending_entities.clear();
+            self.pending_placements.clear();
             self.canvas_dirty = true;
-            self.push_toast(
-                "Server snapshot hash did not match oreak-core; staying local".to_owned(),
-                "warning",
+            self.schedule_reconnect(
+                ctx,
+                "server snapshot hash did not match oreak-core".to_owned(),
             );
             return true;
         }
@@ -1910,23 +4968,36 @@ impl App {
             return false;
         }
 
+        let previous_size = self.model.timeline().snapshot().size();
         if let Err(error) = self.model.replace_snapshot(response.snapshot) {
             self.connection_attempt += 1;
             self.rpc = None;
-            self.rpc_state = RpcState::Offline;
             self.pending_commands.clear();
             self.pending_cells.clear();
+            self.pending_entities.clear();
+            self.pending_placements.clear();
             self.canvas_dirty = true;
-            self.push_toast(
-                format!("Server snapshot was rejected locally: {error}"),
-                "warning",
+            self.schedule_reconnect(
+                ctx,
+                format!("server snapshot was rejected locally: {error}"),
             );
             return true;
         }
+        self.blind_gesture = None;
+        self.key_locker_assignment = None;
         self.server_sequence = Some(response.server_sequence);
         self.server_hash = Some(response.level_hash);
         self.pending_commands.clear();
         self.pending_cells.clear();
+        self.pending_entities.clear();
+        self.pending_placements.clear();
+        self.pending_grid = None;
+        self.pending_edge_view = None;
+        self.clear_missing_entity_selection();
+        self.sync_resize_fields();
+        if self.model.timeline().snapshot().size() != previous_size {
+            self.frame_grid();
+        }
         self.canvas_dirty = true;
         self.persist_draft();
         true
@@ -1934,6 +5005,7 @@ impl App {
 
     fn accept_server_history(
         &mut self,
+        ctx: &Context<Self>,
         target: ProjectLevelTarget,
         through_sequence: u64,
         events: Vec<HistoryEvent>,
@@ -1944,32 +5016,34 @@ impl App {
             || event_tip != through_sequence
         {
             return self.reject_server_history(
+                ctx,
                 "history did not match the subscribed target and snapshot sequence".to_owned(),
             );
         }
         let projection = match hydrate_history(self.model.timeline().snapshot(), &events) {
             Ok(projection) => projection,
-            Err(error) => return self.reject_server_history(error),
+            Err(error) => return self.reject_server_history(ctx, error),
         };
 
         self.server_events = events;
         self.seen_commands = projection.seen_commands;
         self.remote_blame = projection.cell_blame;
+        self.remote_entity_blame = projection.entity_blame;
         self.canvas_dirty = true;
         true
     }
 
-    fn reject_server_history(&mut self, error: String) -> bool {
+    fn reject_server_history(&mut self, ctx: &Context<Self>, error: String) -> bool {
         self.connection_attempt += 1;
         self.rpc = None;
-        self.rpc_state = RpcState::Offline;
         self.pending_commands.clear();
         self.pending_cells.clear();
+        self.pending_entities.clear();
+        self.pending_placements.clear();
+        self.pending_grid = None;
+        self.pending_edge_view = None;
         self.canvas_dirty = true;
-        self.push_toast(
-            format!("Server history hydration failed: {error}"),
-            "warning",
-        );
+        self.schedule_reconnect(ctx, format!("server history hydration failed: {error}"));
         true
     }
 
@@ -2003,6 +5077,10 @@ impl App {
         }
 
         let previous_snapshot = self.model.timeline().snapshot().clone();
+        self.blind_gesture = None;
+        self.entity_drag = None;
+        self.marquee_gesture = None;
+        self.key_locker_assignment = None;
         match self.model.apply_server_event(&update.event) {
             Ok(ModelChange::Applied { .. }) => {}
             Ok(ModelChange::NoChange) => {
@@ -2028,6 +5106,10 @@ impl App {
             return true;
         }
 
+        let previous_size = previous_snapshot.size();
+        let current_size = self.model.timeline().snapshot().size();
+        let command_edge =
+            map_resize_edge_from_command(&update.event.command, previous_size, current_size);
         self.server_sequence = Some(update.server_sequence);
         self.server_hash = Some(update.level_hash);
         self.server_events.push(update.event);
@@ -2041,7 +5123,39 @@ impl App {
             };
         self.seen_commands = projection.seen_commands;
         self.remote_blame = projection.cell_blame;
+        self.remote_entity_blame = projection.entity_blame;
+        let edge_view = (self.pending_grid.as_deref() == Some(command_id.as_str()))
+            .then(|| self.pending_edge_view.take())
+            .flatten()
+            .filter(|edge| map_resize_edge_changes_only_axis(*edge, previous_size, current_size))
+            .or(command_edge)
+            .map(|edge| (edge, previous_size, current_size));
         self.remove_pending(&command_id);
+        self.clear_missing_entity_selection();
+        if self.model.timeline().snapshot().size() != previous_snapshot.size() {
+            self.map_resize_gesture = None;
+            self.marquee_gesture = None;
+            self.entity_drag = None;
+            self.placement_drag = None;
+            self.sync_resize_fields();
+            if let Some((edge, before, after)) = edge_view {
+                let cell_size = CELL_SIZE * self.viewport.scale;
+                match edge {
+                    MapResizeEdge::Top => {
+                        self.viewport.offset_y -=
+                            (f64::from(after.height()) - f64::from(before.height())) * cell_size;
+                    }
+                    MapResizeEdge::Left => {
+                        self.viewport.offset_x +=
+                            (f64::from(before.width()) - f64::from(after.width())) * cell_size;
+                    }
+                    MapResizeEdge::Right | MapResizeEdge::Bottom => {}
+                }
+                self.translate_cell_selection_after_edge_resize(edge, before, after);
+            } else {
+                self.frame_grid();
+            }
+        }
         self.canvas_dirty = true;
         self.persist_draft();
         true
@@ -2132,11 +5246,13 @@ impl App {
             return;
         }
         if self.rpc.is_none() {
-            self.rpc_state = RpcState::Offline;
             self.pending_commands.clear();
             self.pending_cells.clear();
+            self.pending_entities.clear();
+            self.pending_placements.clear();
+            self.pending_grid = None;
             self.canvas_dirty = true;
-            self.push_toast(format!("Resync unavailable: {reason}"), "warning");
+            self.schedule_reconnect(ctx, format!("resync unavailable: {reason}"));
             return;
         }
         self.push_toast(format!("Resync requested: {reason}"), "info");
@@ -2148,6 +5264,14 @@ impl App {
         self.pending_commands.remove(command_id);
         self.pending_cells
             .retain(|_, pending| pending.command_id != command_id);
+        self.pending_entities
+            .retain(|_, pending_command| pending_command != command_id);
+        self.pending_placements
+            .retain(|_, pending_command| pending_command != command_id);
+        if self.pending_grid.as_deref() == Some(command_id) {
+            self.pending_grid = None;
+            self.pending_edge_view = None;
+        }
         self.canvas_dirty = true;
     }
 
@@ -2158,6 +5282,229 @@ impl App {
             .or_else(|| self.model.cell(point).ok())
     }
 
+    fn translate_cell_selection_after_edge_resize(
+        &mut self,
+        edge: MapResizeEdge,
+        before: GridSize,
+        after: GridSize,
+    ) {
+        let Some(Selection::Cell(point)) = self.selection else {
+            return;
+        };
+        let (delta_x, delta_y) = match edge {
+            MapResizeEdge::Top => (0, i32::from(after.height()) - i32::from(before.height())),
+            MapResizeEdge::Left => (i32::from(after.width()) - i32::from(before.width()), 0),
+            MapResizeEdge::Right | MapResizeEdge::Bottom => (0, 0),
+        };
+        self.selection = point
+            .x
+            .checked_add_signed(delta_x as i16)
+            .zip(point.y.checked_add_signed(delta_y as i16))
+            .filter(|(x, y)| *x < after.width() && *y < after.height())
+            .map(|(x, y)| Selection::Cell(GridPoint::new(x, y)));
+    }
+
+    fn frame_grid(&mut self) {
+        self.viewport = ViewportTransform::frame_rect(
+            self.model.timeline().snapshot().size(),
+            f64::from(self.canvas_width),
+            f64::from(self.canvas_height),
+            BOARD_ORIGIN,
+            CELL_SIZE,
+        );
+        self.canvas_dirty = true;
+    }
+
+    fn canvas_resized(&mut self, width: u32, height: u32) -> bool {
+        let width = width.clamp(1, 4096);
+        let height = height.clamp(1, 4096);
+        if self.canvas_size_initialized
+            && self.canvas_width == width
+            && self.canvas_height == height
+        {
+            return false;
+        }
+        let previous_width = self.canvas_width;
+        let previous_height = self.canvas_height;
+        self.canvas_width = width;
+        self.canvas_height = height;
+        if let Some(canvas) = self.canvas_ref.cast::<HtmlCanvasElement>() {
+            canvas.set_width(width);
+            canvas.set_height(height);
+        }
+        if self.canvas_size_initialized {
+            self.viewport.offset_x += (f64::from(width) - f64::from(previous_width)) / 2.0;
+            self.viewport.offset_y += (f64::from(height) - f64::from(previous_height)) / 2.0;
+        } else {
+            self.canvas_size_initialized = true;
+            self.frame_grid();
+        }
+        self.canvas_dirty = true;
+        true
+    }
+
+    fn ensure_canvas_resize_observer(&mut self, ctx: &Context<Self>) {
+        if self.canvas_resize_observer.is_some() {
+            return;
+        }
+        let Some(canvas) = self.canvas_ref.cast::<HtmlCanvasElement>() else {
+            return;
+        };
+        let canvas_ref = self.canvas_ref.clone();
+        let link = ctx.link().clone();
+        let callback = Closure::<dyn FnMut()>::new(move || {
+            let Some(canvas) = canvas_ref.cast::<HtmlCanvasElement>() else {
+                return;
+            };
+            link.send_message(Msg::CanvasResized(
+                u32::try_from(canvas.client_width().max(1)).unwrap_or(CANVAS_WIDTH),
+                u32::try_from(canvas.client_height().max(1)).unwrap_or(CANVAS_HEIGHT),
+            ));
+        });
+        let Ok(observer) = ResizeObserver::new(callback.as_ref().unchecked_ref()) else {
+            return;
+        };
+        observer.observe(canvas.unchecked_ref::<Element>());
+        self.canvas_resize_callback = Some(callback);
+        self.canvas_resize_observer = Some(observer);
+    }
+
+    fn disconnect_canvas_resize_observer(&mut self) {
+        if let Some(observer) = self.canvas_resize_observer.take() {
+            observer.disconnect();
+        }
+        self.canvas_resize_callback = None;
+        self.canvas_size_initialized = false;
+    }
+
+    fn begin_sidebar_resize(&mut self, side: SidebarSide, event: PointerEvent) -> bool {
+        if event.button() != 0 {
+            return false;
+        }
+        event.prevent_default();
+        if let Some(root) = self.root_ref.cast::<HtmlElement>() {
+            let _ = root.set_pointer_capture(event.pointer_id());
+        }
+        self.sidebar_resize = Some(SidebarResize {
+            side,
+            pointer_id: event.pointer_id(),
+            start_client_x: f64::from(event.client_x()),
+            start_width: match side {
+                SidebarSide::Left => self.left_sidebar_width,
+                SidebarSide::Right => self.right_sidebar_width,
+            },
+        });
+        true
+    }
+
+    fn resize_sidebar(&mut self, event: PointerEvent) -> bool {
+        let Some(resize) = self.sidebar_resize.as_ref() else {
+            return false;
+        };
+        if resize.pointer_id != event.pointer_id() {
+            return false;
+        }
+        let delta = f64::from(event.client_x()) - resize.start_client_x;
+        let width = match resize.side {
+            SidebarSide::Left => resize.start_width + delta,
+            SidebarSide::Right => resize.start_width - delta,
+        }
+        .clamp(180.0, 480.0);
+        let target = match resize.side {
+            SidebarSide::Left => &mut self.left_sidebar_width,
+            SidebarSide::Right => &mut self.right_sidebar_width,
+        };
+        if (*target - width).abs() < f64::EPSILON {
+            return false;
+        }
+        *target = width;
+        true
+    }
+
+    fn end_sidebar_resize(&mut self, event: PointerEvent) -> bool {
+        if self
+            .sidebar_resize
+            .as_ref()
+            .is_none_or(|resize| resize.pointer_id != event.pointer_id())
+        {
+            return false;
+        }
+        if let Some(root) = self.root_ref.cast::<HtmlElement>() {
+            let _ = root.release_pointer_capture(event.pointer_id());
+        }
+        self.sidebar_resize = None;
+        true
+    }
+
+    fn sync_resize_fields(&mut self) {
+        let size = self.model.timeline().snapshot().size();
+        self.resize_width = size.width().to_string();
+        self.resize_height = size.height().to_string();
+    }
+
+    fn zoom_canvas(&mut self, factor: f64) -> bool {
+        if self.blind_gesture.is_some() || self.entity_drag.is_some() || self.drag_kind.is_some() {
+            return false;
+        }
+        let center_x = f64::from(self.canvas_width) / 2.0;
+        let center_y = f64::from(self.canvas_height) / 2.0;
+        self.viewport = self
+            .viewport
+            .zoom_about(self.viewport.scale * factor, center_x, center_y);
+        self.canvas_dirty = true;
+        true
+    }
+
+    fn canvas_wheel(&mut self, event: WheelEvent) -> bool {
+        event.prevent_default();
+        if self.blind_gesture.is_some() || self.entity_drag.is_some() || self.drag_kind.is_some() {
+            return false;
+        }
+        let Some(canvas) = self.canvas_ref.cast::<HtmlCanvasElement>() else {
+            return false;
+        };
+        let bounds = canvas.get_bounding_client_rect();
+        if bounds.width() <= 0.0 || bounds.height() <= 0.0 {
+            return false;
+        }
+        let x = (f64::from(event.client_x()) - bounds.left()) * f64::from(canvas.width())
+            / bounds.width();
+        let y = (f64::from(event.client_y()) - bounds.top()) * f64::from(canvas.height())
+            / bounds.height();
+        let factor = (-event.delta_y() * 0.0015).exp();
+        self.viewport = self.viewport.zoom_about(self.viewport.scale * factor, x, y);
+        self.canvas_dirty = true;
+        true
+    }
+
+    fn preview_origin(&self, entity: &PlaceableEntity) -> GridPoint {
+        let Some(drag) = self.entity_drag.as_ref() else {
+            return entity.origin();
+        };
+        let Some((_, origin)) = drag
+            .origins
+            .iter()
+            .find(|(entity_id, _)| entity_id == entity.id())
+        else {
+            return entity.origin();
+        };
+        let delta_x = i32::from(drag.current.x) - i32::from(drag.start.x);
+        let delta_y = i32::from(drag.current.y) - i32::from(drag.start.y);
+        let Ok(delta_x) = i16::try_from(delta_x) else {
+            return *origin;
+        };
+        let Ok(delta_y) = i16::try_from(delta_y) else {
+            return *origin;
+        };
+        match (
+            origin.x.checked_add_signed(delta_x),
+            origin.y.checked_add_signed(delta_y),
+        ) {
+            (Some(x), Some(y)) => GridPoint::new(x, y),
+            _ => *origin,
+        }
+    }
+
     fn activity_events(&self) -> &[HistoryEvent] {
         if matches!(self.rpc_state, RpcState::Online | RpcState::Resyncing) {
             &self.server_events
@@ -2166,40 +5513,132 @@ impl App {
         }
     }
 
-    fn blame_for_cell(&self, point: GridPoint) -> Option<BlameEntry> {
-        if matches!(self.rpc_state, RpcState::Online | RpcState::Resyncing) {
-            self.remote_blame.get(&point).cloned()
-        } else {
-            let local = self.model.timeline().blame_cell(point);
-            if local
-                .as_ref()
-                .is_some_and(|entry| entry.actor.as_str() == self.model.actor().as_str())
-            {
-                local
-            } else {
-                self.remote_blame.get(&point).cloned().or(local)
-            }
+    fn selected_cell(&self) -> Option<GridPoint> {
+        match self.selection.as_ref() {
+            Some(Selection::Cell(point)) => Some(*point),
+            _ => None,
         }
     }
 
-    fn history_for_cell(&self, point: GridPoint) -> Vec<&HistoryEvent> {
+    fn selected_entity_id(&self) -> Option<&EntityId> {
+        match self.selection.as_ref() {
+            Some(Selection::Entities(entity_ids)) if entity_ids.len() == 1 => entity_ids.first(),
+            _ => None,
+        }
+    }
+
+    fn selected_entity_ids(&self) -> &[EntityId] {
+        match self.selection.as_ref() {
+            Some(Selection::Entities(entity_ids)) => entity_ids,
+            _ => &[],
+        }
+    }
+
+    fn selected_entity(&self) -> Option<&PlaceableEntity> {
+        self.model
+            .timeline()
+            .snapshot()
+            .entity(self.selected_entity_id()?)
+    }
+
+    fn blame_for_selection(&self) -> Option<BlameEntry> {
+        match self.selection.as_ref()? {
+            Selection::Cell(point) => self.blame_for_cell(*point),
+            Selection::Entities(entity_ids) if entity_ids.len() == 1 => {
+                self.blame_for_entity(&entity_ids[0])
+            }
+            Selection::Entities(_) => None,
+        }
+    }
+
+    fn blame_for_cell(&self, point: GridPoint) -> Option<BlameEntry> {
+        let local = self.model.timeline().blame_cell(point);
+        self.resolve_blame(local, self.remote_blame.get(&point))
+    }
+
+    fn blame_for_entity(&self, entity_id: &EntityId) -> Option<BlameEntry> {
+        let local = self.model.timeline().blame_entity(entity_id);
+        self.resolve_blame(local, self.remote_entity_blame.get(entity_id))
+    }
+
+    fn resolve_blame(
+        &self,
+        local: Option<BlameEntry>,
+        remote: Option<&BlameEntry>,
+    ) -> Option<BlameEntry> {
         if matches!(self.rpc_state, RpcState::Online | RpcState::Resyncing) {
-            let target = LevelTarget::Cell(point);
+            remote.cloned()
+        } else if local
+            .as_ref()
+            .is_some_and(|entry| entry.actor.as_str() == self.model.actor().as_str())
+        {
+            local
+        } else {
+            remote.cloned().or(local)
+        }
+    }
+
+    fn history_for_selection(&self, selection: &Selection) -> Vec<&HistoryEvent> {
+        let target = match selection {
+            Selection::Cell(point) => LevelTarget::Cell(*point),
+            Selection::Entities(entity_ids) if entity_ids.len() == 1 => {
+                LevelTarget::Entity(entity_ids[0].clone())
+            }
+            Selection::Entities(_) => return Vec::new(),
+        };
+        if matches!(self.rpc_state, RpcState::Online | RpcState::Resyncing) {
             self.server_events
                 .iter()
                 .filter(|event| event.changes.iter().any(|change| change.target == target))
                 .collect()
         } else {
-            self.model.timeline().history_for_cell(point)
+            match selection {
+                Selection::Cell(point) => self.model.timeline().history_for_cell(*point),
+                Selection::Entities(entity_ids) => {
+                    self.model.timeline().history_for_entity(&entity_ids[0])
+                }
+            }
+        }
+    }
+
+    fn clear_missing_entity_selection(&mut self) {
+        let size = self.model.timeline().snapshot().size();
+        if self
+            .isolated_blind
+            .as_ref()
+            .is_some_and(|entity_id| self.model.timeline().snapshot().entity(entity_id).is_none())
+        {
+            self.isolated_blind = None;
+        }
+        match self.selection.as_mut() {
+            Some(Selection::Entities(entity_ids)) => {
+                entity_ids.retain(|entity_id| {
+                    self.model.timeline().snapshot().entity(entity_id).is_some()
+                });
+                if entity_ids.is_empty() {
+                    self.selection = None;
+                }
+            }
+            Some(Selection::Cell(point)) if point.x >= size.width() || point.y >= size.height() => {
+                self.selection = None;
+            }
+            _ => {}
         }
     }
 
     fn push_toast(&mut self, message: String, tone: &'static str) {
         let id = self.next_toast_id;
         self.next_toast_id += 1;
-        self.toasts.push(Toast { id, message, tone });
-        if self.toasts.len() > 3 {
-            self.toasts.remove(0);
+        self.toasts.push(Toast {
+            id,
+            message,
+            tone,
+            occurred_at_ms: now_ms(),
+        });
+        self.active_toasts.insert(id);
+        if self.toasts.len() > 200 {
+            let removed = self.toasts.remove(0);
+            self.active_toasts.remove(&removed.id);
         }
     }
 
@@ -2230,21 +5669,26 @@ impl App {
             .ok_or_else(|| JsValue::from_str("2D canvas context is unavailable"))?
             .dyn_into::<CanvasRenderingContext2d>()?;
         let palette = CanvasPalette::for_theme(self.theme.active());
+        let canvas_width = f64::from(canvas.width());
+        let canvas_height = f64::from(canvas.height());
 
         context.set_fill_style_str(palette.background);
-        context.fill_rect(0.0, 0.0, f64::from(CANVAS_SIZE), f64::from(CANVAS_SIZE));
+        context.fill_rect(0.0, 0.0, canvas_width, canvas_height);
 
         context.set_stroke_style_str(palette.guide);
         context.set_line_width(1.0);
-        for guide in (14..CANVAS_SIZE).step_by(16) {
+        for guide in (14..canvas.width()).step_by(16) {
             let guide = f64::from(guide) + 0.5;
             context.begin_path();
             context.move_to(guide, 0.0);
-            context.line_to(guide, f64::from(CANVAS_SIZE));
+            context.line_to(guide, canvas_height);
             context.stroke();
+        }
+        for guide in (14..canvas.height()).step_by(16) {
+            let guide = f64::from(guide) + 0.5;
             context.begin_path();
             context.move_to(0.0, guide);
-            context.line_to(f64::from(CANVAS_SIZE), guide);
+            context.line_to(canvas_width, guide);
             context.stroke();
         }
 
@@ -2252,8 +5696,19 @@ impl App {
         context.set_text_align("center");
         context.set_text_baseline("middle");
 
-        for y in 0..8_u16 {
-            for x in 0..8_u16 {
+        context.save();
+        context.set_transform(
+            self.viewport.scale,
+            0.0,
+            0.0,
+            self.viewport.scale,
+            self.viewport.offset_x - BOARD_ORIGIN * self.viewport.scale,
+            self.viewport.offset_y - BOARD_ORIGIN * self.viewport.scale,
+        )?;
+
+        let size = self.model.timeline().snapshot().size();
+        for y in 0..size.height() {
+            for x in 0..size.width() {
                 let point = GridPoint::new(x, y);
                 let left = BOARD_ORIGIN + f64::from(x) * CELL_SIZE;
                 let top = BOARD_ORIGIN + f64::from(y) * CELL_SIZE;
@@ -2289,23 +5744,110 @@ impl App {
             }
         }
 
+        for entity in self.model.timeline().snapshot().entities() {
+            if self
+                .isolated_blind
+                .as_ref()
+                .is_some_and(|entity_id| entity.id() != entity_id)
+            {
+                continue;
+            }
+            let display = entity.moved_to(self.preview_origin(entity));
+            self.draw_entity(&context, &palette, &display)?;
+        }
+        if self.isolated_blind.is_none() {
+            self.draw_decorators(&context);
+        }
+        self.draw_blind_gesture_preview(&context, &palette);
+        self.draw_placement_preview(&context, &palette);
+
         context.set_fill_style_str(palette.label);
-        for index in 0..8_u16 {
+        for index in 0..size.width() {
             let center = BOARD_ORIGIN + f64::from(index) * CELL_SIZE + CELL_SIZE / 2.0;
             context.fill_text(&format!("{index:02}"), center, 23.0)?;
+        }
+        for index in 0..size.height() {
+            let center = BOARD_ORIGIN + f64::from(index) * CELL_SIZE + CELL_SIZE / 2.0;
             context.fill_text(&format!("{index:02}"), 22.0, center)?;
         }
 
-        if let Some(point) = self.selected {
-            let left = BOARD_ORIGIN + f64::from(point.x) * CELL_SIZE;
-            let top = BOARD_ORIGIN + f64::from(point.y) * CELL_SIZE;
-            context.set_stroke_style_str(palette.selection);
-            context.set_line_width(3.0);
-            context.stroke_rect(left + 2.0, top + 2.0, CELL_SIZE - 4.0, CELL_SIZE - 4.0);
-            context.set_fill_style_str(palette.selection);
-            context.fill_rect(left + 2.0, top + 2.0, 14.0, 3.0);
-            context.fill_rect(left + 2.0, top + 2.0, 3.0, 14.0);
+        match self.selection.as_ref() {
+            Some(Selection::Cell(point)) => {
+                draw_selection_cell(&context, &palette, *point);
+            }
+            Some(Selection::Entities(entity_ids)) => {
+                context.set_stroke_style_str(palette.selection);
+                context.set_line_width(3.0);
+                for entity_id in entity_ids {
+                    if let Some(entity) = self.model.timeline().snapshot().entity(entity_id) {
+                        let origin = self.preview_origin(entity);
+                        for cell in entity.shape().occupied_cells() {
+                            let left =
+                                BOARD_ORIGIN + f64::from(origin.x + u16::from(cell.x)) * CELL_SIZE;
+                            let top =
+                                BOARD_ORIGIN + f64::from(origin.y + u16::from(cell.y)) * CELL_SIZE;
+                            draw_shape_boundary(
+                                &context,
+                                left,
+                                top,
+                                3.5,
+                                shape_boundary_edges(entity.shape(), cell),
+                            );
+                        }
+                    }
+                }
+            }
+            None => {}
         }
+
+        for participant in self
+            .presence
+            .participants()
+            .filter(|participant| !self.presence.is_self(&participant.id))
+        {
+            let Some(point) = participant.cursor else {
+                continue;
+            };
+            let x = BOARD_ORIGIN + f64::from(point.x) * CELL_SIZE + CELL_SIZE / 2.0;
+            let y = BOARD_ORIGIN + f64::from(point.y) * CELL_SIZE + CELL_SIZE / 2.0;
+            let color = presence_color(participant.actor.as_str());
+            context.set_fill_style_str(color);
+            context.begin_path();
+            context.arc(x, y, 7.0, 0.0, std::f64::consts::TAU)?;
+            context.fill();
+            context.set_stroke_style_str(palette.background);
+            context.set_line_width(2.0);
+            context.stroke();
+            context.set_text_align("left");
+            context.set_font("bold 10px ui-monospace, SFMono-Regular, Consolas, monospace");
+            context.fill_text(participant.actor.as_str(), x + 11.0, y - 10.0)?;
+        }
+
+        context.restore();
+        if let Some(gesture) = self
+            .marquee_gesture
+            .as_ref()
+            .filter(|gesture| gesture.active)
+        {
+            let left = gesture.start_canvas_x.min(gesture.current_canvas_x);
+            let top = gesture.start_canvas_y.min(gesture.current_canvas_y);
+            let width = (gesture.current_canvas_x - gesture.start_canvas_x).abs();
+            let height = (gesture.current_canvas_y - gesture.start_canvas_y).abs();
+            context.save();
+            context.set_fill_style_str(palette.selection);
+            context.set_global_alpha(0.12);
+            context.fill_rect(left, top, width, height);
+            context.set_global_alpha(1.0);
+            context.set_stroke_style_str(palette.selection);
+            context.set_line_width(1.5);
+            context
+                .set_line_dash(&js_sys::Array::of2(&5.into(), &3.into()))
+                .ok();
+            context.stroke_rect(left + 0.5, top + 0.5, width, height);
+            context.set_line_dash(&js_sys::Array::new()).ok();
+            context.restore();
+        }
+        self.draw_map_resize_handles(&context, &palette);
 
         context.set_text_align("right");
         context.set_fill_style_str(palette.label);
@@ -2315,11 +5857,483 @@ impl App {
                 self.mode.label().to_ascii_uppercase(),
                 self.activity_events().len()
             ),
-            754.0,
-            754.0,
+            canvas_width - 14.0,
+            canvas_height - 14.0,
         )?;
         Ok(())
     }
+
+    fn draw_map_resize_handles(&self, context: &CanvasRenderingContext2d, palette: &CanvasPalette) {
+        if self.mode != Mode::Map || self.workspace_tool != WorkspaceTool::Resize {
+            return;
+        }
+        let current_size = self.model.timeline().snapshot().size();
+        let (size, left, top) = if let Some(gesture) = self.map_resize_gesture.as_ref() {
+            let old_width = f64::from(gesture.start_size.width()) * gesture.cell_size;
+            let old_height = f64::from(gesture.start_size.height()) * gesture.cell_size;
+            let new_width = f64::from(gesture.preview_size.width()) * gesture.cell_size;
+            let new_height = f64::from(gesture.preview_size.height()) * gesture.cell_size;
+            let old_left = self.viewport.offset_x;
+            let old_top = self.viewport.offset_y;
+            let left = if gesture.edge == MapResizeEdge::Left {
+                old_left + old_width - new_width
+            } else {
+                old_left
+            };
+            let top = if gesture.edge == MapResizeEdge::Top {
+                old_top + old_height - new_height
+            } else {
+                old_top
+            };
+            (gesture.preview_size, left, top)
+        } else {
+            (current_size, self.viewport.offset_x, self.viewport.offset_y)
+        };
+        let width = f64::from(size.width()) * CELL_SIZE * self.viewport.scale;
+        let height = f64::from(size.height()) * CELL_SIZE * self.viewport.scale;
+        context.save();
+        context.set_stroke_style_str(palette.selection);
+        context.set_fill_style_str(palette.background);
+        context.set_line_width(2.0);
+        context
+            .set_line_dash(&js_sys::Array::of2(&6.into(), &4.into()))
+            .ok();
+        context.stroke_rect(left, top, width, height);
+        context.set_line_dash(&js_sys::Array::new()).ok();
+        let handles = [
+            (left + width / 2.0, top),
+            (left + width, top + height / 2.0),
+            (left + width / 2.0, top + height),
+            (left, top + height / 2.0),
+        ];
+        for (x, y) in handles {
+            context.fill_rect(x - 7.0, y - 7.0, 14.0, 14.0);
+            context.stroke_rect(x - 6.5, y - 6.5, 13.0, 13.0);
+        }
+        context.set_fill_style_str(palette.selection);
+        context.set_font("10px ui-monospace, SFMono-Regular, Consolas, monospace");
+        context.set_text_align("center");
+        let _ = context.fill_text(
+            &format!("{} x {}", size.width(), size.height()),
+            left + width / 2.0,
+            top - 15.0,
+        );
+        context.restore();
+    }
+
+    fn draw_placement_preview(&self, context: &CanvasRenderingContext2d, palette: &CanvasPalette) {
+        let Some(drag) = self.placement_drag.as_ref() else {
+            return;
+        };
+        let Some(origin) = drag.hover else {
+            return;
+        };
+        let valid = self.can_place_shape(origin, drag.shape);
+        context.save();
+        context.set_global_alpha(0.72);
+        context.set_fill_style_str(if valid {
+            palette.selection
+        } else {
+            palette.invalid
+        });
+        context.set_stroke_style_str(if valid {
+            palette.selection
+        } else {
+            palette.invalid
+        });
+        context.set_line_width(3.0);
+        for cell in drag.shape.occupied_cells() {
+            let left =
+                BOARD_ORIGIN + f64::from(origin.x.saturating_add(u16::from(cell.x))) * CELL_SIZE;
+            let top =
+                BOARD_ORIGIN + f64::from(origin.y.saturating_add(u16::from(cell.y))) * CELL_SIZE;
+            context.fill_rect(left + 5.0, top + 5.0, CELL_SIZE - 10.0, CELL_SIZE - 10.0);
+            draw_shape_boundary(
+                context,
+                left,
+                top,
+                3.0,
+                shape_boundary_edges(drag.shape, cell),
+            );
+        }
+        context.restore();
+    }
+
+    fn draw_entity(
+        &self,
+        context: &CanvasRenderingContext2d,
+        palette: &CanvasPalette,
+        entity: &PlaceableEntity,
+    ) -> Result<(), JsValue> {
+        match entity.kind() {
+            PlaceableEntityKind::Block(block) => {
+                let color_index = block
+                    .collect_layers()
+                    .first()
+                    .map_or(1, |layer| layer.color_index());
+                let label_cell = entity.shape().occupied_cells().next();
+                for cell in entity.shape().occupied_cells() {
+                    let left =
+                        BOARD_ORIGIN + f64::from(entity.origin().x + u16::from(cell.x)) * CELL_SIZE;
+                    let top =
+                        BOARD_ORIGIN + f64::from(entity.origin().y + u16::from(cell.y)) * CELL_SIZE;
+                    let edges = shape_boundary_edges(entity.shape(), cell);
+                    let x = left + if edges.left { 7.0 } else { 0.0 };
+                    let y = top + if edges.top { 7.0 } else { 0.0 };
+                    let width = CELL_SIZE
+                        - if edges.left { 7.0 } else { 0.0 }
+                        - if edges.right { 7.0 } else { 0.0 };
+                    let height = CELL_SIZE
+                        - if edges.top { 7.0 } else { 0.0 }
+                        - if edges.bottom { 7.0 } else { 0.0 };
+                    context.set_fill_style_str(block_color(color_index));
+                    context.fill_rect(x, y, width, height);
+                    context.set_stroke_style_str(palette.block_outline);
+                    context.set_line_width(3.0);
+                    draw_shape_boundary(context, left, top, 7.5, edges);
+                    if label_cell == Some(cell) {
+                        context.set_fill_style_str(palette.entity_label);
+                        context.set_font(
+                            "bold 12px ui-monospace, SFMono-Regular, Consolas, monospace",
+                        );
+                        context.fill_text("B", left + CELL_SIZE / 2.0, top + CELL_SIZE / 2.0)?;
+                    }
+                }
+            }
+            PlaceableEntityKind::Blind(blind) => {
+                let label_cell = entity.shape().occupied_cells().next();
+                for (cell, tile) in entity.shape().occupied_cells().zip(blind.tiles()) {
+                    let left =
+                        BOARD_ORIGIN + f64::from(entity.origin().x + u16::from(cell.x)) * CELL_SIZE;
+                    let top =
+                        BOARD_ORIGIN + f64::from(entity.origin().y + u16::from(cell.y)) * CELL_SIZE;
+                    let edges = shape_boundary_edges(entity.shape(), cell);
+                    let geometry = pool_tile_geometry(edges, CELL_SIZE, BLIND_INSET);
+                    let rect_x = left + geometry.x;
+                    let rect_y = top + geometry.y;
+                    let width = geometry.width;
+                    let height = geometry.height;
+                    context.set_fill_style_str(palette.blind_base);
+                    context.fill_rect(rect_x, rect_y, width, height);
+
+                    let resolution = tile.pixels_per_cell();
+                    let pixel_width = width / f64::from(resolution);
+                    let pixel_height = height / f64::from(resolution);
+                    let mut painted = false;
+                    for y in 0..resolution {
+                        for x in 0..resolution {
+                            let Some(color_index) = tile.color(x, y) else {
+                                continue;
+                            };
+                            if color_index == 0 {
+                                continue;
+                            }
+                            painted = true;
+                            let canvas_y = resolution - 1 - y;
+                            context.set_fill_style_str(blind_color(color_index));
+                            context.fill_rect(
+                                rect_x + f64::from(x) * pixel_width,
+                                rect_y + f64::from(canvas_y) * pixel_height,
+                                pixel_width + 0.25,
+                                pixel_height + 0.25,
+                            );
+                        }
+                    }
+                    context.set_stroke_style_str(palette.blind_outline);
+                    context.set_line_width(2.0);
+                    draw_shape_boundary(context, left, top, BLIND_INSET + 0.5, edges);
+                    if !painted {
+                        context.set_stroke_style_str(palette.blind_detail);
+                        context.set_line_width(1.0);
+                        for offset in [20.0_f64, 38.0, 56.0] {
+                            context.begin_path();
+                            context.move_to(rect_x + 5.0, rect_y + offset.min(height - 5.0));
+                            context.line_to(rect_x + offset.min(width - 5.0), rect_y + 5.0);
+                            context.stroke();
+                        }
+                    }
+                    if label_cell == Some(cell) {
+                        context.set_fill_style_str(palette.entity_label);
+                        context
+                            .set_font("bold 9px ui-monospace, SFMono-Regular, Consolas, monospace");
+                        context.fill_text("PL", left + CELL_SIZE / 2.0, top + CELL_SIZE / 2.0)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn draw_blind_gesture_preview(
+        &self,
+        context: &CanvasRenderingContext2d,
+        palette: &CanvasPalette,
+    ) {
+        let Some(gesture) = self.blind_gesture.as_ref() else {
+            return;
+        };
+        let Some(entity) = self.model.timeline().snapshot().entity(&gesture.entity_id) else {
+            return;
+        };
+        let Some(blind) = entity.as_blind() else {
+            return;
+        };
+        let resolution = u16::from(blind.pixels_per_cell());
+        let preview_color = match gesture.operation {
+            BlindGestureOperation::Paint { color_index }
+            | BlindGestureOperation::FloodFill { color_index, .. } => blind_color(color_index),
+            BlindGestureOperation::Erase => palette.blind_base,
+        };
+        context.set_fill_style_str(preview_color);
+        for pixel in &gesture.pixels {
+            let cell_x = pixel.x / resolution;
+            let cell_y = pixel.y / resolution;
+            let local_x = pixel.x % resolution;
+            let local_y = pixel.y % resolution;
+            let canvas_y = resolution - 1 - local_y;
+            let (Ok(shape_x), Ok(shape_y)) = (u8::try_from(cell_x), u8::try_from(cell_y)) else {
+                continue;
+            };
+            let cell = ShapeCell::new(shape_x, shape_y);
+            let geometry = pool_tile_geometry(
+                shape_boundary_edges(entity.shape(), cell),
+                CELL_SIZE,
+                BLIND_INSET,
+            );
+            let pixel_width = geometry.width / f64::from(resolution);
+            let pixel_height = geometry.height / f64::from(resolution);
+            let left = BOARD_ORIGIN
+                + f64::from(entity.origin().x + cell_x) * CELL_SIZE
+                + geometry.x
+                + f64::from(local_x) * pixel_width;
+            let top = BOARD_ORIGIN
+                + f64::from(entity.origin().y + cell_y) * CELL_SIZE
+                + geometry.y
+                + f64::from(canvas_y) * pixel_height;
+            context.fill_rect(left, top, pixel_width + 0.25, pixel_height + 0.25);
+        }
+    }
+
+    fn draw_decorators(&self, context: &CanvasRenderingContext2d) {
+        let snapshot = self.model.timeline().snapshot();
+        context.save();
+        context.set_text_align("center");
+        context.set_text_baseline("middle");
+        context.set_font("bold 10px ui-monospace, SFMono-Regular, Consolas, monospace");
+        for decorator in snapshot.decorators() {
+            match decorator.kind() {
+                DecoratorKind::Ice {
+                    entity,
+                    blocking_count,
+                } if *blocking_count > 0 => {
+                    let Some(owner) = snapshot.entity(entity) else {
+                        continue;
+                    };
+                    let owner = owner.moved_to(self.preview_origin(owner));
+                    context.set_stroke_style_str("#54caec");
+                    context.set_line_width(2.0);
+                    for cell in owner.shape().occupied_cells() {
+                        let left = BOARD_ORIGIN
+                            + f64::from(owner.origin().x + u16::from(cell.x)) * CELL_SIZE;
+                        let top = BOARD_ORIGIN
+                            + f64::from(owner.origin().y + u16::from(cell.y)) * CELL_SIZE;
+                        context.stroke_rect(
+                            left + 5.0,
+                            top + 5.0,
+                            CELL_SIZE - 10.0,
+                            CELL_SIZE - 10.0,
+                        );
+                    }
+                    if let Some(cell) = owner.shape().occupied_cells().next() {
+                        let left = BOARD_ORIGIN
+                            + f64::from(owner.origin().x + u16::from(cell.x)) * CELL_SIZE;
+                        let top = BOARD_ORIGIN
+                            + f64::from(owner.origin().y + u16::from(cell.y)) * CELL_SIZE;
+                        context.set_fill_style_str("#102d39");
+                        context.fill_rect(left + 9.0, top + 9.0, 24.0, 20.0);
+                        context.set_stroke_style_str("#54caec");
+                        context.stroke_rect(left + 9.5, top + 9.5, 23.0, 19.0);
+                        context.set_fill_style_str("#bceffc");
+                        let _ = context.fill_text(
+                            &format!("I{blocking_count}"),
+                            left + 21.0,
+                            top + 19.0,
+                        );
+                    }
+                }
+                DecoratorKind::Direction { entity, direction } => {
+                    let Some(owner) = snapshot.entity(entity) else {
+                        continue;
+                    };
+                    let owner = owner.moved_to(self.preview_origin(owner));
+                    let Some(cell) = owner.shape().occupied_cells().next() else {
+                        continue;
+                    };
+                    let left =
+                        BOARD_ORIGIN + f64::from(owner.origin().x + u16::from(cell.x)) * CELL_SIZE;
+                    let top =
+                        BOARD_ORIGIN + f64::from(owner.origin().y + u16::from(cell.y)) * CELL_SIZE;
+                    context.set_fill_style_str("#1d2831");
+                    context.fill_rect(left + CELL_SIZE - 33.0, top + 9.0, 24.0, 20.0);
+                    context.set_stroke_style_str("#f4f7fa");
+                    context.stroke_rect(left + CELL_SIZE - 32.5, top + 9.5, 23.0, 19.0);
+                    context.set_fill_style_str("#f4f7fa");
+                    let label = match direction.mode() {
+                        DirectionMode::Horizontal => "H",
+                        DirectionMode::Vertical => "V",
+                        DirectionMode::Disabled => continue,
+                    };
+                    let _ = context.fill_text(label, left + CELL_SIZE - 21.0, top + 19.0);
+                }
+                DecoratorKind::KeyLocker { entity, key } => {
+                    let (Some(lock), Some(key_owner)) =
+                        (snapshot.entity(entity), snapshot.entity(key))
+                    else {
+                        continue;
+                    };
+                    let lock = lock.moved_to(self.preview_origin(lock));
+                    let key_owner = key_owner.moved_to(self.preview_origin(key_owner));
+                    let (key_x, key_y) = entity_canvas_center(&key_owner);
+                    let (lock_x, lock_y) = entity_canvas_center(&lock);
+                    context.set_stroke_style_str("#e3b341");
+                    context.set_line_width(2.0);
+                    context.begin_path();
+                    context.move_to(key_x, key_y);
+                    context.line_to(lock_x, lock_y);
+                    context.stroke();
+                    draw_role_badge(context, key_x, key_y, "#4a3915", "#ffd15a", "K");
+                    draw_role_badge(context, lock_x, lock_y, "#481c2a", "#ff7489", "L");
+                    context.set_stroke_style_str("#ff7489");
+                    for cell in lock.shape().occupied_cells() {
+                        let left = BOARD_ORIGIN
+                            + f64::from(lock.origin().x + u16::from(cell.x)) * CELL_SIZE;
+                        let top = BOARD_ORIGIN
+                            + f64::from(lock.origin().y + u16::from(cell.y)) * CELL_SIZE;
+                        context.stroke_rect(
+                            left + 11.0,
+                            top + 11.0,
+                            CELL_SIZE - 22.0,
+                            CELL_SIZE - 22.0,
+                        );
+                    }
+                }
+                DecoratorKind::Ice { .. } => {}
+            }
+        }
+        if let Some(key_entity_id) = self.key_locker_assignment.as_ref()
+            && let Some(key) = snapshot.entity(key_entity_id)
+        {
+            let key = key.moved_to(self.preview_origin(key));
+            let (x, y) = entity_canvas_center(&key);
+            context.set_stroke_style_str("#ffd15a");
+            context.set_line_width(3.0);
+            context.stroke_rect(x - 20.0, y - 20.0, 40.0, 40.0);
+        }
+        context.restore();
+    }
+}
+
+fn entity_canvas_center(entity: &PlaceableEntity) -> (f64, f64) {
+    let mut total_x = 0.0;
+    let mut total_y = 0.0;
+    let mut count = 0.0;
+    for cell in entity.shape().occupied_cells() {
+        total_x +=
+            BOARD_ORIGIN + (f64::from(entity.origin().x + u16::from(cell.x)) + 0.5) * CELL_SIZE;
+        total_y +=
+            BOARD_ORIGIN + (f64::from(entity.origin().y + u16::from(cell.y)) + 0.5) * CELL_SIZE;
+        count += 1.0;
+    }
+    (total_x / count, total_y / count)
+}
+
+fn draw_role_badge(
+    context: &CanvasRenderingContext2d,
+    x: f64,
+    y: f64,
+    background: &str,
+    foreground: &str,
+    label: &str,
+) {
+    context.set_fill_style_str(background);
+    context.fill_rect(x - 11.0, y - 11.0, 22.0, 22.0);
+    context.set_stroke_style_str(foreground);
+    context.stroke_rect(x - 10.5, y - 10.5, 21.0, 21.0);
+    context.set_fill_style_str(foreground);
+    let _ = context.fill_text(label, x, y);
+}
+
+fn mode_icon(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Select => "@",
+        Mode::Map => "#",
+        Mode::Brush => "/",
+        Mode::Sandbox => ">",
+    }
+}
+
+fn catalog_text_matches<const N: usize>(query: &str, values: [&str; N]) -> bool {
+    query.is_empty()
+        || values
+            .into_iter()
+            .any(|value| value.to_ascii_lowercase().contains(query))
+}
+
+fn catalog_project_matches(project: &ProjectSummary, levels: &[LevelSummary], query: &str) -> bool {
+    catalog_text_matches(query, [&project.name, &project.id])
+        || levels
+            .iter()
+            .any(|level| catalog_level_matches(level, query))
+}
+
+fn catalog_level_matches(level: &LevelSummary, query: &str) -> bool {
+    catalog_text_matches(query, [&level.name, &level.id])
+}
+
+fn map_resize_edge_from_command(
+    command: &LevelCommand,
+    before: GridSize,
+    after: GridSize,
+) -> Option<MapResizeEdge> {
+    let LevelCommand::ResizeGrid { anchor, .. } = command else {
+        return None;
+    };
+    match (
+        before.width() != after.width(),
+        before.height() != after.height(),
+        anchor,
+    ) {
+        (true, false, GridAnchor::Left) => Some(MapResizeEdge::Right),
+        (true, false, GridAnchor::Right) => Some(MapResizeEdge::Left),
+        (false, true, GridAnchor::Top) => Some(MapResizeEdge::Top),
+        (false, true, GridAnchor::Bottom) => Some(MapResizeEdge::Bottom),
+        _ => None,
+    }
+}
+
+fn map_resize_edge_changes_only_axis(
+    edge: MapResizeEdge,
+    before: GridSize,
+    after: GridSize,
+) -> bool {
+    match edge {
+        MapResizeEdge::Top | MapResizeEdge::Bottom => before.width() == after.width(),
+        MapResizeEdge::Right | MapResizeEdge::Left => before.height() == after.height(),
+    }
+}
+
+fn template_drag_callback(
+    ctx: &Context<App>,
+    kind: PlacementKind,
+    shape: Shape,
+) -> Callback<DragEvent> {
+    ctx.link().callback(move |event: DragEvent| {
+        if let Some(data_transfer) = event.data_transfer() {
+            data_transfer.set_effect_allowed("copy");
+            let _ = data_transfer.set_data("text/plain", "oreak-entity-template");
+        }
+        Msg::BeginPlacementDrag(kind, shape)
+    })
 }
 
 struct CanvasPalette {
@@ -2332,6 +6346,12 @@ struct CanvasPalette {
     grid: &'static str,
     label: &'static str,
     selection: &'static str,
+    invalid: &'static str,
+    block_outline: &'static str,
+    blind_base: &'static str,
+    blind_outline: &'static str,
+    blind_detail: &'static str,
+    entity_label: &'static str,
 }
 
 impl CanvasPalette {
@@ -2347,6 +6367,12 @@ impl CanvasPalette {
                 grid: "#344552",
                 label: "#728492",
                 selection: "#f2c94c",
+                invalid: "#ff6b6b",
+                block_outline: "#080c10",
+                blind_base: "#302649",
+                blind_outline: "#c89cff",
+                blind_detail: "#8068a7",
+                entity_label: "#ffffff",
             },
             Theme::Light => Self {
                 background: "#dce3e8",
@@ -2358,8 +6384,229 @@ impl CanvasPalette {
                 grid: "#8799a3",
                 label: "#53636c",
                 selection: "#9b6200",
+                invalid: "#b52d3a",
+                block_outline: "#3f2b27",
+                blind_base: "#d7caea",
+                blind_outline: "#67468c",
+                blind_detail: "#9a82b6",
+                entity_label: "#182329",
             },
         }
+    }
+}
+
+fn draw_selection_cell(
+    context: &CanvasRenderingContext2d,
+    palette: &CanvasPalette,
+    point: GridPoint,
+) {
+    let left = BOARD_ORIGIN + f64::from(point.x) * CELL_SIZE;
+    let top = BOARD_ORIGIN + f64::from(point.y) * CELL_SIZE;
+    context.set_stroke_style_str(palette.selection);
+    context.set_line_width(3.0);
+    context.stroke_rect(left + 2.0, top + 2.0, CELL_SIZE - 4.0, CELL_SIZE - 4.0);
+    context.set_fill_style_str(palette.selection);
+    context.fill_rect(left + 2.0, top + 2.0, 14.0, 3.0);
+    context.fill_rect(left + 2.0, top + 2.0, 3.0, 14.0);
+}
+
+fn draw_shape_boundary(
+    context: &CanvasRenderingContext2d,
+    left: f64,
+    top: f64,
+    inset: f64,
+    edges: ShapeBoundaryEdges,
+) {
+    let right = left + CELL_SIZE;
+    let bottom = top + CELL_SIZE;
+    context.begin_path();
+    if edges.left {
+        context.move_to(left + inset, top + if edges.top { inset } else { 0.0 });
+        context.line_to(
+            left + inset,
+            bottom - if edges.bottom { inset } else { 0.0 },
+        );
+    }
+    if edges.right {
+        context.move_to(right - inset, top + if edges.top { inset } else { 0.0 });
+        context.line_to(
+            right - inset,
+            bottom - if edges.bottom { inset } else { 0.0 },
+        );
+    }
+    if edges.top {
+        context.move_to(left + if edges.left { inset } else { 0.0 }, top + inset);
+        context.line_to(right - if edges.right { inset } else { 0.0 }, top + inset);
+    }
+    if edges.bottom {
+        context.move_to(left + if edges.left { inset } else { 0.0 }, bottom - inset);
+        context.line_to(
+            right - if edges.right { inset } else { 0.0 },
+            bottom - inset,
+        );
+    }
+    context.stroke();
+}
+
+fn entity_kind_label(kind: &PlaceableEntityKind) -> &'static str {
+    match kind {
+        PlaceableEntityKind::Block(_) => "Block",
+        PlaceableEntityKind::Blind(_) => "Pool",
+    }
+}
+
+fn view_entity_kind_details(entity: &PlaceableEntity) -> Html {
+    match entity.kind() {
+        PlaceableEntityKind::Block(block) => {
+            let colors = if block.collect_layers().is_empty() {
+                "none".to_owned()
+            } else {
+                block
+                    .collect_layers()
+                    .iter()
+                    .map(|layer| layer.color_index().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let capacities = if block.collect_layers().is_empty() {
+                "none".to_owned()
+            } else {
+                block
+                    .collect_layers()
+                    .iter()
+                    .map(|layer| match layer.capacity() {
+                        CollectCapacity::Unlimited => "unlimited".to_owned(),
+                        CollectCapacity::Finite(capacity) => capacity.to_string(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let locked = block
+                .collect_layers()
+                .iter()
+                .filter(|layer| layer.is_locked())
+                .count();
+            html! {
+                <section class="inspector-section">
+                    <h2>{"Block data"}</h2>
+                    <div class="property-table">
+                        <div><span>{"Colors"}</span><code>{colors}</code></div>
+                        <div><span>{"Collect layers"}</span><strong>{block.collect_layers().len()}</strong></div>
+                        <div><span>{"Capacities"}</span><code>{capacities}</code></div>
+                        <div><span>{"Locked layers"}</span><strong>{locked}</strong></div>
+                    </div>
+                </section>
+            }
+        }
+        PlaceableEntityKind::Blind(blind) => {
+            let painted = blind
+                .tiles()
+                .iter()
+                .flat_map(|tile| tile.colors())
+                .filter(|color| **color != 0)
+                .count();
+            let total = blind.tiles().len()
+                * usize::from(blind.pixels_per_cell())
+                * usize::from(blind.pixels_per_cell());
+            let colors: BTreeSet<_> = blind
+                .tiles()
+                .iter()
+                .flat_map(|tile| tile.colors().iter().copied())
+                .filter(|color| *color != 0)
+                .collect();
+            let colors = if colors.is_empty() {
+                "empty".to_owned()
+            } else {
+                colors
+                    .into_iter()
+                    .map(|color| color.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            html! {
+                <section class="inspector-section">
+                    <h2>{"Pool data"}</h2>
+                    <div class="property-table">
+                        <div><span>{"Resolution"}</span><code>{format!("{} px/cell", blind.pixels_per_cell())}</code></div>
+                        <div><span>{"Tiles"}</span><strong>{blind.tiles().len()}</strong></div>
+                        <div><span>{"Painted"}</span><code>{format!("{painted} / {total} px")}</code></div>
+                        <div><span>{"Colors"}</span><code>{colors}</code></div>
+                    </div>
+                </section>
+            }
+        }
+    }
+}
+
+fn selection_status(selection: Option<&Selection>) -> String {
+    match selection {
+        Some(Selection::Cell(point)) => format!("CELL {:02}:{:02}", point.x, point.y),
+        Some(Selection::Entities(entity_ids)) if entity_ids.len() == 1 => {
+            format!("ENTITY {}", entity_ids[0])
+        }
+        Some(Selection::Entities(entity_ids)) => format!("GROUP {}", entity_ids.len()),
+        None => "TARGET --".to_owned(),
+    }
+}
+
+fn grid_anchor_label(anchor: GridAnchor) -> &'static str {
+    match anchor {
+        GridAnchor::TopLeft => "Top left",
+        GridAnchor::Top => "Top",
+        GridAnchor::TopRight => "Top right",
+        GridAnchor::Left => "Left",
+        GridAnchor::Center => "Center",
+        GridAnchor::Right => "Right",
+        GridAnchor::BottomLeft => "Bottom left",
+        GridAnchor::Bottom => "Bottom",
+        GridAnchor::BottomRight => "Bottom right",
+    }
+}
+
+fn visual_anchor_to_grid(anchor: GridAnchor) -> GridAnchor {
+    match anchor {
+        GridAnchor::TopLeft => GridAnchor::BottomLeft,
+        GridAnchor::Top => GridAnchor::Bottom,
+        GridAnchor::TopRight => GridAnchor::BottomRight,
+        GridAnchor::Left => GridAnchor::Left,
+        GridAnchor::Center => GridAnchor::Center,
+        GridAnchor::Right => GridAnchor::Right,
+        GridAnchor::BottomLeft => GridAnchor::TopLeft,
+        GridAnchor::Bottom => GridAnchor::Top,
+        GridAnchor::BottomRight => GridAnchor::TopRight,
+    }
+}
+
+fn block_color(color_index: u16) -> &'static str {
+    match color_index {
+        0 => "#80909c",
+        1 => "#d97859",
+        2 => "#e3b341",
+        3 => "#62b97c",
+        4 => "#4aa9c8",
+        5 => "#607de0",
+        6 => "#936bd4",
+        7 => "#c662ae",
+        8 => "#da5f72",
+        9 => "#8d765f",
+        10 => "#d5dce2",
+        _ => "#596773",
+    }
+}
+
+fn blind_color(color_index: u8) -> &'static str {
+    match color_index {
+        1 => "#ff8b68",
+        2 => "#ffd15a",
+        3 => "#72dd91",
+        4 => "#54caec",
+        5 => "#7895ff",
+        6 => "#af82f2",
+        7 => "#f17bd2",
+        8 => "#ff7489",
+        9 => "#b69a7b",
+        10 => "#f4f7fa",
+        _ => "#000000",
     }
 }
 
@@ -2407,6 +6654,13 @@ fn actor_mark(actor: &str) -> String {
         .take(2)
         .collect::<String>()
         .to_ascii_uppercase()
+}
+
+fn presence_color(actor: &str) -> &'static str {
+    let hash = actor.bytes().fold(0_u32, |hash, byte| {
+        hash.wrapping_mul(31).wrapping_add(u32::from(byte))
+    });
+    ["#df8fff", "#69a8ff", "#f2b66d", "#65d6b4"][hash as usize % 4]
 }
 
 fn storage() -> Option<web_sys::Storage> {
@@ -2479,11 +6733,64 @@ fn view_history_event(event: &HistoryEvent) -> Html {
             "Move entity",
             format!("{entity_id} -> {:02}:{:02}", origin.x, origin.y),
         ),
+        LevelCommand::MoveEntities { moves } => (
+            "Move entities",
+            format!("{} selected entities", moves.len()),
+        ),
         LevelCommand::RotateEntityClockwise { entity_id } => {
             ("Rotate entity", entity_id.to_string())
         }
         LevelCommand::FlipEntityHorizontal { entity_id } => ("Flip entity", entity_id.to_string()),
         LevelCommand::DeleteEntity { entity_id } => ("Delete entity", entity_id.to_string()),
+        LevelCommand::ToggleIce { entity_id, .. } => ("Toggle Ice", entity_id.to_string()),
+        LevelCommand::SetIce {
+            entity_id,
+            blocking_count,
+            ..
+        } => ("Set Ice", format!("{entity_id} / count {blocking_count}")),
+        LevelCommand::CycleDirection { entity_id, .. } => {
+            ("Cycle direction", entity_id.to_string())
+        }
+        LevelCommand::SetDirection {
+            entity_id, mode, ..
+        } => ("Set direction", format!("{entity_id} / {mode:?}")),
+        LevelCommand::AssignKeyLocker {
+            key_entity_id,
+            lock_entity_id,
+            ..
+        } => (
+            "Assign Key & Locker",
+            format!("{key_entity_id} -> {lock_entity_id}"),
+        ),
+        LevelCommand::RemoveKeyLocker { decorator_id } => {
+            ("Remove Key & Locker", decorator_id.to_string())
+        }
+        LevelCommand::PaintBlindStroke {
+            entity_id,
+            color_index,
+            stroke,
+        } => (
+            "Paint Blind",
+            format!(
+                "{entity_id} / {} px / color {color_index}",
+                stroke.pixels().len()
+            ),
+        ),
+        LevelCommand::EraseBlindStroke { entity_id, stroke } => (
+            "Erase Blind",
+            format!("{entity_id} / {} px", stroke.pixels().len()),
+        ),
+        LevelCommand::FloodFillBlind {
+            entity_id,
+            start,
+            color_index,
+        } => (
+            "Fill Blind",
+            format!(
+                "{entity_id} / {:02}:{:02} / color {color_index}",
+                start.x, start.y
+            ),
+        ),
         LevelCommand::RestoreEntity { entity } => (
             "Restore entity",
             format!(

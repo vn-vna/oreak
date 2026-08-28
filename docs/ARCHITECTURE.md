@@ -49,8 +49,9 @@ release unless their pinned plugin version has a certified LevelData codec.
 ## Rendering and plugins
 
 Yew renders application chrome as HTML and the current map surface on a canvas.
-Rendering placeables, Blind artwork, decorators, guides, and collaborator
-presence in the browser remains a parity gate. Themes use semantic tokens;
+Placeables, simplified Blind artwork, decorators, and connection-scoped remote
+cursors render on the browser canvas; richer artwork and guide rendering remain
+parity gates. Themes use semantic tokens;
 untrusted plugins cannot inject arbitrary CSS, DOM, network, filesystem,
 database, or GPU calls.
 

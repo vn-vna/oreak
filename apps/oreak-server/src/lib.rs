@@ -5,13 +5,16 @@
 mod mvp;
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     convert::Infallible,
     env,
     net::{IpAddr, SocketAddr},
     path::PathBuf,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -28,17 +31,18 @@ use axum::{
 use jsonrpsee::{
     core::{RpcResult, SubscriptionResult, async_trait, to_json_raw_value},
     server::{
-        Methods, PendingSubscriptionSink, ServerBuilder, ServerHandle, SubscriptionSink,
-        stop_channel,
+        Methods, PendingSubscriptionSink, PingConfig, ServerBuilder, ServerConfig, ServerHandle,
+        SubscriptionSink, stop_channel,
     },
     types::ErrorObjectOwned,
 };
-use oreak_core::{ActorId, ApplyOutcome, LevelSnapshot, LevelTimeline, TimelineError};
+use oreak_core::{ActorId, ApplyOutcome, GridPoint, LevelSnapshot, LevelTimeline, TimelineError};
 use oreak_protocol::{
     ApplyCommandRequest, ApplyCommandResponse, ApplyCommandResult, HealthResponse, HealthStatus,
-    LevelEvent, LevelHistoryRequest, LevelHistoryResponse, LevelSnapshotResponse,
-    LevelSubscriptionItem, MAX_LEVEL_HISTORY_PAGE_SIZE, OreakRpcServer, ProjectLevelTarget,
-    RpcErrorCode, RpcErrorData, RpcErrorDetails, UndoLatestRequest, UndoLatestResponse,
+    LevelEvent, LevelHistoryRequest, LevelHistoryResponse, LevelPresenceItem,
+    LevelSnapshotResponse, LevelSubscriptionItem, MAX_LEVEL_HISTORY_PAGE_SIZE, OreakRpcServer,
+    PresenceId, PresenceParticipant, ProjectLevelTarget, RpcErrorCode, RpcErrorData,
+    RpcErrorDetails, UndoLatestRequest, UndoLatestResponse, UpdateLevelCursorRequest,
 };
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tower::{Service, service_fn};
@@ -51,6 +55,10 @@ use tracing::{error, warn};
 
 const INITIAL_LEVEL_AXIS: u16 = 8;
 const LEVEL_EVENT_CAPACITY: usize = 256;
+const PRESENCE_EVENT_CAPACITY: usize = 512;
+const MAX_LEVEL_PRESENCES: usize = 128;
+const CURSOR_BROADCAST_INTERVAL: Duration = Duration::from_millis(50);
+const PRESENCE_AUTHORIZATION_INTERVAL: Duration = Duration::from_secs(15);
 const DEFAULT_WEB_DIST: &str = "apps/oreak-web/dist";
 
 pub struct Application {
@@ -78,9 +86,46 @@ pub struct OreakRpcService {
 #[derive(Clone)]
 struct RpcSessionToken(String);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct RpcConnectionId(u64);
+
+static NEXT_RPC_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
+
 struct LevelState {
     timeline: Mutex<LevelTimeline>,
     events: broadcast::Sender<LevelEvent>,
+    presence: std::sync::Mutex<BTreeMap<PresenceId, PresenceEntry>>,
+    presence_events: broadcast::Sender<LevelPresenceItem>,
+}
+
+struct PresenceEntry {
+    participant: PresenceParticipant,
+    last_broadcast: Instant,
+    last_broadcast_cursor: Option<GridPoint>,
+}
+
+struct PresenceLease {
+    level: Arc<LevelState>,
+    target: ProjectLevelTarget,
+    presence_id: PresenceId,
+}
+
+impl Drop for PresenceLease {
+    fn drop(&mut self) {
+        let removed = self
+            .level
+            .presence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.presence_id)
+            .is_some();
+        if removed {
+            let _ = self.level.presence_events.send(LevelPresenceItem::Left {
+                target: self.target.clone(),
+                presence_id: self.presence_id.clone(),
+            });
+        }
+    }
 }
 
 impl LevelState {
@@ -90,9 +135,12 @@ impl LevelState {
         let timeline =
             LevelTimeline::new(snapshot).expect("a newly-created level snapshot is valid");
         let (events, _) = broadcast::channel(LEVEL_EVENT_CAPACITY);
+        let (presence_events, _) = broadcast::channel(PRESENCE_EVENT_CAPACITY);
         Self {
             timeline: Mutex::new(timeline),
             events,
+            presence: std::sync::Mutex::new(BTreeMap::new()),
+            presence_events,
         }
     }
 }
@@ -266,6 +314,56 @@ impl OreakRpcServer for OreakRpcService {
         })
     }
 
+    async fn update_level_cursor(
+        &self,
+        extensions: &jsonrpsee::Extensions,
+        request: UpdateLevelCursorRequest,
+    ) -> RpcResult<()> {
+        self.authorize(extensions, &request.target, mvp::RpcLevelAccess::View)
+            .await?;
+        let connection_id = extensions
+            .get::<RpcConnectionId>()
+            .copied()
+            .ok_or_else(|| invalid_command_rpc_error("cursor updates require a WebSocket"))?;
+        let level = self.level(&request.target).await;
+        if let Some(cursor) = request.cursor {
+            let size = level.timeline.lock().await.snapshot().size();
+            if cursor.x >= size.width() || cursor.y >= size.height() {
+                return Err(invalid_command_rpc_error(
+                    "cursor is outside the level grid",
+                ));
+            }
+        }
+
+        let presence_id = presence_id(connection_id);
+        let mut presence = level
+            .presence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = presence.get_mut(&presence_id).ok_or_else(|| {
+            invalid_command_rpc_error("cursor updates require an active presence subscription")
+        })?;
+        if entry.participant.cursor == request.cursor
+            && entry.last_broadcast_cursor == request.cursor
+        {
+            return Ok(());
+        }
+        entry.participant.cursor = request.cursor;
+        let now = Instant::now();
+        let should_broadcast = request.cursor.is_none()
+            || now.duration_since(entry.last_broadcast) >= CURSOR_BROADCAST_INTERVAL;
+        if should_broadcast {
+            entry.last_broadcast = now;
+            entry.last_broadcast_cursor = request.cursor;
+            let _ = level.presence_events.send(LevelPresenceItem::Cursor {
+                target: request.target,
+                presence_id,
+                cursor: request.cursor,
+            });
+        }
+        Ok(())
+    }
+
     async fn subscribe_level(
         &self,
         pending: PendingSubscriptionSink,
@@ -343,6 +441,136 @@ impl OreakRpcServer for OreakRpcService {
 
         Ok(())
     }
+
+    async fn subscribe_level_presence(
+        &self,
+        pending: PendingSubscriptionSink,
+        extensions: &jsonrpsee::Extensions,
+        target: ProjectLevelTarget,
+    ) -> SubscriptionResult {
+        let token = extensions.get::<RpcSessionToken>().cloned();
+        let user_id = match self
+            .authorize(extensions, &target, mvp::RpcLevelAccess::View)
+            .await
+        {
+            Ok(user_id) => user_id,
+            Err(error) => {
+                pending.reject(error).await;
+                return Ok(());
+            }
+        };
+        let Some(connection_id) = extensions.get::<RpcConnectionId>().copied() else {
+            pending
+                .reject(invalid_command_rpc_error(
+                    "presence requires a WebSocket connection",
+                ))
+                .await;
+            return Ok(());
+        };
+
+        let level = self.level(&target).await;
+        let mut receiver = level.presence_events.subscribe();
+        let sink = pending.accept().await?;
+        let presence_id = presence_id(connection_id);
+        let participant = PresenceParticipant {
+            id: presence_id.clone(),
+            actor: ActorId::new(user_id.as_str()),
+            cursor: None,
+        };
+        let participants = {
+            let mut presence = level
+                .presence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if presence.contains_key(&presence_id) || presence.len() >= MAX_LEVEL_PRESENCES {
+                return Ok(());
+            }
+            presence.insert(
+                presence_id.clone(),
+                PresenceEntry {
+                    participant: participant.clone(),
+                    last_broadcast: Instant::now() - CURSOR_BROADCAST_INTERVAL,
+                    last_broadcast_cursor: None,
+                },
+            );
+            presence
+                .values()
+                .map(|entry| entry.participant.clone())
+                .collect::<Vec<_>>()
+        };
+        let _lease = PresenceLease {
+            level: Arc::clone(&level),
+            target: target.clone(),
+            presence_id: presence_id.clone(),
+        };
+
+        if !send_subscription(
+            &sink,
+            &LevelPresenceItem::Snapshot {
+                target: target.clone(),
+                self_id: presence_id.clone(),
+                participants,
+            },
+        )
+        .await
+        {
+            return Ok(());
+        }
+        let _ = level.presence_events.send(LevelPresenceItem::Joined {
+            target: target.clone(),
+            participant,
+        });
+
+        let mut authorization = tokio::time::interval(PRESENCE_AUTHORIZATION_INTERVAL);
+        authorization.tick().await;
+        loop {
+            tokio::select! {
+                () = sink.closed() => break,
+                _ = authorization.tick() => {
+                    if self
+                        .application
+                        .authorize_level(
+                            token.as_ref().map(|token| token.0.as_str()),
+                            target.project_id.as_str(),
+                            target.level_id.as_str(),
+                            mvp::RpcLevelAccess::View,
+                        )
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                received = receiver.recv() => {
+                    let item = match received {
+                        Ok(LevelPresenceItem::Joined { participant, .. })
+                            if participant.id == presence_id => continue,
+                        Ok(item) => item,
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            let participants = level
+                                .presence
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                                .values()
+                                .map(|entry| entry.participant.clone())
+                                .collect();
+                            LevelPresenceItem::Snapshot {
+                                target: target.clone(),
+                                self_id: presence_id.clone(),
+                                participants,
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    };
+                    if !send_subscription(&sink, &item).await {
+                        break;
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[must_use]
@@ -362,13 +590,21 @@ pub fn build_application() -> Application {
 fn build_application_with_config(web_dist: PathBuf, secure_cookies: bool) -> Application {
     let application = mvp::MvpState::new(secure_cookies);
     let methods: Methods = OreakRpcService::new(application.clone()).into_rpc().into();
-    let rpc_builder = ServerBuilder::default().to_service_builder();
+    let rpc_config = ServerConfig::builder()
+        .enable_ws_ping(PingConfig::default())
+        .build();
+    let rpc_builder = ServerBuilder::default()
+        .set_config(rpc_config)
+        .to_service_builder();
     let (stop_handle, rpc_handle) = stop_channel();
     let rpc_service = service_fn(move |mut request: Request| {
         let origin_allowed = is_same_origin_rpc_request(request.headers());
         if let Some(token) = mvp::session_token(request.headers()) {
             request.extensions_mut().insert(RpcSessionToken(token));
         }
+        request.extensions_mut().insert(RpcConnectionId(
+            NEXT_RPC_CONNECTION_ID.fetch_add(1, Ordering::Relaxed),
+        ));
         let mut service = rpc_builder
             .clone()
             .build(methods.clone(), stop_handle.clone());
@@ -463,7 +699,11 @@ fn server_timestamp_ms() -> i64 {
         .unwrap_or(i64::MAX)
 }
 
-async fn send_subscription(sink: &SubscriptionSink, item: &LevelSubscriptionItem) -> bool {
+fn presence_id(connection_id: RpcConnectionId) -> PresenceId {
+    PresenceId::new(format!("presence-{}", connection_id.0))
+}
+
+async fn send_subscription<T: serde::Serialize>(sink: &SubscriptionSink, item: &T) -> bool {
     let message = match to_json_raw_value(item) {
         Ok(message) => message,
         Err(error) => {

@@ -21,6 +21,10 @@ coverage/
 .env
 .env.*
 !.env.example
+/bootstrap.local.toml
+
+# Bootstrap-generated development configuration and assets
+/target/bootstrap/
 
 # Logs and temporary files
 *.log

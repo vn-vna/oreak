@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use serde::{Deserialize, Deserializer, Serialize, de::Error as _};
 use thiserror::Error;
@@ -280,6 +283,29 @@ impl LevelSnapshot {
         Ok(std::mem::replace(&mut self.entities[index], entity))
     }
 
+    pub(crate) fn replace_entities(
+        &mut self,
+        replacements: Vec<PlaceableEntity>,
+    ) -> Result<(), LevelError> {
+        let mut ids = BTreeSet::new();
+        let mut candidate = self.entities.clone();
+        for entity in replacements {
+            if !ids.insert(entity.id().clone()) {
+                return Err(LevelError::DuplicateEntityMove(entity.id().clone()));
+            }
+            let index = candidate
+                .binary_search_by(|existing| existing.id().cmp(entity.id()))
+                .map_err(|_| LevelError::EntityNotFound(entity.id().clone()))?;
+            candidate[index] = entity;
+        }
+        let previous = std::mem::replace(&mut self.entities, candidate);
+        if let Err(error) = self.validate_domain() {
+            self.entities = previous;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     pub(crate) fn remove_entity_cascade(
         &mut self,
         id: &EntityId,
@@ -472,14 +498,18 @@ impl LevelSnapshot {
 
             match decorator.kind() {
                 DecoratorKind::Ice { entity, .. } => {
+                    self.validate_decorator_block_owner(decorator.id(), entity)?;
                     insert_owner(&mut ice_owners, DecoratorRole::Ice, entity, decorator.id())?
                 }
-                DecoratorKind::Direction { entity, .. } => insert_owner(
-                    &mut direction_owners,
-                    DecoratorRole::Direction,
-                    entity,
-                    decorator.id(),
-                )?,
+                DecoratorKind::Direction { entity, .. } => {
+                    self.validate_decorator_block_owner(decorator.id(), entity)?;
+                    insert_owner(
+                        &mut direction_owners,
+                        DecoratorRole::Direction,
+                        entity,
+                        decorator.id(),
+                    )?
+                }
                 DecoratorKind::KeyLocker { entity, key } => {
                     if entity == key {
                         return Err(LevelError::KeyLockerEndpointsMustDiffer {
@@ -509,6 +539,23 @@ impl LevelSnapshot {
             }
         }
         Ok(())
+    }
+
+    fn validate_decorator_block_owner(
+        &self,
+        decorator_id: &DecoratorId,
+        entity_id: &EntityId,
+    ) -> Result<(), LevelError> {
+        if self
+            .entity(entity_id)
+            .is_some_and(|entity| matches!(entity.kind(), PlaceableEntityKind::Block(_)))
+        {
+            return Ok(());
+        }
+        Err(LevelError::DecoratorOwnerNotBlock {
+            decorator_id: decorator_id.clone(),
+            entity_id: entity_id.clone(),
+        })
     }
 
     fn validate_entity_placement(
@@ -627,6 +674,9 @@ pub enum LevelError {
     #[error("entity ID '{0}' does not exist")]
     EntityNotFound(EntityId),
 
+    #[error("entity ID '{0}' occurs more than once in a grouped move")]
+    DuplicateEntityMove(EntityId),
+
     #[error(
         "entity '{entity_id}' at ({}, {}) with local cell ({}, {}) is outside the {} x {} grid",
         origin.x,
@@ -697,6 +747,12 @@ pub enum LevelError {
         entity_id: EntityId,
     },
 
+    #[error("decorator '{decorator_id}' owner '{entity_id}' is not a Block")]
+    DecoratorOwnerNotBlock {
+        decorator_id: DecoratorId,
+        entity_id: EntityId,
+    },
+
     #[error("decorator '{decorator_id}' has a different kind or owner than the command")]
     DecoratorIdentityConflict { decorator_id: DecoratorId },
 
@@ -705,4 +761,10 @@ pub enum LevelError {
         entity_id: EntityId,
         decorator_id: DecoratorId,
     },
+
+    #[error("resizing would clip non-floor cell ({}, {})", point.x, point.y)]
+    ResizeWouldClipCell { point: GridPoint },
+
+    #[error("resizing would clip entity '{entity_id}'")]
+    ResizeWouldClipEntity { entity_id: EntityId },
 }

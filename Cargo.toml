@@ -8,8 +8,10 @@ members = [
   "crates/oreak-plugin-api",
   "crates/oreak-project",
   "crates/oreak-protocol",
+  "tools/bootstrap",
 ]
 resolver = "3"
+default-members = [ "tools/bootstrap" ]
 
 [workspace.package]
 edition = "2024"
