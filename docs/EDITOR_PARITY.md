@@ -16,7 +16,7 @@ all covered.
 | Merge and Blind resize | Missing | Partial | Missing | Port merge rules and SBLN topology transforms. |
 | Block collect properties | Partial | Partial | Read-only summary | Add collaborative color/layer/radius/capacity/lock commands. |
 | Capacity analysis/normalization | Missing | Partial | Missing | Port Unity analyzer and deterministic normalization plan. |
-| Ice/Direction/KeyLocker | Partial | Partial | Partial | Preserve disabled identities/counts, add movable badges, batch selection, and dedicated decorator history. |
+| Ice/Direction/KeyLocker/Glass | Partial | Partial | Partial | Glass is now Blind-only with typed timeline/RPC/browser controls and active/`_led.dt` tombstone legacy round-trip; generalize tombstones, then add movable badges, batch selection, and dedicated decorator history. |
 | Blind paint/erase/fill | Complete | Complete | Complete | Add Block color sampling and mixed-color held gestures; local Blind isolation is complete. |
 | Blind pixel resolution | Complete | Compatible through final pixels | Complete | Per-Pool 1-32 resolution changes resample deterministically and support exact Undo. |
 | One-pixel stroke interpolation | Complete | Final pixels compatible | Complete | None for the size-1 tip. |

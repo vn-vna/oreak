@@ -2,11 +2,16 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use gloo_timers::callback::Timeout;
 use js_sys::Date;
+use lucide_yew::{
+    Eraser, FolderTree, GitCommitHorizontal, Image, Map, Maximize, MessageSquare, MousePointer2,
+    PanelLeft, PanelLeftClose, PanelRight, PanelRightClose, Settings, Shapes, SlidersHorizontal,
+    Square, Users, ZoomIn, ZoomOut,
+};
 use oreak_core::{
-    BlameEntry, BlindPixel, BlindStroke, CellKind, CollectCapacity, CommandEnvelope, DecoratorKind,
-    DirectionMode, EntityId, EntityMove, GridAnchor, GridPoint, GridSize, HistoryEvent,
-    LevelCommand, LevelSnapshot, LevelTarget, PlaceableEntity, PlaceableEntityKind, Shape,
-    ShapeCell,
+    BlameEntry, BlindPixel, BlindStroke, CellKind, CollectCapacity, CollectLayer, CommandEnvelope,
+    DecoratorKind, DirectionMode, EntityId, EntityMove, GridAnchor, GridPoint, GridSize,
+    HistoryEvent, LevelCommand, LevelSnapshot, LevelTarget, PlaceableEntity, PlaceableEntityKind,
+    Shape, ShapeCell,
 };
 use oreak_protocol::{
     ApplyCommandRequest, ApplyCommandResponse, ApplyCommandResult, LevelEvent, LevelPresenceItem,
@@ -15,15 +20,16 @@ use oreak_protocol::{
 };
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use web_sys::{
-    CanvasRenderingContext2d, DragEvent, Element, HtmlCanvasElement, HtmlElement, HtmlInputElement,
-    HtmlSelectElement, KeyboardEvent, PointerEvent, ResizeObserver, WheelEvent,
+    CanvasRenderingContext2d, ClipboardEvent, DragEvent, Element, File, HtmlCanvasElement,
+    HtmlElement, HtmlInputElement, HtmlSelectElement, KeyboardEvent, PointerEvent, ResizeObserver,
+    WheelEvent,
 };
 use yew::prelude::*;
 
 use crate::api::{
-    ApiError, CatalogSnapshot, LevelConfiguration, LevelSummary, MembershipSummary,
-    ProjectConfiguration, ProjectInvitationSummary, ProjectSummary, RestClient, ShapeCatalogEntry,
-    ShapeDefinition, UserSummary, WorkspaceSummary, draft_storage_key,
+    ApiError, CatalogSnapshot, ImageCatalogEntry, LevelConfiguration, LevelSummary,
+    MembershipSummary, ProjectConfiguration, ProjectInvitationSummary, ProjectSummary, RestClient,
+    ShapeCatalogEntry, ShapeDefinition, UserSummary, WorkspaceSummary, draft_storage_key,
 };
 use crate::model::{
     EditorModel, MapResizeEdge, Mode, ModelChange, MoveDirection, PresenceRoster, Selection,
@@ -41,6 +47,7 @@ const BOARD_ORIGIN: f64 = 44.0;
 const CELL_SIZE: f64 = 85.0;
 const BLIND_INSET: f64 = 6.0;
 const THEME_STORAGE_KEY: &str = "oreak.theme.override";
+const INSPECTOR_COLLAPSE_STORAGE_PREFIX: &str = "oreak.inspector.collapsed.v1.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
@@ -145,17 +152,159 @@ pub(crate) enum TopMenu {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UiIcon {
+    Blame,
+    Explorer,
+    Comments,
+    Collaboration,
+    Inspector,
+    LevelConfiguration,
+    ShapeTemplates,
+    PlaceEntity,
+    MapDesign,
+    ImageStudio,
+    DrawWall,
+    ClearWall,
+    Resize,
+    DockLeft,
+    DockRight,
+    HideLeft,
+    HideRight,
+    Float,
+    ZoomOut,
+    Frame,
+    ZoomIn,
+}
+
+fn ui_icon(icon: UiIcon, size: usize) -> Html {
+    let icon = match icon {
+        UiIcon::Blame => html! { <GitCommitHorizontal size={size} /> },
+        UiIcon::Explorer => html! { <FolderTree size={size} /> },
+        UiIcon::Comments => html! { <MessageSquare size={size} /> },
+        UiIcon::Collaboration => html! { <Users size={size} /> },
+        UiIcon::Inspector => html! { <SlidersHorizontal size={size} /> },
+        UiIcon::LevelConfiguration => html! { <Settings size={size} /> },
+        UiIcon::ShapeTemplates => html! { <Shapes size={size} /> },
+        UiIcon::PlaceEntity => html! { <MousePointer2 size={size} /> },
+        UiIcon::MapDesign => html! { <Map size={size} /> },
+        UiIcon::ImageStudio => html! { <Image size={size} /> },
+        UiIcon::DrawWall => html! { <Square size={size} /> },
+        UiIcon::ClearWall => html! { <Eraser size={size} /> },
+        UiIcon::DockLeft => html! { <PanelLeft size={size} /> },
+        UiIcon::DockRight => html! { <PanelRight size={size} /> },
+        UiIcon::HideLeft => html! { <PanelLeftClose size={size} /> },
+        UiIcon::HideRight => html! { <PanelRightClose size={size} /> },
+        UiIcon::Resize | UiIcon::Frame | UiIcon::Float => html! { <Maximize size={size} /> },
+        UiIcon::ZoomOut => html! { <ZoomOut size={size} /> },
+        UiIcon::ZoomIn => html! { <ZoomIn size={size} /> },
+    };
+    html! { <span class="ui-icon" aria-hidden="true">{icon}</span> }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RightTab {
     Inspector,
-    Activity,
-    Blame,
+    LevelStructure,
+    LevelConfiguration,
+}
+
+impl RightTab {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Inspector => "Inspector",
+            Self::LevelStructure => "Level structure",
+            Self::LevelConfiguration => "Level configuration",
+        }
+    }
+
+    const fn icon(self) -> UiIcon {
+        match self {
+            Self::Inspector => UiIcon::Inspector,
+            Self::LevelStructure => UiIcon::Explorer,
+            Self::LevelConfiguration => UiIcon::LevelConfiguration,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum LeftTab {
     #[default]
-    Tool,
-    Templates,
+    ShapeTemplates,
+    Blame,
+    Explorer,
+    Comments,
+    Collaboration,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ShapeTemplateView {
+    #[default]
+    Grid,
+    List,
+}
+
+impl LeftTab {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::ShapeTemplates => "Shape templates",
+            Self::Blame => "Blame",
+            Self::Explorer => "Project explorer",
+            Self::Comments => "Comments",
+            Self::Collaboration => "Collaboration session",
+        }
+    }
+
+    const fn icon(self) -> UiIcon {
+        match self {
+            Self::ShapeTemplates => UiIcon::ShapeTemplates,
+            Self::Blame => UiIcon::Blame,
+            Self::Explorer => UiIcon::Explorer,
+            Self::Comments => UiIcon::Comments,
+            Self::Collaboration => UiIcon::Collaboration,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum InspectorSection {
+    Selection,
+    EntityData,
+    Capacity,
+    Decorators,
+    PoolResolution,
+}
+
+impl InspectorSection {
+    const fn storage_key(self) -> &'static str {
+        match self {
+            Self::Selection => "selection",
+            Self::EntityData => "entity-data",
+            Self::Capacity => "capacity",
+            Self::Decorators => "decorators",
+            Self::PoolResolution => "pool-resolution",
+        }
+    }
+
+    fn from_storage_key(value: &str) -> Option<Self> {
+        match value {
+            "selection" => Some(Self::Selection),
+            "entity-data" => Some(Self::EntityData),
+            "capacity" => Some(Self::Capacity),
+            "decorators" => Some(Self::Decorators),
+            "pool-resolution" => Some(Self::PoolResolution),
+            _ => None,
+        }
+    }
+
+    const fn content_id(self) -> &'static str {
+        match self {
+            Self::Selection => "inspector-selection-content",
+            Self::EntityData => "inspector-entity-data-content",
+            Self::Capacity => "inspector-capacity-content",
+            Self::Decorators => "inspector-decorators-content",
+            Self::PoolResolution => "inspector-pool-resolution-content",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -187,53 +336,6 @@ impl WorkspaceTool {
             Mode::Map => Self::Cells,
             Mode::Brush => Self::Paint,
             Mode::Sandbox => Self::SandboxMove,
-        }
-    }
-
-    const fn label(self) -> &'static str {
-        match self {
-            Self::Place => "Place",
-            Self::Transform => "Transform",
-            Self::Decorate => "Decorate",
-            Self::Cells => "Cells",
-            Self::Resize => "Resize",
-            Self::Paint => "Paint",
-            Self::Fill => "Fill",
-            Self::SandboxMove => "Move",
-        }
-    }
-
-    const fn description(self) -> &'static str {
-        match self {
-            Self::Place => "Place one default Block or Pool at the selected floor cell.",
-            Self::Transform => "Move or reshape the selected entity as one timeline action.",
-            Self::Decorate => "Edit Ice, Direction, and Key & Locker on the selected Block.",
-            Self::Cells => "Paint logical Floor and Wall cells on the map.",
-            Self::Resize => "Resize the map from one of nine fixed visual anchors.",
-            Self::Paint => "Paint or erase pixels on the selected Pool canvas.",
-            Self::Fill => "Fill one connected empty region on the selected Pool canvas.",
-            Self::SandboxMove => "Sandbox movement remains parity gated.",
-        }
-    }
-
-    const fn icon(self) -> &'static str {
-        match self {
-            Self::Place => "+",
-            Self::Transform => "<>",
-            Self::Decorate => "*",
-            Self::Cells => "#",
-            Self::Resize => "[]",
-            Self::Paint => "/",
-            Self::Fill => "~",
-            Self::SandboxMove => ">",
-        }
-    }
-
-    const fn key(self) -> char {
-        match self {
-            Self::Place | Self::Cells | Self::Paint | Self::SandboxMove => 'Z',
-            Self::Transform | Self::Resize | Self::Fill => 'X',
-            Self::Decorate => 'C',
         }
     }
 
@@ -322,9 +424,17 @@ pub(crate) enum PlacementKind {
     Blind,
 }
 
+impl PlacementKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Block => "Block",
+            Self::Blind => "Pool",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EntityAction {
-    Move(MoveDirection),
     RotateClockwise,
     FlipHorizontal,
     Delete,
@@ -333,6 +443,7 @@ pub(crate) enum EntityAction {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DecoratorAction {
     ToggleIce,
+    ToggleGlass,
     CycleDirection,
     SetDirection(DirectionMode),
     BeginKeyLocker,
@@ -368,6 +479,8 @@ struct EntityDrag {
     start: GridPoint,
     current: GridPoint,
     origins: Vec<(EntityId, GridPoint)>,
+    duplicate: bool,
+    rotation_steps: u8,
     start_canvas_x: f64,
     start_canvas_y: f64,
     active: bool,
@@ -408,6 +521,35 @@ impl PanelLayout {
             Self::Docked => "DOCKED",
             Self::Floating => "FLOATING",
             Self::Hidden => "HIDDEN",
+        }
+    }
+
+    const fn toggled(self) -> Self {
+        match self {
+            Self::Docked => Self::Floating,
+            Self::Floating | Self::Hidden => Self::Docked,
+        }
+    }
+
+    const fn toggle_label(self) -> &'static str {
+        match self {
+            Self::Docked => "Float",
+            Self::Floating | Self::Hidden => "Dock",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StudioModal {
+    Shape,
+    Image,
+}
+
+impl StudioModal {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Shape => "Shape Studio",
+            Self::Image => "Image Studio",
         }
     }
 }
@@ -476,6 +618,8 @@ pub struct App {
     mode: Mode,
     selection: Option<Selection>,
     drag_kind: Option<CellKind>,
+    map_paint_kind: Option<CellKind>,
+    selected_placement_kind: PlacementKind,
     last_drag: Option<GridPoint>,
     blind_brush_tool: BlindBrushTool,
     blind_color_index: u8,
@@ -502,19 +646,28 @@ pub struct App {
     resize_anchor: GridAnchor,
     shape_catalog: Vec<ShapeCatalogEntry>,
     shape_catalog_pending: bool,
+    shape_template_view: ShapeTemplateView,
     shape_draft_name: String,
     shape_draft_mask: u64,
     selected_shape_id: Option<String>,
+    image_catalog: Vec<ImageCatalogEntry>,
+    image_catalog_pending: bool,
+    image_draft_name: String,
+    image_file: Option<File>,
+    image_import_error: Option<String>,
     isolated_blind: Option<EntityId>,
     key_locker_assignment: Option<EntityId>,
     canvas_ref: NodeRef,
     root_ref: NodeRef,
     palette_input_ref: NodeRef,
+    image_file_input_ref: NodeRef,
     canvas_dirty: bool,
     theme: ThemeSettings,
+    inspector_collapsed: BTreeSet<InspectorSection>,
     open_menu: Option<TopMenu>,
     left_tab: LeftTab,
     right_tab: RightTab,
+    studio_modal: Option<StudioModal>,
     workspace_tool: WorkspaceTool,
     palette_open: bool,
     palette_query: String,
@@ -614,12 +767,19 @@ pub enum Msg {
     Logout,
     LogoutFinished(Result<(), ApiError>),
     SetMode(Mode),
-    SetSelectedKind(CellKind),
+    SetMapPaintKind(CellKind),
+    SetPlacementContext(PlacementKind),
+    OpenStudio(StudioModal),
+    CloseStudio,
+    FocusExplorerEntity(EntityId),
     EditEntity(EntityAction),
     EditDecorator(DecoratorAction),
     SetIceCount(String),
-    SetBlindColor(u8),
+    SetGlassCount(String),
     SetPoolResolution(u8),
+    SetBlockLayerCapacity(usize, String),
+    AddBlockCollectLayer,
+    RemoveBlockCollectLayer(usize),
     ResizeWidth(String),
     ResizeHeight(String),
     SetResizeAnchor(GridAnchor),
@@ -632,6 +792,7 @@ pub enum Msg {
         project_id: String,
         result: Result<Vec<ShapeCatalogEntry>, ApiError>,
     },
+    SetShapeTemplateView(ShapeTemplateView),
     ShapeDraftName(String),
     ToggleShapeCell(u8, u8),
     NewShapeDraft,
@@ -648,12 +809,23 @@ pub enum Msg {
         shape_id: String,
         result: Result<(), ApiError>,
     },
+    ImageCatalogLoaded {
+        project_id: String,
+        result: Result<Vec<ImageCatalogEntry>, ApiError>,
+    },
+    ImageDraftName(String),
+    ImageFileSelected(Option<File>),
+    ImagePasted(ClipboardEvent),
+    ImportImage,
+    ImageImported {
+        project_id: String,
+        result: Result<ImageCatalogEntry, ApiError>,
+    },
     BeginPlacementDrag(PlacementKind, Shape),
     EndPlacementDrag,
     CanvasDragOver(DragEvent),
     CanvasDrop(DragEvent),
     CanvasResized(u32, u32),
-    ToggleBlindIsolation,
     CanvasDown(PointerEvent),
     CanvasMove(PointerEvent),
     CanvasUp(PointerEvent),
@@ -672,6 +844,8 @@ pub enum Msg {
     SidebarResizeMove(PointerEvent),
     EndSidebarResize(PointerEvent),
     SetPanelLayout(SidebarSide, PanelLayout),
+    TogglePanelLayout(SidebarSide),
+    ToggleInspectorSection(InspectorSection),
     TogglePalette,
     CloseOverlays,
     PaletteQuery(String),
@@ -748,6 +922,8 @@ impl Component for App {
             mode: Mode::Select,
             selection: None,
             drag_kind: None,
+            map_paint_kind: None,
+            selected_placement_kind: PlacementKind::Block,
             last_drag: None,
             blind_brush_tool: BlindBrushTool::Paint,
             blind_color_index: 1,
@@ -780,19 +956,28 @@ impl Component for App {
             resize_anchor: GridAnchor::Center,
             shape_catalog: Vec::new(),
             shape_catalog_pending: false,
+            shape_template_view: ShapeTemplateView::Grid,
             shape_draft_name: String::new(),
             shape_draft_mask: 1,
             selected_shape_id: None,
+            image_catalog: Vec::new(),
+            image_catalog_pending: false,
+            image_draft_name: String::new(),
+            image_file: None,
+            image_import_error: None,
             isolated_blind: None,
             key_locker_assignment: None,
             canvas_ref: NodeRef::default(),
             root_ref: NodeRef::default(),
             palette_input_ref: NodeRef::default(),
+            image_file_input_ref: NodeRef::default(),
             canvas_dirty: true,
             theme: ThemeSettings::load(),
+            inspector_collapsed: BTreeSet::new(),
             open_menu: None,
-            left_tab: LeftTab::Tool,
+            left_tab: LeftTab::ShapeTemplates,
             right_tab: RightTab::Inspector,
+            studio_modal: None,
             workspace_tool: WorkspaceTool::Place,
             palette_open: false,
             palette_query: String::new(),
@@ -1076,6 +1261,7 @@ impl Component for App {
                 if self.phase != Phase::Editor {
                     return false;
                 }
+                self.right_tab = RightTab::LevelConfiguration;
                 self.level_configuration_open = true;
                 self.level_configuration_pending = true;
                 self.level_configuration_error = None;
@@ -1094,6 +1280,7 @@ impl Component for App {
             Msg::CloseLevelConfiguration => {
                 self.level_configuration_open = false;
                 self.level_configuration_error = None;
+                self.right_tab = RightTab::Inspector;
                 true
             }
             Msg::LevelConfigurationName(value) => {
@@ -1123,7 +1310,6 @@ impl Component for App {
                 match result {
                     Ok(configuration) => {
                         self.accept_level_configuration(configuration);
-                        self.level_configuration_open = false;
                         self.push_toast("Level configuration saved".to_owned(), "success");
                     }
                     Err(error) if error.is_unauthorized() => {
@@ -1405,25 +1591,77 @@ impl Component for App {
                 self.clear_session();
                 true
             }
-            Msg::SetMode(mode) => self.set_mode(mode),
-            Msg::SetSelectedKind(kind) => {
-                let Some(point) = self.selected_cell() else {
+            Msg::SetMode(mode) => {
+                if self.mode == mode {
+                    self.set_workspace_tool(WorkspaceTool::default_for(mode))
+                } else {
+                    self.set_mode(mode)
+                }
+            }
+            Msg::SetMapPaintKind(kind) => {
+                let mut changed = self.set_mode(Mode::Map);
+                changed |= self.set_workspace_tool(WorkspaceTool::Cells);
+                if self.map_paint_kind != Some(kind) {
+                    self.map_paint_kind = Some(kind);
+                    changed = true;
+                }
+                changed
+            }
+            Msg::SetPlacementContext(kind) => {
+                let mut changed = self.set_mode(Mode::Select);
+                changed |= self.set_workspace_tool(WorkspaceTool::Place);
+                if self.selected_placement_kind != kind {
+                    self.selected_placement_kind = kind;
+                    changed = true;
+                }
+                if self.left_tab != LeftTab::ShapeTemplates {
+                    self.left_tab = LeftTab::ShapeTemplates;
+                    changed = true;
+                }
+                if self.studio_modal.is_some() {
+                    self.studio_modal = None;
+                    changed = true;
+                }
+                changed
+            }
+            Msg::OpenStudio(studio) => {
+                self.studio_modal = Some(studio);
+                if studio == StudioModal::Image {
+                    self.load_image_catalog(ctx);
+                }
+                true
+            }
+            Msg::CloseStudio => {
+                self.studio_modal = None;
+                true
+            }
+            Msg::FocusExplorerEntity(entity_id) => {
+                if self
+                    .model
+                    .timeline()
+                    .snapshot()
+                    .entity(&entity_id)
+                    .is_none()
+                {
                     return false;
-                };
-                self.apply_cell(ctx, point, kind)
+                }
+                self.select_entities_and_focus_inspector(vec![entity_id]);
+                self.canvas_dirty = true;
+                true
             }
             Msg::EditEntity(action) => self.edit_selected_entity(ctx, action),
             Msg::EditDecorator(action) => self.edit_selected_decorator(ctx, action),
             Msg::SetIceCount(value) => self.set_selected_ice_count(ctx, &value),
-            Msg::SetBlindColor(color_index) => {
-                if !(1..=10).contains(&color_index) {
-                    return false;
-                }
-                self.blind_color_index = color_index;
-                true
-            }
+            Msg::SetGlassCount(value) => self.set_selected_glass_count(ctx, &value),
             Msg::SetPoolResolution(pixels_per_cell) => {
                 self.set_pool_resolution(ctx, pixels_per_cell)
+            }
+            Msg::SetBlockLayerCapacity(layer_index, value) => {
+                self.set_block_layer_capacity(ctx, layer_index, &value)
+            }
+            Msg::AddBlockCollectLayer => self.add_block_collect_layer(ctx),
+            Msg::RemoveBlockCollectLayer(layer_index) => {
+                self.remove_block_collect_layer(ctx, layer_index)
             }
             Msg::ResizeWidth(value) => {
                 self.resize_width = value;
@@ -1454,6 +1692,10 @@ impl Component for App {
                     Ok(shapes) => self.shape_catalog = shapes,
                     Err(error) => return self.handle_authenticated_api_error(error),
                 }
+                true
+            }
+            Msg::SetShapeTemplateView(view) => {
+                self.shape_template_view = view;
                 true
             }
             Msg::ShapeDraftName(value) => {
@@ -1518,12 +1760,56 @@ impl Component for App {
                 }
                 true
             }
+            Msg::ImageCatalogLoaded { project_id, result } => {
+                if self.target.project_id.as_str() != project_id {
+                    return false;
+                }
+                self.image_catalog_pending = false;
+                match result {
+                    Ok(images) => self.image_catalog = images,
+                    Err(error) => {
+                        self.image_import_error = Some(api_error_message(&error));
+                        return self.handle_authenticated_api_error(error);
+                    }
+                }
+                true
+            }
+            Msg::ImageDraftName(value) => {
+                self.image_draft_name = value;
+                self.image_import_error = None;
+                true
+            }
+            Msg::ImageFileSelected(file) => self.select_image_file(file),
+            Msg::ImagePasted(event) => self.select_pasted_image(event),
+            Msg::ImportImage => self.import_image(ctx),
+            Msg::ImageImported { project_id, result } => {
+                if self.target.project_id.as_str() != project_id {
+                    return false;
+                }
+                self.image_catalog_pending = false;
+                match result {
+                    Ok(image) => {
+                        self.image_catalog.push(image);
+                        self.image_file = None;
+                        if let Some(input) = self.image_file_input_ref.cast::<HtmlInputElement>() {
+                            input.set_value("");
+                        }
+                        self.image_draft_name.clear();
+                        self.image_import_error = None;
+                        self.push_toast("Shared image template imported".to_owned(), "success");
+                    }
+                    Err(error) => {
+                        self.image_import_error = Some(api_error_message(&error));
+                        return self.handle_authenticated_api_error(error);
+                    }
+                }
+                true
+            }
             Msg::BeginPlacementDrag(kind, shape) => self.begin_placement_drag(kind, shape),
             Msg::EndPlacementDrag => self.end_placement_drag(),
             Msg::CanvasDragOver(event) => self.canvas_drag_over(event),
             Msg::CanvasDrop(event) => self.canvas_drop(ctx, event),
             Msg::CanvasResized(width, height) => self.canvas_resized(width, height),
-            Msg::ToggleBlindIsolation => self.toggle_blind_isolation(),
             Msg::CanvasDown(event) => self.canvas_down(ctx, event),
             Msg::CanvasMove(event) => self.canvas_move(ctx, event),
             Msg::CanvasUp(event) => self.canvas_up(ctx, event),
@@ -1539,6 +1825,7 @@ impl Component for App {
             Msg::KeyDown(event) => self.key_down(ctx, event),
             Msg::ToggleTheme => {
                 self.theme.toggle();
+                self.open_menu = None;
                 self.canvas_dirty = true;
                 self.push_toast(
                     format!(
@@ -1567,22 +1854,26 @@ impl Component for App {
                 true
             }
             Msg::SetRightTab(tab) => {
+                let changed = self.right_tab != tab;
                 self.right_tab = tab;
-                true
+                if tab == RightTab::LevelConfiguration && !self.level_configuration_open {
+                    ctx.link().send_message(Msg::OpenLevelConfiguration);
+                }
+                changed
             }
             Msg::SetWorkspaceTool(tool) => self.set_workspace_tool(tool),
             Msg::BeginSidebarResize(side, event) => self.begin_sidebar_resize(side, event),
             Msg::SidebarResizeMove(event) => self.resize_sidebar(event),
             Msg::EndSidebarResize(event) => self.end_sidebar_resize(event),
-            Msg::SetPanelLayout(side, layout) => {
-                match side {
-                    SidebarSide::Left => self.left_panel_layout = layout,
-                    SidebarSide::Right => self.right_panel_layout = layout,
-                }
-                self.sidebar_resize = None;
-                self.canvas_dirty = true;
-                true
+            Msg::SetPanelLayout(side, layout) => self.set_panel_layout(side, layout),
+            Msg::TogglePanelLayout(side) => {
+                let layout = match side {
+                    SidebarSide::Left => self.left_panel_layout,
+                    SidebarSide::Right => self.right_panel_layout,
+                };
+                self.set_panel_layout(side, layout.toggled())
             }
+            Msg::ToggleInspectorSection(section) => self.toggle_inspector_section(section),
             Msg::TogglePalette => {
                 self.palette_open = !self.palette_open;
                 self.palette_query.clear();
@@ -1780,21 +2071,29 @@ impl Component for App {
                 tabindex="0"
                 ref={self.root_ref.clone()}
                 onkeydown={ctx.link().callback(Msg::KeyDown)}
+                onpaste={ctx.link().callback(|event: Event| Msg::ImagePasted(event.unchecked_into()))}
                 onpointermove={ctx.link().callback(Msg::SidebarResizeMove)}
                 onpointerup={ctx.link().callback(Msg::EndSidebarResize)}
                 onpointercancel={ctx.link().callback(Msg::EndSidebarResize)}
             >
                 { self.view_header(ctx) }
+                {
+                    if self.open_menu.is_some() {
+                        html! { <div class="menu-dismiss-layer" aria-hidden="true" onclick={ctx.link().callback(|_| Msg::CloseOverlays)}></div> }
+                    } else {
+                        Html::default()
+                    }
+                }
                 { if self.left_panel_layout == PanelLayout::Hidden { Html::default() } else { self.view_left_sidebar(ctx) } }
                 { if self.left_panel_layout == PanelLayout::Docked { html! { <div class="sidebar-resizer left-resizer" title="Resize left sidebar" onpointerdown={ctx.link().callback(|event| Msg::BeginSidebarResize(SidebarSide::Left, event))}></div> } } else { Html::default() } }
                 { self.view_canvas(ctx) }
                 { if self.right_panel_layout == PanelLayout::Docked { html! { <div class="sidebar-resizer right-resizer" title="Resize right sidebar" onpointerdown={ctx.link().callback(|event| Msg::BeginSidebarResize(SidebarSide::Right, event))}></div> } } else { Html::default() } }
                 { if self.right_panel_layout == PanelLayout::Hidden { Html::default() } else { self.view_right_sidebar(ctx) } }
-                { self.view_status() }
+                { self.view_status(ctx) }
                 { self.view_palette(ctx) }
                 { self.view_toasts(ctx) }
                 { self.view_notifications(ctx) }
-                { self.view_level_configuration(ctx) }
+                { self.view_studio_modal(ctx) }
             </div>
         }
     }
@@ -1982,24 +2281,148 @@ impl App {
         }
     }
 
-    fn view_level_configuration(&self, ctx: &Context<Self>) -> Html {
+    fn view_level_configuration_panel(&self, ctx: &Context<Self>) -> Html {
         if !self.level_configuration_open {
-            return Html::default();
+            return html! {
+                <div class="empty-selection panel-placeholder">
+                    <span>{"LEVEL CONFIGURATION"}</span>
+                    <p>{"Load the authoritative level settings into this secondary sidebar."}</p>
+                    <button onclick={ctx.link().callback(|_| Msg::OpenLevelConfiguration)}>{"Load settings"}</button>
+                </div>
+            };
         }
         html! {
-            <div class="configuration-backdrop" onclick={ctx.link().callback(|_| Msg::CloseLevelConfiguration)}>
-                <section class="level-configuration" role="dialog" aria-modal="true" aria-label="Level configuration" onclick={Callback::from(|event: MouseEvent| event.stop_propagation())}>
-                    <header>
-                        <div><small>{"LEVEL CONFIGURATION"}</small><strong>{self.level_display_name.clone()}</strong><code>{self.target.level_id.to_string()}</code></div>
-                        <button aria-label="Close level configuration" onclick={ctx.link().callback(|_| Msg::CloseLevelConfiguration)}>{"x"}</button>
-                    </header>
-                    <div class="level-configuration-body">
-                        <label><span>{"NAME"}</span><input value={self.level_configuration_name.clone()} disabled={self.level_configuration_pending || !self.can_edit_timeline} oninput={ctx.link().callback(|event: InputEvent| Msg::LevelConfigurationName(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
-                        <label><span>{"DURATION / SECONDS"}</span><input type="number" min="0" step="0.1" value={self.level_configuration_duration.clone()} disabled={self.level_configuration_pending || !self.can_edit_timeline} oninput={ctx.link().callback(|event: InputEvent| Msg::LevelConfigurationDuration(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
-                        <p>{"Name and duration are authoritative project settings and do not create timeline revisions."}</p>
+            <section class="level-configuration sidebar-level-configuration" aria-label="Level configuration">
+                <header>
+                    <div><small>{"LEVEL CONFIGURATION"}</small><strong>{self.level_display_name.clone()}</strong><code>{self.target.level_id.to_string()}</code></div>
+                    <button aria-label="Close level configuration" onclick={ctx.link().callback(|_| Msg::CloseLevelConfiguration)}>{"x"}</button>
+                </header>
+                <div class="level-configuration-body">
+                    <label><span>{"NAME"}</span><input value={self.level_configuration_name.clone()} disabled={self.level_configuration_pending || !self.can_edit_timeline} oninput={ctx.link().callback(|event: InputEvent| Msg::LevelConfigurationName(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
+                    <label><span>{"DURATION / SECONDS"}</span><input type="number" min="0" step="0.1" value={self.level_configuration_duration.clone()} disabled={self.level_configuration_pending || !self.can_edit_timeline} oninput={ctx.link().callback(|event: InputEvent| Msg::LevelConfigurationDuration(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
+                    <p>{"Name and duration are authoritative project settings and do not create timeline revisions."}</p>
+                </div>
+                { self.level_configuration_error.as_ref().map(|error| html! { <div class="configuration-error">{error}</div> }).unwrap_or_default() }
+                <footer><button onclick={ctx.link().callback(|_| Msg::CloseLevelConfiguration)}>{"Close"}</button><button class="primary-action compact" disabled={self.level_configuration_pending || !self.can_edit_timeline || self.level_configuration_name.trim().is_empty()} onclick={ctx.link().callback(|_| Msg::SaveLevelConfiguration)}>{if self.level_configuration_pending { "Saving..." } else { "Save level" }}</button></footer>
+            </section>
+        }
+    }
+
+    fn view_studio_modal(&self, ctx: &Context<Self>) -> Html {
+        let Some(studio) = self.studio_modal else {
+            return Html::default();
+        };
+        html! {
+            <div class="studio-backdrop" onclick={ctx.link().callback(|_| Msg::CloseStudio)}>
+                <section class="studio-modal" role="dialog" aria-modal="true" aria-label={studio.label()} onclick={Callback::from(|event: MouseEvent| event.stop_propagation())}>
+                    <header class="studio-header"><div><small>{"FOCUSED EDITING"}</small><strong>{studio.label()}</strong></div><button aria-label="Close studio" onclick={ctx.link().callback(|_| Msg::CloseStudio)}>{"x"}</button></header>
+                    {
+                        match studio {
+                            StudioModal::Shape => self.view_shape_studio(ctx),
+                            StudioModal::Image => self.view_image_studio(ctx),
+                        }
+                    }
+                </section>
+            </div>
+        }
+    }
+
+    fn view_shape_studio(&self, ctx: &Context<Self>) -> Html {
+        let shape = shape_from_designer_mask(self.shape_draft_mask).ok();
+        let can_use_template =
+            self.can_edit_timeline && matches!(self.rpc_state, RpcState::Online) && shape.is_some();
+        html! {
+            <div class="shape-studio-layout">
+                <aside class="shape-studio-library">
+                    <div class="studio-section-heading"><span>{"SAVED SHAPES"}</span><button onclick={ctx.link().callback(|_| Msg::NewShapeDraft)}>{"New Shape"}</button></div>
+                    <div class="shape-catalog">
+                        { if self.shape_catalog_pending && self.shape_catalog.is_empty() {
+                            html! { <span>{"Loading project shapes..."}</span> }
+                        } else if self.shape_catalog.is_empty() {
+                            html! { <span>{"No project shapes saved."}</span> }
+                        } else {
+                            html! { <>{ for self.shape_catalog.iter().map(|sample| {
+                                let id = sample.id.clone();
+                                html! { <button class={classes!((self.selected_shape_id.as_ref() == Some(&sample.id)).then_some("active"))} title={format!("{} x {}", sample.shape.width, sample.shape.height)} onclick={ctx.link().callback(move |_| Msg::SelectShape(id.clone()))}><strong>{sample.name.clone()}</strong><code>{format!("{}x{}", sample.shape.width, sample.shape.height)}</code></button> }
+                            }) }</> }
+                        } }
                     </div>
-                    { self.level_configuration_error.as_ref().map(|error| html! { <div class="configuration-error">{error}</div> }).unwrap_or_default() }
-                    <footer><button onclick={ctx.link().callback(|_| Msg::CloseLevelConfiguration)}>{"Cancel"}</button><button class="primary-action compact" disabled={self.level_configuration_pending || !self.can_edit_timeline || self.level_configuration_name.trim().is_empty()} onclick={ctx.link().callback(|_| Msg::SaveLevelConfiguration)}>{if self.level_configuration_pending { "Saving..." } else { "Save level" }}</button></footer>
+                </aside>
+                <section class="shape-studio-editor">
+                    <div class="studio-section-heading"><span>{"SHAPE EDITOR"}</span><code>{shape.map_or_else(|| "INVALID".to_owned(), |shape| format!("{}x{} / {}", shape.width(), shape.height(), shape.occupied_count()))}</code></div>
+                    <div class="shape-grid studio-shape-grid" aria-label="8 by 8 shape designer">
+                        { for (0_u8..64).map(|index| html! {
+                            <button
+                                key={index}
+                                class={classes!((self.shape_draft_mask & (1_u64 << u32::from(index)) != 0).then_some("active"))}
+                                aria-label={format!("Shape cell {}, {}", index % 8, index / 8)}
+                                onclick={ctx.link().callback(move |_| Msg::ToggleShapeCell(index % 8, index / 8))}
+                            ></button>
+                        }) }
+                    </div>
+                    <p>{"Toggle cells to build one edge-connected footprint."}</p>
+                </section>
+                <aside class="shape-studio-properties">
+                    <div class="studio-section-heading"><span>{"PROPERTIES"}</span></div>
+                    <label class="shape-name"><span>{"Sample name"}</span><input value={self.shape_draft_name.clone()} placeholder="Connected shape" oninput={ctx.link().callback(|event: InputEvent| Msg::ShapeDraftName(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
+                    <div class="shape-save-row">
+                        <button disabled={self.shape_catalog_pending || !self.can_edit_timeline || shape.is_none() || self.shape_draft_name.trim().is_empty()} onclick={ctx.link().callback(|_| Msg::SaveShapeDraft)}>{"Save new"}</button>
+                        <button disabled={self.shape_catalog_pending || !self.can_edit_timeline || self.selected_shape_id.is_none() || shape.is_none()} onclick={ctx.link().callback(|_| Msg::UpdateShapeDraft)}>{"Update"}</button>
+                        <button disabled={self.shape_catalog_pending || !self.can_edit_timeline || self.selected_shape_id.is_none()} onclick={ctx.link().callback(|_| Msg::DeleteShapeDraft)}>{"Delete"}</button>
+                    </div>
+                    <div class="shape-place-row">
+                        <button class={classes!((self.selected_placement_kind == PlacementKind::Block).then_some("active"))} disabled={!can_use_template} onclick={ctx.link().callback(|_| Msg::SetPlacementContext(PlacementKind::Block))}><span class="swatch block"></span>{"Use Block template"}<kbd>{"OPEN"}</kbd></button>
+                        <button class={classes!((self.selected_placement_kind == PlacementKind::Blind).then_some("active"))} disabled={!can_use_template} onclick={ctx.link().callback(|_| Msg::SetPlacementContext(PlacementKind::Blind))}><span class="swatch blind"></span>{"Use Pool template"}<kbd>{"OPEN"}</kbd></button>
+                    </div>
+                </aside>
+            </div>
+        }
+    }
+
+    fn view_image_studio(&self, ctx: &Context<Self>) -> Html {
+        let selected_file = self.image_file.as_ref();
+        let selected_file_label = selected_file
+            .map(|file| format!("{} · {} bytes", file.name(), file.size() as u64))
+            .unwrap_or_else(|| "No image selected".to_owned());
+        let import_disabled = self.image_catalog_pending
+            || !self.can_edit_timeline
+            || selected_file.is_none()
+            || self.image_draft_name.trim().is_empty();
+        html! {
+            <div class="image-studio-layout">
+                <section class="image-studio-import">
+                    <div class="studio-section-heading"><span>{"IMPORT IMAGE"}</span><code>{"SHARED TEMPLATE"}</code></div>
+                    <label class="image-file-picker">
+                        <span>{"Choose image"}</span>
+                        <input ref={self.image_file_input_ref.clone()} type="file" accept="image/png,image/jpeg,image/webp" disabled={self.image_catalog_pending || !self.can_edit_timeline} onchange={ctx.link().callback(|event: Event| {
+                            let input = event.target_unchecked_into::<HtmlInputElement>();
+                            Msg::ImageFileSelected(input.files().and_then(|files| files.get(0)))
+                        })} />
+                    </label>
+                    <p class="image-file-status">{selected_file_label}</p>
+                    <label class="image-template-name"><span>{"Template name"}</span><input value={self.image_draft_name.clone()} placeholder="Portal texture" disabled={self.image_catalog_pending || !self.can_edit_timeline} oninput={ctx.link().callback(|event: InputEvent| Msg::ImageDraftName(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
+                    { self.image_import_error.as_ref().map(|error| html! { <p class="image-import-error">{error}</p> }).unwrap_or_default() }
+                    <button class="primary-action" disabled={import_disabled} onclick={ctx.link().callback(|_| Msg::ImportImage)}>{if self.image_catalog_pending { "Importing..." } else { "Import shared template" }}</button>
+                    <p class="image-studio-note">{"Static PNG, JPEG, and WebP · 512 KiB maximum · up to 1024px per side. Paste a copied image here or choose a file; the server verifies its bytes, dimensions, and digest."}</p>
+                </section>
+                <section class="image-studio-library">
+                    <div class="studio-section-heading"><span>{"PROJECT IMAGE TEMPLATES"}</span><code>{self.image_catalog.len()}</code></div>
+                    { if self.image_catalog_pending && self.image_catalog.is_empty() {
+                        html! { <p class="image-library-empty">{"Loading shared templates..."}</p> }
+                    } else if self.image_catalog.is_empty() {
+                        html! { <p class="image-library-empty">{"No image templates are stored for this project."}</p> }
+                    } else {
+                        html! { <div class="image-catalog">{ for self.image_catalog.iter().map(|image| {
+                            let source = format!("/api/projects/{}/images/{}/content", self.target.project_id, image.id);
+                            html! {
+                                <article key={image.id.clone()} class="image-catalog-card">
+                                    <img src={source} alt={image.name.clone()} loading="lazy" decoding="async" />
+                                    <div><strong>{image.name.clone()}</strong><code>{format!("{} × {}", image.width, image.height)}</code><small>{format!("{} · {} bytes", image.media_type, image.byte_size)}</small></div>
+                                </article>
+                            }
+                        }) }</div> }
+                    } }
+                    <p class="image-studio-note">{"Imported files are immutable shared assets. Pixelation and canvas placement remain disabled until a server-backed derived-image and level-asset command exist."}</p>
                 </section>
             </div>
         }
@@ -2018,11 +2441,11 @@ impl App {
                     { self.view_menu_button(ctx, TopMenu::View, "View") }
                 </nav>
                 <div class="context-switcher" aria-label="Current editing context">
-                    <button class="context-part" title="Switch workspace">
+                    <button class="context-part" title="Browse workspace catalog" onclick={ctx.link().callback(|_| Msg::ShowCatalog)}>
                         <small>{"WORKSPACE"}</small><span>{self.workspace_name.clone()}</span>
                     </button>
                     <span class="context-slash">{"/"}</span>
-                    <button class="context-part" title="Switch project">
+                    <button class="context-part" title="Browse project catalog" onclick={ctx.link().callback(|_| Msg::ShowCatalog)}>
                         <small>{"PROJECT"}</small><span>{self.project_display_name.clone()}</span>
                     </button>
                     <span class="context-slash">{"/"}</span>
@@ -2107,11 +2530,9 @@ impl App {
                     <>
                         <button onclick={ctx.link().callback(|_| Msg::ToggleTheme)}><span>{"Toggle theme"}</span><kbd>{self.theme.active().label()}</kbd></button>
                         <button onclick={ctx.link().callback(|_| Msg::UseProjectTheme)}><span>{"Use project default"}</span><kbd>{self.theme.project_default.label()}</kbd></button>
-                        <button onclick={ctx.link().callback(|_| Msg::SetPanelLayout(SidebarSide::Left, PanelLayout::Docked))}><span>{"Dock tools panel"}</span><kbd>{self.left_panel_layout.label()}</kbd></button>
-                        <button onclick={ctx.link().callback(|_| Msg::SetPanelLayout(SidebarSide::Left, PanelLayout::Floating))}><span>{"Float tools panel"}</span><kbd>{"LEFT"}</kbd></button>
-                        <button onclick={ctx.link().callback(|_| Msg::SetPanelLayout(SidebarSide::Left, PanelLayout::Hidden))}><span>{"Hide tools panel"}</span><kbd>{"LEFT"}</kbd></button>
-                        <button onclick={ctx.link().callback(|_| Msg::SetPanelLayout(SidebarSide::Right, PanelLayout::Docked))}><span>{"Dock inspector panel"}</span><kbd>{self.right_panel_layout.label()}</kbd></button>
-                        <button onclick={ctx.link().callback(|_| Msg::SetPanelLayout(SidebarSide::Right, PanelLayout::Floating))}><span>{"Float inspector panel"}</span><kbd>{"RIGHT"}</kbd></button>
+                        <button onclick={ctx.link().callback(|_| Msg::TogglePanelLayout(SidebarSide::Left))}><span>{format!("{} left sidebar", self.left_panel_layout.toggle_label())}</span><kbd>{self.left_panel_layout.label()}</kbd></button>
+                        <button onclick={ctx.link().callback(|_| Msg::SetPanelLayout(SidebarSide::Left, PanelLayout::Hidden))}><span>{"Hide left sidebar"}</span><kbd>{"LEFT"}</kbd></button>
+                        <button onclick={ctx.link().callback(|_| Msg::TogglePanelLayout(SidebarSide::Right))}><span>{format!("{} inspector panel", self.right_panel_layout.toggle_label())}</span><kbd>{self.right_panel_layout.label()}</kbd></button>
                         <button onclick={ctx.link().callback(|_| Msg::SetPanelLayout(SidebarSide::Right, PanelLayout::Hidden))}><span>{"Hide inspector panel"}</span><kbd>{"RIGHT"}</kbd></button>
                     </>
                 },
@@ -2120,46 +2541,57 @@ impl App {
         html! { <div class={classes!("top-menu-popover", class)}>{body}</div> }
     }
 
-    fn view_mode_selector(&self, ctx: &Context<Self>) -> Html {
+    fn view_primary_toolbox(&self, ctx: &Context<Self>) -> Html {
+        let placing = self.mode == Mode::Select && self.workspace_tool == WorkspaceTool::Place;
+        let mapping = self.mode == Mode::Map;
         html! {
-            <div class="mode-selector">
-                <span class="selector-label">{"MODE"}</span>
-                <nav class="mode-tabs" aria-label="Editor modes">
-                    { html! { for mode in Mode::ALL {
-                        <button
-                            key={mode.label()}
-                            class={classes!((self.mode == mode).then_some("active"), mode.is_parity_gated().then_some("gated"))}
-                            aria-pressed={(self.mode == mode).to_string()}
-                            title={mode.description()}
-                            onclick={ctx.link().callback(move |_| Msg::SetMode(mode))}
-                        ><span class="selector-icon">{mode_icon(mode)}</span><span>{mode.label()}</span><kbd>{mode.key()}</kbd></button>
-                    } } }
-                </nav>
-            </div>
+            <nav class="canvas-toolbox primary-canvas-tools" aria-label="Primary editor tools">
+                <button class={classes!(placing.then_some("active"))} aria-pressed={placing.to_string()} onclick={ctx.link().callback(|_| Msg::SetMode(Mode::Select))}>{ui_icon(UiIcon::PlaceEntity, 15)}<span>{"Place Entity"}</span></button>
+                <button class={classes!(mapping.then_some("active"))} aria-pressed={mapping.to_string()} onclick={ctx.link().callback(|_| Msg::SetMode(Mode::Map))}>{ui_icon(UiIcon::MapDesign, 15)}<span>{"Map Design"}</span></button>
+                <button title="Open Shape Studio" onclick={ctx.link().callback(|_| Msg::OpenStudio(StudioModal::Shape))}>{ui_icon(UiIcon::ShapeTemplates, 15)}<span>{"Shape Studio"}</span></button>
+                <button title="Open Image Studio" onclick={ctx.link().callback(|_| Msg::OpenStudio(StudioModal::Image))}>{ui_icon(UiIcon::ImageStudio, 15)}<span>{"Image Studio"}</span></button>
+            </nav>
         }
     }
 
     fn view_left_sidebar(&self, ctx: &Context<Self>) -> Html {
+        let tabs = [
+            LeftTab::ShapeTemplates,
+            LeftTab::Blame,
+            LeftTab::Explorer,
+            LeftTab::Comments,
+            LeftTab::Collaboration,
+        ];
+        let toggle_layout_label = self.left_panel_layout.toggle_label();
+        let toggle_layout_icon = if self.left_panel_layout == PanelLayout::Docked {
+            UiIcon::Float
+        } else {
+            UiIcon::DockLeft
+        };
         html! {
             <aside class={classes!("left-sidebar", "panel", (self.left_panel_layout == PanelLayout::Floating).then_some("panel-floating"))}>
-                <div class="panel-tabs left-tabs">
-                    <button
-                        class={classes!((self.left_tab == LeftTab::Tool).then_some("active"))}
-                        title="Current selected tool behavior"
-                        onclick={ctx.link().callback(|_| Msg::SetLeftTab(LeftTab::Tool))}
-                    >{"Tool behavior"}</button>
-                    <button
-                        class={classes!((self.left_tab == LeftTab::Templates).then_some("active"))}
-                        title="Template entities"
-                        onclick={ctx.link().callback(|_| Msg::SetLeftTab(LeftTab::Templates))}
-                    >{"Entity templates"}</button>
-                    <div class="panel-layout-actions"><button title="Dock panel" onclick={ctx.link().callback(|_| Msg::SetPanelLayout(SidebarSide::Left, PanelLayout::Docked))}>{"D"}</button><button title="Float panel" onclick={ctx.link().callback(|_| Msg::SetPanelLayout(SidebarSide::Left, PanelLayout::Floating))}>{"F"}</button><button title="Hide panel" onclick={ctx.link().callback(|_| Msg::SetPanelLayout(SidebarSide::Left, PanelLayout::Hidden))}>{"x"}</button></div>
+                <div class="panel-tabs left-tabs compact-tab-bar">
+                    { for tabs.into_iter().map(|tab| {
+                        let active = self.left_tab == tab;
+                        html! {
+                            <button
+                                class={classes!("sidebar-tab", active.then_some("active"))}
+                                title={tab.label()}
+                                aria-pressed={active.to_string()}
+                                onclick={ctx.link().callback(move |_| Msg::SetLeftTab(tab))}
+                            ><span class="sidebar-tab-icon">{ui_icon(tab.icon(), 14)}</span><span class="sidebar-tab-label">{tab.label()}</span></button>
+                        }
+                    }) }
+                    <div class="panel-layout-actions"><button aria-label={format!("{} left sidebar", toggle_layout_label)} title={format!("{} left sidebar", toggle_layout_label)} onclick={ctx.link().callback(|_| Msg::TogglePanelLayout(SidebarSide::Left))}>{ui_icon(toggle_layout_icon, 12)}</button><button aria-label="Hide left sidebar" title="Hide left sidebar" onclick={ctx.link().callback(|_| Msg::SetPanelLayout(SidebarSide::Left, PanelLayout::Hidden))}>{ui_icon(UiIcon::HideLeft, 12)}</button></div>
                 </div>
                 <div class="left-panel-content">
                     {
                         match self.left_tab {
-                            LeftTab::Tool => self.view_tool_behavior(ctx),
-                            LeftTab::Templates => self.view_shape_designer(ctx),
+                            LeftTab::ShapeTemplates => self.view_shape_template_library(ctx),
+                            LeftTab::Blame => self.view_blame_panel(self.blame_for_selection()),
+                            LeftTab::Explorer => self.view_project_explorer(ctx),
+                            LeftTab::Comments => self.view_comments_panel(),
+                            LeftTab::Collaboration => self.view_collaboration_session(),
                         }
                     }
                 </div>
@@ -2167,121 +2599,85 @@ impl App {
         }
     }
 
-    fn view_tool_behavior(&self, ctx: &Context<Self>) -> Html {
-        let sync_blocked = !matches!(self.rpc_state, RpcState::Online);
+    fn view_project_explorer(&self, ctx: &Context<Self>) -> Html {
+        let snapshot = self.model.timeline().snapshot();
+        html! {
+            <div class="explorer-content">
+                <div class="panel-heading"><div><small>{"CURRENT LEVEL"}</small><strong>{self.level_display_name.clone()}</strong></div><span class="panel-code">{format!("{} ENT", snapshot.entities().len())}</span></div>
+                <section class="explorer-section explorer-projects">
+                    <div class="section-title"><span>{"PROJECTS"}</span><code>{self.projects.len()}</code></div>
+                    <div class="explorer-tree">
+                        { for self.projects.iter().map(|project| {
+                            let levels = self.catalog_levels.get(&project.id).cloned().unwrap_or_default();
+                            let current_project = self.target.project_id.as_str() == project.id;
+                            html! {
+                                <div class="explorer-project">
+                                    <div class={classes!("explorer-entity", current_project.then_some("active"))}>
+                                        <span class="tree-icon">{"P"}</span><span><strong>{project.name.clone()}</strong><small>{format!("{} levels", levels.len())}</small></span>
+                                    </div>
+                                    <div class="explorer-levels">{ for levels.iter().map(|level| {
+                                        let project = project.clone();
+                                        let level_message = level.clone();
+                                        let current_level = self.target.level_id.as_str() == level.id;
+                                        html! { <button class={classes!("explorer-level", current_level.then_some("active"))} onclick={ctx.link().callback(move |_| Msg::OpenCatalogLevel(project.clone(), level_message.clone()))}><span>{"L"}</span><span>{level.name.clone()}</span></button> }
+                                    }) }</div>
+                                </div>
+                            }
+                        }) }
+                        { if self.projects.is_empty() { html! { <div class="empty-selection"><span>{"NO PROJECTS"}</span><p>{"Open the catalog to load a workspace project tree."}</p></div> } } else { Html::default() } }
+                    </div>
+                </section>
+                <section class="explorer-section">
+                    <div class="section-title"><span>{"ENTITIES"}</span><code>{snapshot.entities().len()}</code></div>
+                    <div class="explorer-tree">
+                        { for snapshot.entities().iter().map(|entity| {
+                            let entity_id = entity.id().clone();
+                            let selected = matches!(&self.selection, Some(Selection::Entities(ids)) if ids.contains(entity.id()));
+                            let kind = match entity.kind() {
+                                PlaceableEntityKind::Block(_) => "Sand Block",
+                                PlaceableEntityKind::Blind(_) => "Sand Pool",
+                            };
+                            html! {
+                                <button class={classes!("explorer-entity", selected.then_some("active"))} onclick={ctx.link().callback(move |_| Msg::FocusExplorerEntity(entity_id.clone()))}>
+                                    <span class="tree-icon">{if matches!(entity.kind(), PlaceableEntityKind::Block(_)) { "B" } else { "P" }}</span>
+                                    <span><strong>{kind}</strong><small>{format!("{} / {:02}:{:02}", entity.id(), entity.origin().x, entity.origin().y)}</small></span>
+                                </button>
+                            }
+                        }) }
+                        { if snapshot.entities().is_empty() { html! { <div class="empty-selection"><span>{"NO ENTITIES"}</span><p>{"Place a Sand Block or Sand Pool to populate this level."}</p></div> } } else { Html::default() } }
+                    </div>
+                </section>
+            </div>
+        }
+    }
+
+    fn view_comments_panel(&self) -> Html {
+        html! {
+            <div class="empty-selection panel-placeholder">
+                <span>{"COMMENTS"}</span>
+                <p>{"Comment threads need their own server-backed model. This tab is reserved so the editor shell can host them without overloading audit history."}</p>
+            </div>
+        }
+    }
+
+    fn view_collaboration_session(&self) -> Html {
         html! {
             <>
-                <div class="panel-heading">
-                    <div><small>{format!("{} MODE", self.mode.label().to_ascii_uppercase())}</small><strong>{self.workspace_tool.label()}</strong></div>
-                    <span class="panel-code">{"T-01"}</span>
-                </div>
-                <section class={classes!("inspector-section", "mode-summary", self.mode.is_parity_gated().then_some("parity-gated"))}>
-                    <span class="section-rule"></span>
-                    <p>{self.workspace_tool.description()}</p>
+                { self.view_activity_feed() }
+                <section class="collaborators">
+                    <div class="section-title"><span>{"PRESENCE"}</span><code>{format!("{} ACTORS / {} TABS", self.presence.actor_count(), self.presence.participant_count())}</code></div>
+                    <div class="collaborator-list">
+                        { for self.presence.participants().map(|participant| html! {
+                            <article class="collaborator" key={participant.id.as_str().to_owned()}>
+                                <span class="presence" style={format!("background:{}", presence_color(participant.actor.as_str()))}>{actor_mark(participant.actor.as_str())}</span>
+                                <div><strong>{participant.actor.to_string()}</strong><small>{if self.presence.is_self(&participant.id) { "This tab" } else if participant.cursor.is_some() { "Editing canvas" } else { "Viewing level" }}</small></div>
+                                <code>{participant.cursor.map(|point| format!("{:02}:{:02}", point.x, point.y)).unwrap_or_else(|| "--:--".to_owned())}</code>
+                            </article>
+                        }) }
+                        { if self.presence.participant_count() == 0 { html! { <div class="presence-unavailable"><strong>{"Connecting roster"}</strong><small>{"Presence appears after the collaboration stream is ready."}</small></div> } } else { Html::default() } }
+                    </div>
                 </section>
-                {
-                    match self.workspace_tool {
-                        WorkspaceTool::Place => self.view_place_tool(ctx, sync_blocked),
-                        WorkspaceTool::Transform => self.view_transform_tool(ctx, sync_blocked),
-                        WorkspaceTool::Decorate => self.selected_entity().filter(|entity| matches!(entity.kind(), PlaceableEntityKind::Block(_))).map_or_else(
-                            || html! { <section class="inspector-section"><div class="empty-selection"><span>{"NO BLOCK SELECTED"}</span><p>{"Select one Block to edit its decorators."}</p></div></section> },
-                            |entity| self.view_decorator_controls(ctx, entity, sync_blocked),
-                        ),
-                        WorkspaceTool::Cells => self.view_cell_tool(ctx, sync_blocked),
-                        WorkspaceTool::Resize => self.view_resize_tool(ctx, sync_blocked),
-                        WorkspaceTool::Paint | WorkspaceTool::Fill => self.selected_entity().filter(|entity| entity.as_blind().is_some()).map_or_else(
-                            || html! { <section class="inspector-section"><div class="empty-selection"><span>{"NO POOL SELECTED"}</span><p>{"Select one Pool before editing its pixel canvas."}</p></div></section> },
-                            |entity| self.view_blind_brush_controls(ctx, entity, sync_blocked),
-                        ),
-                        WorkspaceTool::SandboxMove => html! {
-                            <section class="inspector-section"><div class="empty-selection"><span>{"PARITY GATED"}</span><p>{"Sandbox movement is visible as a mode target but has no browser command yet."}</p></div></section>
-                        },
-                    }
-                }
             </>
-        }
-    }
-
-    fn view_place_tool(&self, ctx: &Context<Self>, sync_blocked: bool) -> Html {
-        let template_disabled =
-            self.mode != Mode::Select || !self.can_edit_timeline || sync_blocked;
-        let shape = Shape::new(1, 1, 1).expect("single-cell template is valid");
-        html! {
-            <section class="inspector-section">
-                <h2>{"Drag template onto canvas"}</h2>
-                <div class="entity-command-row placement-row template-row">
-                    <button disabled={template_disabled} draggable={(!template_disabled).to_string()} ondragstart={template_drag_callback(ctx, PlacementKind::Block, shape)} ondragend={ctx.link().callback(|_| Msg::EndPlacementDrag)}><span class="swatch block"></span>{"Block"}<kbd>{"DRAG"}</kbd></button>
-                    <button disabled={template_disabled} draggable={(!template_disabled).to_string()} ondragstart={template_drag_callback(ctx, PlacementKind::Blind, shape)} ondragend={ctx.link().callback(|_| Msg::EndPlacementDrag)}><span class="swatch blind"></span>{"Pool"}<kbd>{"DRAG"}</kbd></button>
-                </div>
-                <p class="inspector-note">{"Drop on an unoccupied floor cell. Each drop creates one entity and one undoable event."}</p>
-            </section>
-        }
-    }
-
-    fn view_transform_tool(&self, ctx: &Context<Self>, sync_blocked: bool) -> Html {
-        let entity_ids = self.selected_entity_ids();
-        let edit_disabled = entity_ids.is_empty()
-            || !self.can_edit_timeline
-            || sync_blocked
-            || entity_ids
-                .iter()
-                .any(|entity_id| self.pending_entities.contains_key(entity_id));
-        html! {
-            <section class="inspector-section">
-                <h2>{if entity_ids.len() > 1 { "Group transform" } else { "Entity transform" }}</h2>
-                <div class="entity-move-grid">
-                    <span></span>
-                    <button disabled={edit_disabled} title="Move one cell up" onclick={ctx.link().callback(|_| Msg::EditEntity(EntityAction::Move(MoveDirection::Up)))}>{"Y-"}</button>
-                    <span></span>
-                    <button disabled={edit_disabled} title="Move one cell left" onclick={ctx.link().callback(|_| Msg::EditEntity(EntityAction::Move(MoveDirection::Left)))}>{"X-"}</button>
-                    <button disabled={edit_disabled} title="Move one cell down" onclick={ctx.link().callback(|_| Msg::EditEntity(EntityAction::Move(MoveDirection::Down)))}>{"Y+"}</button>
-                    <button disabled={edit_disabled} title="Move one cell right" onclick={ctx.link().callback(|_| Msg::EditEntity(EntityAction::Move(MoveDirection::Right)))}>{"X+"}</button>
-                </div>
-                <div class="entity-command-row">
-                    <button disabled={edit_disabled || entity_ids.len() != 1} onclick={ctx.link().callback(|_| Msg::EditEntity(EntityAction::RotateClockwise))}>{"Rotate CW"}</button>
-                    <button disabled={edit_disabled || entity_ids.len() != 1} onclick={ctx.link().callback(|_| Msg::EditEntity(EntityAction::FlipHorizontal))}>{"Flip H"}</button>
-                </div>
-                <button class="entity-delete" disabled={edit_disabled || entity_ids.len() != 1} onclick={ctx.link().callback(|_| Msg::EditEntity(EntityAction::Delete))}>{"Delete entity"}</button>
-                <p class="inspector-note">{"Shift-click forms an ordered group. Drag or use arrows to commit one atomic move."}</p>
-            </section>
-        }
-    }
-
-    fn view_cell_tool(&self, ctx: &Context<Self>, sync_blocked: bool) -> Html {
-        let selected_cell = self.selected_cell();
-        let selected_kind = selected_cell.and_then(|point| self.effective_cell(point));
-        let disabled = selected_cell.is_none() || !self.can_edit_timeline || sync_blocked;
-        html! {
-            <section class="inspector-section">
-                <h2>{"Cell material"}</h2>
-                <div class="segmented-control">
-                    <button class={classes!((selected_kind == Some(CellKind::Floor)).then_some("active"))} disabled={disabled} onclick={ctx.link().callback(|_| Msg::SetSelectedKind(CellKind::Floor))}><span class="swatch floor"></span>{"Floor"}</button>
-                    <button class={classes!((selected_kind == Some(CellKind::Wall)).then_some("active"))} disabled={disabled} onclick={ctx.link().callback(|_| Msg::SetSelectedKind(CellKind::Wall))}><span class="swatch wall"></span>{"Wall"}</button>
-                </div>
-                <p class="inspector-note">{"Drag across the canvas to paint the toggled material."}</p>
-            </section>
-        }
-    }
-
-    fn view_resize_tool(&self, ctx: &Context<Self>, sync_blocked: bool) -> Html {
-        html! {
-            <section class="inspector-section resize-controls">
-                <h2>{"Map dimensions"}</h2>
-                <div class="resize-dimensions">
-                    <label><span>{"Width"}</span><input type="number" min="1" max="256" value={self.resize_width.clone()} oninput={ctx.link().callback(|event: InputEvent| Msg::ResizeWidth(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
-                    <label><span>{"Height"}</span><input type="number" min="1" max="256" value={self.resize_height.clone()} oninput={ctx.link().callback(|event: InputEvent| Msg::ResizeHeight(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
-                </div>
-                <div class="resize-anchor-grid" aria-label="Resize anchor">
-                    { for [
-                        GridAnchor::TopLeft, GridAnchor::Top, GridAnchor::TopRight,
-                        GridAnchor::Left, GridAnchor::Center, GridAnchor::Right,
-                        GridAnchor::BottomLeft, GridAnchor::Bottom, GridAnchor::BottomRight,
-                    ].into_iter().map(|anchor| html! {
-                        <button class={classes!((self.resize_anchor == anchor).then_some("active"))} title={grid_anchor_label(anchor)} onclick={ctx.link().callback(move |_| Msg::SetResizeAnchor(anchor))}></button>
-                    }) }
-                </div>
-                <button class="resize-apply" disabled={!self.can_edit_timeline || sync_blocked || self.pending_grid.is_some()} onclick={ctx.link().callback(|_| Msg::ResizeGrid)}>{"Resize without clipping"}</button>
-            </section>
         }
     }
 
@@ -2291,180 +2687,399 @@ impl App {
         let selected_entity = self.selected_entity();
         let selected_entity_count = self.selected_entity_ids().len();
         let size = self.model.timeline().snapshot().size();
+        let current_target = selection_status(self.selection.as_ref());
+        let compact_target = inspector_target_status(self.selection.as_ref());
+        let selection_collapsed = self.inspector_section_is_collapsed(InspectorSection::Selection);
+        let entity_data_collapsed =
+            self.inspector_section_is_collapsed(InspectorSection::EntityData);
+        let capacity_collapsed = self.inspector_section_is_collapsed(InspectorSection::Capacity);
         html! {
             <div class="activity-content inspector-content">
                 <div class="panel-heading compact-heading">
-                    <div><small>{"CURRENT TARGET"}</small><strong>{selection_status(self.selection.as_ref())}</strong></div>
+                    <div><small>{"CURRENT TARGET"}</small><strong class="current-target-label" title={current_target}>{compact_target}</strong></div>
                     <span class="panel-code">{"I-01"}</span>
                 </div>
                 <section class="inspector-section">
-                    <h2>{"Selection"}</h2>
+                    { self.view_inspector_section_header(ctx, InspectorSection::Selection, "Selection") }
                     {
-                        if selected_entity_count > 1 {
+                        if !selection_collapsed {
                             html! {
-                                <div class="property-table">
-                                    <div><span>{"Target"}</span><strong>{"Entity group"}</strong></div>
-                                    <div><span>{"Count"}</span><strong>{selected_entity_count}</strong></div>
-                                    <div><span>{"Order"}</span><code>{self.selected_entity_ids().iter().map(ToString::to_string).collect::<Vec<_>>().join(" -> ")}</code></div>
-                                </div>
-                            }
-                        } else if let Some(entity) = selected_entity {
-                            let shape = entity.shape();
-                            html! {
-                                <div class="property-table">
-                                    <div><span>{"Target"}</span><strong>{"Placeable entity"}</strong></div>
-                                    <div><span>{"ID"}</span><code title={entity.id().to_string()}>{entity.id().to_string()}</code></div>
-                                    <div><span>{"Kind"}</span><strong>{entity_kind_label(entity.kind())}</strong></div>
-                                    <div><span>{"Origin"}</span><code>{format!("x{:02} / y{:02}", entity.origin().x, entity.origin().y)}</code></div>
-                                    <div><span>{"Shape"}</span><code>{format!("{} x {} / {} cells", shape.width(), shape.height(), shape.occupied_count())}</code></div>
-                                </div>
-                            }
-                        } else if let Some(point) = selected_cell {
-                            html! {
-                                <div class="property-table">
-                                    <div><span>{"Target"}</span><strong>{"Logical cell"}</strong></div>
-                                    <div><span>{"Coordinate"}</span><code>{format!("x{:02} / y{:02}", point.x, point.y)}</code></div>
-                                    <div><span>{"Kind"}</span><strong>{cell_kind_label(selected_kind.unwrap_or(CellKind::Floor))}</strong></div>
-                                    <div><span>{"Index"}</span><code>{format!("{:03}", point.x + point.y * size.width())}</code></div>
+                                <div id={InspectorSection::Selection.content_id()} class="inspector-section-body">
+                                    {
+                                        if selected_entity_count > 1 {
+                                            let selected_ids = self.selected_entity_ids();
+                                            let snapshot = self.model.timeline().snapshot();
+                                            let selected_entities = selected_ids.iter().filter_map(|entity_id| snapshot.entity(entity_id)).collect::<Vec<_>>();
+                                            let all_blocks = !selected_entities.is_empty() && selected_entities.iter().all(|entity| matches!(entity.kind(), PlaceableEntityKind::Block(_)));
+                                            let all_pools = !selected_entities.is_empty() && selected_entities.iter().all(|entity| matches!(entity.kind(), PlaceableEntityKind::Blind(_)));
+                                            if all_blocks || all_pools {
+                                                let group_kind = if all_blocks { "Sand Blocks" } else { "Sand Pools" };
+                                                let common_origin = selected_entities.first().and_then(|first| {
+                                                    selected_entities.iter().all(|entity| entity.origin() == first.origin()).then_some(first.origin())
+                                                });
+                                                let common_shape = selected_entities.first().and_then(|first| {
+                                                    selected_entities.iter().all(|entity| entity.shape() == first.shape()).then_some(first.shape())
+                                                });
+                                                html! {
+                                                    <>
+                                                        <div class="property-table multi-selection-properties">
+                                                            <div><span>{"Target"}</span><strong>{format!("{} selected", group_kind)}</strong></div>
+                                                            <div><span>{"Count"}</span><strong>{selected_entity_count}</strong></div>
+                                                            <div><span>{"Origin"}</span><code>{common_origin.map_or_else(|| "<different>".to_owned(), |origin| format!("x{:02} / y{:02}", origin.x, origin.y))}</code></div>
+                                                            <div><span>{"Shape"}</span><code>{common_shape.map_or_else(|| "<different>".to_owned(), |shape| format!("{} x {} / {} cells", shape.width(), shape.height(), shape.occupied_count()))}</code></div>
+                                                            <div><span>{"Bulk edit"}</span><strong>{if all_blocks { "Capacity layers" } else { "Transform tool" }}</strong></div>
+                                                        </div>
+                                                        <div class="entity-command-row inspector-selection-actions">
+                                                            <button disabled={!self.can_edit_timeline || !matches!(self.rpc_state, RpcState::Online) || selected_ids.iter().any(|entity_id| self.pending_entities.contains_key(entity_id))} onclick={ctx.link().callback(|_| Msg::EditEntity(EntityAction::RotateClockwise))}>{"Rotate CW"}</button>
+                                                            <button disabled={!self.can_edit_timeline || !matches!(self.rpc_state, RpcState::Online) || selected_ids.iter().any(|entity_id| self.pending_entities.contains_key(entity_id))} onclick={ctx.link().callback(|_| Msg::EditEntity(EntityAction::FlipHorizontal))}>{"Flip H"}</button>
+                                                            <button class="entity-delete" disabled={!self.can_edit_timeline || !matches!(self.rpc_state, RpcState::Online) || selected_ids.iter().any(|entity_id| self.pending_entities.contains_key(entity_id))} onclick={ctx.link().callback(|_| Msg::EditEntity(EntityAction::Delete))}>{"Delete"}</button>
+                                                        </div>
+                                                    </>
+                                                }
+                                            } else {
+                                                html! { <div class="empty-selection inspector-mixed-selection"><span>{"Multiple Type of Entity Selected"}</span><p>{"Select only Sand Blocks or only Sand Pools to inspect shared properties."}</p></div> }
+                                            }
+                                        } else if let Some(entity) = selected_entity {
+                                            let shape = entity.shape();
+                                            let entity_action_disabled = !self.can_edit_timeline
+                                                || !matches!(self.rpc_state, RpcState::Online)
+                                                || self.pending_entities.contains_key(entity.id());
+                                            html! {
+                                                <>
+                                                <div class="property-table">
+                                                    <div><span>{"Target"}</span><strong>{"Placeable entity"}</strong></div>
+                                                    <div><span>{"ID"}</span><code title={entity.id().to_string()}>{truncate_entity_id(entity.id())}</code></div>
+                                                    <div><span>{"Kind"}</span><strong>{entity_kind_label(entity.kind())}</strong></div>
+                                                    <div><span>{"Origin"}</span><code>{format!("x{:02} / y{:02}", entity.origin().x, entity.origin().y)}</code></div>
+                                                    <div><span>{"Shape"}</span><code>{format!("{} x {} / {} cells", shape.width(), shape.height(), shape.occupied_count())}</code></div>
+                                                </div>
+                                                <div class="entity-command-row inspector-selection-actions">
+                                                    <button disabled={entity_action_disabled} onclick={ctx.link().callback(|_| Msg::EditEntity(EntityAction::RotateClockwise))}>{"Rotate CW"}</button>
+                                                    <button disabled={entity_action_disabled} onclick={ctx.link().callback(|_| Msg::EditEntity(EntityAction::FlipHorizontal))}>{"Flip H"}</button>
+                                                    <button class="entity-delete" disabled={entity_action_disabled} onclick={ctx.link().callback(|_| Msg::EditEntity(EntityAction::Delete))}>{"Delete"}</button>
+                                                </div>
+                                                </>
+                                            }
+                                        } else if let Some(point) = selected_cell {
+                                            html! {
+                                                <div class="property-table">
+                                                    <div><span>{"Target"}</span><strong>{"Logical cell"}</strong></div>
+                                                    <div><span>{"Coordinate"}</span><code>{format!("x{:02} / y{:02}", point.x, point.y)}</code></div>
+                                                    <div><span>{"Kind"}</span><strong>{cell_kind_label(selected_kind.unwrap_or(CellKind::Floor))}</strong></div>
+                                                    <div><span>{"Index"}</span><code>{format!("{:03}", point.x + point.y * size.width())}</code></div>
+                                                </div>
+                                            }
+                                        } else {
+                                            html! { <div class="empty-selection"><span>{"NO TARGET"}</span><p>{"Select a cell or entity footprint on the canvas."}</p></div> }
+                                        }
+                                    }
                                 </div>
                             }
                         } else {
-                            html! { <div class="empty-selection"><span>{"NO TARGET"}</span><p>{"Select a cell or entity footprint on the canvas."}</p></div> }
+                            Html::default()
                         }
                     }
                 </section>
-                { selected_entity.map(view_entity_kind_details).unwrap_or_default() }
-                { self.view_pool_resolution(ctx, selected_entity) }
+                {
+                    selected_entity.map(|entity| view_entity_kind_details(
+                        entity,
+                        entity_data_collapsed,
+                        self.view_inspector_section_header(ctx, InspectorSection::EntityData, "Entity data"),
+                    )).or_else(|| self.view_multi_entity_kind_details(ctx, entity_data_collapsed)).unwrap_or_default()
+                }
+                { self.view_block_capacity(ctx, capacity_collapsed) }
+                { selected_entity.map(|entity| match entity.kind() {
+                    PlaceableEntityKind::Block(_) => self.view_block_decorator_controls(ctx, entity, !matches!(self.rpc_state, RpcState::Online)),
+                    PlaceableEntityKind::Blind(_) => self.view_blind_decorator_controls(ctx, entity, !matches!(self.rpc_state, RpcState::Online)),
+                }).unwrap_or_default() }
+                { self.view_pool_resolution(ctx) }
+            </div>
+        }
+    }
+
+    fn view_multi_entity_kind_details(&self, ctx: &Context<Self>, collapsed: bool) -> Option<Html> {
+        let entities = self.selected_entities();
+        let first = *entities.first()?;
+        if entities.len() < 2
+            || !entities.iter().all(|entity| {
+                std::mem::discriminant(entity.kind()) == std::mem::discriminant(first.kind())
+            })
+        {
+            return None;
+        }
+        let shapes_match = entities
+            .iter()
+            .all(|entity| entity.shape() == first.shape());
+        let origin_match = entities
+            .iter()
+            .all(|entity| entity.origin() == first.origin());
+        let shape = shapes_match.then_some(first.shape()).map_or_else(
+            || "<different>".to_owned(),
+            |shape| {
+                format!(
+                    "{} x {} / {} cells",
+                    shape.width(),
+                    shape.height(),
+                    shape.occupied_count()
+                )
+            },
+        );
+        let origin = origin_match.then_some(first.origin()).map_or_else(
+            || "<different>".to_owned(),
+            |origin| format!("x{:02} / y{:02}", origin.x, origin.y),
+        );
+        let kind = entity_kind_label(first.kind());
+        Some(html! {
+            <section class="inspector-section">
+                { self.view_inspector_section_header(ctx, InspectorSection::EntityData, "Entity data") }
+                {
+                    if !collapsed {
+                        html! {
+                            <div id={InspectorSection::EntityData.content_id()} class="inspector-section-body">
+                                <div class="property-table">
+                                    <div><span>{"Kind"}</span><strong>{kind}</strong></div>
+                                    <div><span>{"Selected"}</span><strong>{entities.len()}</strong></div>
+                                    <div><span>{"Origin"}</span><code>{origin}</code></div>
+                                    <div><span>{"Shape"}</span><code>{shape}</code></div>
+                                </div>
+                            </div>
+                        }
+                    } else {
+                        Html::default()
+                    }
+                }
+            </section>
+        })
+    }
+
+    fn view_block_capacity(&self, ctx: &Context<Self>, collapsed: bool) -> Html {
+        let entities = self.selected_entities();
+        if entities.is_empty()
+            || !entities
+                .iter()
+                .all(|entity| matches!(entity.kind(), PlaceableEntityKind::Block(_)))
+        {
+            return Html::default();
+        }
+        let blocks = entities
+            .iter()
+            .filter_map(|entity| match entity.kind() {
+                PlaceableEntityKind::Block(block) => Some(block),
+                PlaceableEntityKind::Blind(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let max_layer_count = blocks
+            .iter()
+            .map(|block| block.collect_layers().len())
+            .max()
+            .unwrap_or(0);
+        let single_selection = entities.len() == 1;
+        let disabled = !self.can_edit_timeline
+            || !matches!(self.rpc_state, RpcState::Online)
+            || self
+                .selected_entity_ids()
+                .iter()
+                .any(|entity_id| self.pending_entities.contains_key(entity_id));
+        html! {
+            <section class="inspector-section capacity-section">
+                { self.view_inspector_section_header(ctx, InspectorSection::Capacity, "Capacity") }
+                {
+                    if !collapsed {
+                        html! {
+                            <div id={InspectorSection::Capacity.content_id()} class="inspector-section-body capacity-section-body">
+                                {
+                                    if !single_selection && blocks.iter().any(|block| block.collect_layers().len() != max_layer_count) {
+                                        html! { <p class="inspector-note">{"<different> layer counts. A capacity can be batch-edited only where every selected Block has that layer."}</p> }
+                                    } else if !single_selection {
+                                        html! { <p class="inspector-note">{"<different> means selected Blocks disagree. Enter a value to apply it to every selected Block."}</p> }
+                                    } else {
+                                        Html::default()
+                                    }
+                                }
+                                <div class="capacity-layer-list">
+                                    { for (0..max_layer_count).map(|layer_index| {
+                                        let layers = blocks.iter().map(|block| block.collect_layers().get(layer_index)).collect::<Vec<_>>();
+                                        let all_have_layer = layers.iter().all(Option::is_some);
+                                        let first_layer = layers.first().and_then(|layer| *layer);
+                                        let capacity = first_layer.and_then(|layer| {
+                                            all_have_layer.then_some(layer.capacity())
+                                        }).filter(|capacity| layers.iter().all(|layer| layer.is_some_and(|item| item.capacity() == *capacity)));
+                                        let color = first_layer.map(|layer| layer.color_index()).filter(|color| layers.iter().all(|layer| layer.is_some_and(|item| item.color_index() == *color)));
+                                        let radius = first_layer.map(|layer| layer.radius()).filter(|radius| layers.iter().all(|layer| layer.is_some_and(|item| item.radius() == *radius)));
+                                        let locked = first_layer.map(|layer| layer.is_locked()).filter(|locked| layers.iter().all(|layer| layer.is_some_and(|item| item.is_locked() == *locked)));
+                                        let capacity_value = capacity.map_or_else(|| "<different>".to_owned(), collect_capacity_label);
+                                        let color_value = color.map_or_else(|| "<different>".to_owned(), |color| format!("Color {color}"));
+                                        let radius_value = radius.map_or_else(|| "<different>".to_owned(), |radius| radius.map_or_else(|| "Default radius".to_owned(), |radius| format!("Radius {radius}")));
+                                        let locked_value = locked.map_or_else(|| "<different>".to_owned(), |locked| if locked { "Locked".to_owned() } else { "Unlocked".to_owned() });
+                                        html! {
+                                            <div class="capacity-layer" key={layer_index}>
+                                                <div class="capacity-layer-heading"><strong>{format!("Layer {}", layer_index + 1)}</strong>{if single_selection { html! { <button class="layer-remove" disabled={disabled} onclick={ctx.link().callback(move |_| Msg::RemoveBlockCollectLayer(layer_index))}>{"Remove"}</button> } } else { Html::default() }}</div>
+                                                <div class="capacity-layer-meta"><span>{color_value}</span><span>{radius_value}</span><span>{locked_value}</span></div>
+                                                <label><span>{"Capacity"}</span><input type="text" value={capacity_value} disabled={disabled || !all_have_layer} title={if all_have_layer { "Enter a number or unlimited" } else { "Every selected Block must have this layer" }} onchange={ctx.link().callback(move |event: Event| Msg::SetBlockLayerCapacity(layer_index, event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
+                                            </div>
+                                        }
+                                    }) }
+                                </div>
+                                {
+                                    if single_selection {
+                                        html! { <button class="capacity-add-layer" disabled={disabled} onclick={ctx.link().callback(|_| Msg::AddBlockCollectLayer)}>{"Add capacity layer"}</button> }
+                                    } else {
+                                        Html::default()
+                                    }
+                                }
+                            </div>
+                        }
+                    } else {
+                        Html::default()
+                    }
+                }
+            </section>
+        }
+    }
+
+    fn view_level_structure(&self, ctx: &Context<Self>) -> Html {
+        let snapshot = self.model.timeline().snapshot();
+        let size = snapshot.size();
+        html! {
+            <div class="activity-content level-structure-content">
+                <div class="panel-heading compact-heading">
+                    <div><small>{"LEVEL"}</small><strong>{self.level_display_name.clone()}</strong></div>
+                    <span class="panel-code">{"L-01"}</span>
+                </div>
                 <section class="inspector-section scene-tree">
                     <h2>{"Level structure"}</h2>
                     <button class="tree-row expanded"><span>{"v"}</span><strong>{self.level_display_name.clone()}</strong><code>{"ROOT"}</code></button>
                     <button class="tree-row child active"><span>{"#"}</span><strong>{"Logical map"}</strong><code>{format!("{}x{}", size.width(), size.height())}</code></button>
-                    <button class="tree-row child"><span>{"E"}</span><strong>{"Core placeables"}</strong><code>{self.model.timeline().snapshot().entities().len()}</code></button>
+                    <button class="tree-row child"><span>{"E"}</span><strong>{"Core placeables"}</strong><code>{snapshot.entities().len()}</code></button>
                 </section>
-                <section class="inspector-section project-theme">
-                    <h2>{"Theme source"}</h2>
-                    <div class="theme-source-line">
-                        <span class="source-dot"></span>
-                        <div><strong>{self.theme.active().label()}</strong><small>{if self.theme.user_override.is_some() { "User override" } else { "Project default" }}</small></div>
-                        <button onclick={ctx.link().callback(|_| Msg::UseProjectTheme)}>{"Reset"}</button>
+                <section class="inspector-section resize-controls">
+                    <h2>{"Map dimensions"}</h2>
+                    <div class="resize-dimensions">
+                        <label><span>{"Width"}</span><input type="number" min="1" max="256" value={self.resize_width.clone()} oninput={ctx.link().callback(|event: InputEvent| Msg::ResizeWidth(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
+                        <label><span>{"Height"}</span><input type="number" min="1" max="256" value={self.resize_height.clone()} oninput={ctx.link().callback(|event: InputEvent| Msg::ResizeHeight(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
                     </div>
+                    <div class="resize-anchor-grid" aria-label="Resize anchor">
+                        { for [
+                            GridAnchor::TopLeft, GridAnchor::Top, GridAnchor::TopRight,
+                            GridAnchor::Left, GridAnchor::Center, GridAnchor::Right,
+                            GridAnchor::BottomLeft, GridAnchor::Bottom, GridAnchor::BottomRight,
+                        ].into_iter().map(|anchor| html! {
+                            <button class={classes!((self.resize_anchor == anchor).then_some("active"))} title={grid_anchor_label(anchor)} onclick={ctx.link().callback(move |_| Msg::SetResizeAnchor(anchor))}></button>
+                        }) }
+                    </div>
+                    <button class="resize-apply" disabled={!self.can_edit_timeline || !matches!(self.rpc_state, RpcState::Online) || self.pending_grid.is_some()} onclick={ctx.link().callback(|_| Msg::ResizeGrid)}>{"Resize without clipping"}</button>
                 </section>
             </div>
         }
     }
 
-    fn view_pool_resolution(
-        &self,
-        ctx: &Context<Self>,
-        selected_entity: Option<&PlaceableEntity>,
-    ) -> Html {
-        let Some(entity) = selected_entity else {
+    fn view_pool_resolution(&self, ctx: &Context<Self>) -> Html {
+        let entities = self.selected_entities();
+        if entities.is_empty() || entities.iter().any(|entity| entity.as_blind().is_none()) {
             return Html::default();
-        };
-        let Some(blind) = entity.as_blind() else {
-            return Html::default();
-        };
+        }
+        let first_resolution = entities
+            .first()
+            .and_then(|entity| entity.as_blind())
+            .map(|blind| blind.pixels_per_cell())
+            .expect("a non-empty Pool selection has a resolution");
+        let resolution = entities
+            .iter()
+            .all(|entity| {
+                entity
+                    .as_blind()
+                    .is_some_and(|blind| blind.pixels_per_cell() == first_resolution)
+            })
+            .then_some(first_resolution)
+            .map_or_else(|| "<different>".to_owned(), |value| value.to_string());
         let disabled = !self.can_edit_timeline
             || !matches!(self.rpc_state, RpcState::Online)
-            || self.pending_entities.contains_key(entity.id());
+            || self
+                .selected_entity_ids()
+                .iter()
+                .any(|entity_id| self.pending_entities.contains_key(entity_id));
+        let collapsed = self.inspector_section_is_collapsed(InspectorSection::PoolResolution);
         html! {
             <section class="inspector-section pool-resolution">
-                <h2>{"Pool resolution"}</h2>
-                <label><span>{"Pixels per cell"}</span><input type="number" min="1" max="32" value={blind.pixels_per_cell().to_string()} disabled={disabled} onchange={ctx.link().callback(|event: Event| {
-                    let value = event.target_unchecked_into::<HtmlInputElement>().value().parse().unwrap_or(0);
-                    Msg::SetPoolResolution(value)
-                })} /></label>
-                <small>{"Changing resolution resamples paint to nearest pixel center and is undoable."}</small>
+                { self.view_inspector_section_header(ctx, InspectorSection::PoolResolution, "Pool resolution") }
+                {
+                    if !collapsed {
+                        html! {
+                            <div id={InspectorSection::PoolResolution.content_id()} class="inspector-section-body">
+                                <label><span>{"Pixels per cell"}</span><input type="text" value={resolution} disabled={disabled} title={"Enter 1–32; this applies to every selected Pool"} onchange={ctx.link().callback(|event: Event| {
+                                    let value = event.target_unchecked_into::<HtmlInputElement>().value().parse().unwrap_or(0);
+                                    Msg::SetPoolResolution(value)
+                                })} /></label>
+                                <small>{if entities.len() > 1 { "<different> means selected Pools disagree. Changing resolution applies it to every selected Pool." } else { "Changing resolution resamples paint to nearest pixel center and is undoable." }}</small>
+                            </div>
+                        }
+                    } else {
+                        Html::default()
+                    }
+                }
             </section>
         }
     }
 
-    fn view_shape_designer(&self, ctx: &Context<Self>) -> Html {
-        let shape = shape_from_designer_mask(self.shape_draft_mask).ok();
+    fn view_shape_template_library(&self, ctx: &Context<Self>) -> Html {
+        let grid_view = self.shape_template_view == ShapeTemplateView::Grid;
         let can_drag = self.mode == Mode::Select
             && self.can_edit_timeline
-            && matches!(self.rpc_state, RpcState::Online)
-            && shape.is_some();
+            && matches!(self.rpc_state, RpcState::Online);
+        let placement_kind = self.selected_placement_kind;
         html! {
-            <section class="inspector-section shape-designer">
-                <div class="shape-designer-heading"><h2>{"Shape designer"}</h2><code>{shape.map_or_else(|| "INVALID".to_owned(), |shape| format!("{}x{} / {}", shape.width(), shape.height(), shape.occupied_count()))}</code></div>
-                <div class="shape-grid" aria-label="8 by 8 shape designer">
-                    { html! { for index in 0_u8..64 {
-                        <button
-                            key={index}
-                            class={classes!((self.shape_draft_mask & (1_u64 << u32::from(index)) != 0).then_some("active"))}
-                            aria-label={format!("Shape cell {}, {}", index % 8, index / 8)}
-                            onclick={ctx.link().callback(move |_| Msg::ToggleShapeCell(index % 8, index / 8))}
-                        ></button>
-                    } } }
-                </div>
-                <label class="shape-name"><span>{"Sample name"}</span><input value={self.shape_draft_name.clone()} placeholder="Connected shape" oninput={ctx.link().callback(|event: InputEvent| Msg::ShapeDraftName(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
-                <div class="shape-save-row">
-                    <button disabled={self.shape_catalog_pending || !self.can_edit_timeline || shape.is_none() || self.shape_draft_name.trim().is_empty()} onclick={ctx.link().callback(|_| Msg::SaveShapeDraft)}>{"Save new"}</button>
-                    <button disabled={self.shape_catalog_pending || !self.can_edit_timeline || self.selected_shape_id.is_none() || shape.is_none()} onclick={ctx.link().callback(|_| Msg::UpdateShapeDraft)}>{"Update"}</button>
-                    <button disabled={self.shape_catalog_pending || !self.can_edit_timeline || self.selected_shape_id.is_none()} onclick={ctx.link().callback(|_| Msg::DeleteShapeDraft)}>{"Delete"}</button>
-                    <button onclick={ctx.link().callback(|_| Msg::NewShapeDraft)}>{"New"}</button>
-                </div>
-                <div class="shape-catalog">
-                    { if self.shape_catalog_pending && self.shape_catalog.is_empty() {
-                        html! { <span>{"Loading project shapes..."}</span> }
+            <section class="shape-template-library" aria-label="Project shape templates">
+                <header class="shape-template-library-heading">
+                    <div><small>{"PROJECT SHAPES"}</small><strong>{format!("{} templates", self.shape_catalog.len())}</strong></div>
+                    <div class="shape-template-view-switcher" aria-label="Shape template view">
+                        <button class={classes!(grid_view.then_some("active"))} aria-pressed={grid_view.to_string()} onclick={ctx.link().callback(|_| Msg::SetShapeTemplateView(ShapeTemplateView::Grid))}>{"Grid"}</button>
+                        <button class={classes!((!grid_view).then_some("active"))} aria-pressed={(!grid_view).to_string()} onclick={ctx.link().callback(|_| Msg::SetShapeTemplateView(ShapeTemplateView::List))}>{"List"}</button>
+                    </div>
+                </header>
+                {
+                    if self.shape_catalog_pending && self.shape_catalog.is_empty() {
+                        html! { <p class="shape-template-empty">{"Loading project shapes..."}</p> }
                     } else if self.shape_catalog.is_empty() {
-                        html! { <span>{"No project shapes saved."}</span> }
-                    } else {
-                        html! { for sample in &self.shape_catalog {
-                            <button class={classes!((self.selected_shape_id.as_ref() == Some(&sample.id)).then_some("active"))} title={format!("{} x {}", sample.shape.width, sample.shape.height)} onclick={{ let id = sample.id.clone(); ctx.link().callback(move |_| Msg::SelectShape(id.clone())) }}><strong>{&sample.name}</strong><code>{format!("{}x{}", sample.shape.width, sample.shape.height)}</code></button>
-                        } }
-                    } }
-                </div>
-                <div class="shape-place-row">
-                    <button disabled={!can_drag} draggable={can_drag.to_string()} ondragstart={template_drag_callback(ctx, PlacementKind::Block, shape.unwrap_or_else(|| Shape::new(1, 1, 1).expect("fallback shape is valid")))} ondragend={ctx.link().callback(|_| Msg::EndPlacementDrag)}><span class="swatch block"></span>{"Block"}<kbd>{"DRAG"}</kbd></button>
-                    <button disabled={!can_drag} draggable={can_drag.to_string()} ondragstart={template_drag_callback(ctx, PlacementKind::Blind, shape.unwrap_or_else(|| Shape::new(1, 1, 1).expect("fallback shape is valid")))} ondragend={ctx.link().callback(|_| Msg::EndPlacementDrag)}><span class="swatch blind"></span>{"Pool"}<kbd>{"DRAG"}</kbd></button>
-                </div>
-                <p class="inspector-note">{"Toggle cells, keep the footprint edge-connected, then save it for the project or drag either template onto the canvas."}</p>
-            </section>
-        }
-    }
-
-    fn view_blind_brush_controls(
-        &self,
-        ctx: &Context<Self>,
-        entity: &PlaceableEntity,
-        sync_blocked: bool,
-    ) -> Html {
-        if self.mode != Mode::Brush || entity.as_blind().is_none() {
-            return Html::default();
-        }
-        let disabled = !self.can_edit_timeline
-            || sync_blocked
-            || self.blind_gesture.is_some()
-            || self.pending_entities.contains_key(entity.id());
-        html! {
-            <section class="inspector-section blind-brush-controls">
-                <h2>{if self.blind_brush_tool == BlindBrushTool::Paint { "Pool paint color" } else { "Pool fill color" }}</h2>
-                <div class="brush-color-grid" aria-label="Pool paint color">
-                    { for (1_u8..=10).map(|color_index| {
-                        let style = format!("--brush-color: {}", blind_color(color_index));
+                        html! { <p class="shape-template-empty">{"No project shapes saved."}</p> }
+                    } else if grid_view {
                         html! {
-                            <button
-                                key={color_index}
-                                class={classes!((self.blind_color_index == color_index).then_some("active"))}
-                                style={style}
-                                title={format!("Color {color_index}")}
-                                aria-label={format!("Color {color_index}")}
-                                aria-pressed={(self.blind_color_index == color_index).to_string()}
-                                disabled={disabled}
-                                onclick={ctx.link().callback(move |_| Msg::SetBlindColor(color_index))}
-                            ><span></span><kbd>{if color_index == 10 { "0".to_owned() } else { color_index.to_string() }}</kbd></button>
+                            <div class="shape-template-grid" role="list">
+                                { for self.shape_catalog.iter().map(|sample| {
+                                    let shape = Shape::new(sample.shape.width, sample.shape.height, sample.shape.occupied_mask);
+                                    let draggable = can_drag && shape.is_ok();
+                                    let drag_shape = shape.unwrap_or_else(|_| Shape::new(1, 1, 1).expect("fallback shape is valid"));
+                                    html! {
+                                        <article key={sample.id.clone()} class="shape-template-card grid" role="listitem" title={sample.name.clone()} aria-label={format!("{} — {} by {} shape", sample.name, sample.shape.width, sample.shape.height)} draggable={draggable.to_string()} ondragstart={template_drag_callback(ctx, placement_kind, drag_shape)} ondragend={ctx.link().callback(|_| Msg::EndPlacementDrag)}>
+                                            { shape_template_thumbnail(sample) }
+                                        </article>
+                                    }
+                                }) }
+                            </div>
                         }
-                    }) }
-                </div>
-                <button class={classes!("blind-isolation", (self.isolated_blind.as_ref() == Some(entity.id())).then_some("active"))} disabled={self.blind_gesture.is_some()} onclick={ctx.link().callback(|_| Msg::ToggleBlindIsolation)}>{if self.isolated_blind.as_ref() == Some(entity.id()) { "Exit isolation" } else { "Isolate Pool canvas" }}</button>
-                <p class="inspector-note">{if self.blind_brush_tool == BlindBrushTool::Paint { "LMB paints and Shift+LMB drags erase. Right or middle drag pans the board." } else { "LMB fills one connected empty region. Right or middle drag pans the board." }}</p>
+                    } else {
+                        html! {
+                            <div class="shape-template-list" role="list">
+                                { for self.shape_catalog.iter().map(|sample| {
+                                    let shape = Shape::new(sample.shape.width, sample.shape.height, sample.shape.occupied_mask);
+                                    let draggable = can_drag && shape.is_ok();
+                                    let drag_shape = shape.unwrap_or_else(|_| Shape::new(1, 1, 1).expect("fallback shape is valid"));
+                                    html! {
+                                        <article key={sample.id.clone()} class="shape-template-card list" role="listitem" draggable={draggable.to_string()} ondragstart={template_drag_callback(ctx, placement_kind, drag_shape)} ondragend={ctx.link().callback(|_| Msg::EndPlacementDrag)}>
+                                            { shape_template_thumbnail(sample) }
+                                            <div><strong>{sample.name.clone()}</strong><small>{format!("{} × {} · {} cells", sample.shape.width, sample.shape.height, shape_occupied_count(sample))}</small></div>
+                                        </article>
+                                    }
+                                }) }
+                            </div>
+                        }
+                    }
+                }
+                <p class="shape-template-note">{format!("Browse-only library. Drag a template onto the canvas as the current {} placement; create and edit shapes in Shape Studio.", placement_kind.label().to_ascii_lowercase())}</p>
             </section>
         }
     }
 
-    fn view_decorator_controls(
+    fn view_block_decorator_controls(
         &self,
         ctx: &Context<Self>,
         entity: &PlaceableEntity,
@@ -2490,9 +3105,14 @@ impl App {
             DecoratorKind::KeyLocker { key, .. } => Some(key.to_string()),
             _ => None,
         });
+        let collapsed = self.inspector_section_is_collapsed(InspectorSection::Decorators);
         html! {
             <section class="inspector-section decorator-controls">
-                <h2>{"Decorators"}</h2>
+                { self.view_inspector_section_header(ctx, InspectorSection::Decorators, "Decorators") }
+                {
+                    if !collapsed {
+                        html! {
+                            <div id={InspectorSection::Decorators.content_id()} class="inspector-section-body">
                 <div class="decorator-row">
                     <div><strong>{"Ice"}</strong><small>{if ice_count == 0 { "disabled".to_owned() } else { format!("blocks {ice_count}") }}</small></div>
                     <button class={classes!((ice_count > 0).then_some("active"))} disabled={disabled} onclick={ctx.link().callback(|_| Msg::EditDecorator(DecoratorAction::ToggleIce))}>{if ice_count > 0 { "On" } else { "Off" }}<kbd>{"I"}</kbd></button>
@@ -2515,6 +3135,53 @@ impl App {
                 </div>
                 <button class={classes!("key-locker-action", pending_assignment.then_some("active"))} disabled={disabled} onclick={ctx.link().callback(|_| Msg::EditDecorator(DecoratorAction::BeginKeyLocker))}>{if pending_assignment { "Cancel assignment" } else if outgoing.is_some() { "Reassign locker" } else { "Assign locker" }}</button>
                 { if pending_assignment { html! { <p class="inspector-note assignment-prompt">{"Click a different available Block on the canvas. Invalid targets keep assignment active."}</p> } } else { Html::default() } }
+                            </div>
+                        }
+                    } else {
+                        Html::default()
+                    }
+                }
+            </section>
+        }
+    }
+
+    fn view_blind_decorator_controls(
+        &self,
+        ctx: &Context<Self>,
+        entity: &PlaceableEntity,
+        sync_blocked: bool,
+    ) -> Html {
+        if self.mode != Mode::Select || entity.as_blind().is_none() {
+            return Html::default();
+        }
+        let glass_count = self
+            .model
+            .timeline()
+            .snapshot()
+            .glass_blocking_count(entity.id());
+        let disabled = !self.can_edit_timeline
+            || sync_blocked
+            || self.pending_entities.contains_key(entity.id());
+        let collapsed = self.inspector_section_is_collapsed(InspectorSection::Decorators);
+        html! {
+            <section class="inspector-section decorator-controls">
+                { self.view_inspector_section_header(ctx, InspectorSection::Decorators, "Pool decorators") }
+                {
+                    if !collapsed {
+                        html! {
+                            <div id={InspectorSection::Decorators.content_id()} class="inspector-section-body">
+                                <div class="decorator-row">
+                                    <div><strong>{"Glass"}</strong><small>{if glass_count == 0 { "disabled".to_owned() } else { format!("blocks {glass_count}") }}</small></div>
+                                    <button class={classes!((glass_count > 0).then_some("active"))} disabled={disabled} onclick={ctx.link().callback(|_| Msg::EditDecorator(DecoratorAction::ToggleGlass))}>{if glass_count > 0 { "On" } else { "Off" }}<kbd>{"G"}</kbd></button>
+                                </div>
+                                <label class="decorator-count"><span>{"Blocking count"}</span><input type="number" min="0" value={glass_count.to_string()} disabled={disabled} onchange={ctx.link().callback(|event: Event| Msg::SetGlassCount(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
+                                <p class="inspector-note">{"Glass is saved on this Pool and does not alter Sandbox simulation."}</p>
+                            </div>
+                        }
+                    } else {
+                        Html::default()
+                    }
+                }
             </section>
         }
     }
@@ -2530,21 +3197,26 @@ impl App {
         };
         html! {
             <main class="workbench">
-                <div class="canvas-toolbar">
-                    { self.view_mode_selector(ctx) }
-                    <div class="viewport-tools">
-                        <button class="tool-button" title="Zoom out" onclick={ctx.link().callback(|_| Msg::ZoomOut)}>{"-"}</button>
-                        <button class="tool-button" title="Frame the full grid" onclick={ctx.link().callback(|_| Msg::FrameGrid)}>{"Frame"}</button>
-                        <button class="tool-button" title="Zoom in" onclick={ctx.link().callback(|_| Msg::ZoomIn)}>{"+"}</button>
-                    </div>
-                    <div class="canvas-readout">
-                        <span><i class={classes!("status-dot", if matches!(self.rpc_state, RpcState::Online) { "online" } else { "local" })}></i>{connection_label}</span>
-                        <code>{format!("{} EV", self.activity_events().len())}</code>
-                        <code>{format!("{} PENDING", self.pending_commands.len())}</code>
-                        <span>{format!("{:.0}%", self.viewport.scale * 100.0)}</span>
-                    </div>
-                </div>
                 <div class="canvas-stage">
+                    <div class="canvas-primary-tool-dock">
+                        { self.view_primary_toolbox(ctx) }
+                    </div>
+                    <div class="canvas-secondary-tool-dock">
+                        { self.view_tool_selector(ctx) }
+                        <div class="canvas-viewport-controls" aria-label="Level zoom controls">
+                            <div class="viewport-tools">
+                                <button class="tool-button" aria-label="Zoom out" title="Zoom out" onclick={ctx.link().callback(|_| Msg::ZoomOut)}>{ui_icon(UiIcon::ZoomOut, 14)}</button>
+                                <button class="tool-button" aria-label="Frame the full grid" title="Frame the full grid" onclick={ctx.link().callback(|_| Msg::FrameGrid)}>{ui_icon(UiIcon::Frame, 14)}</button>
+                                <button class="tool-button" aria-label="Zoom in" title="Zoom in" onclick={ctx.link().callback(|_| Msg::ZoomIn)}>{ui_icon(UiIcon::ZoomIn, 14)}</button>
+                            </div>
+                            <div class="canvas-readout">
+                                <span><i class={classes!("status-dot", if matches!(self.rpc_state, RpcState::Online) { "online" } else { "local" })}></i>{connection_label}</span>
+                                <code>{format!("{} EV", self.activity_events().len())}</code>
+                                <code>{format!("{} PENDING", self.pending_commands.len())}</code>
+                                <span>{format!("{:.0}%", self.viewport.scale * 100.0)}</span>
+                            </div>
+                        </div>
+                    </div>
                     <div class="axis-label axis-y">{"Y / ROW"}</div>
                     <canvas
                         ref={self.canvas_ref.clone()}
@@ -2572,28 +3244,28 @@ impl App {
                     }
                     { self.view_blame_popover(ctx, blame) }
                 </div>
-                { self.view_tool_selector(ctx) }
             </main>
         }
     }
 
     fn view_tool_selector(&self, ctx: &Context<Self>) -> Html {
-        html! {
-            <div class="workspace-tool-selector">
-                <span class="selector-label">{"TOOL"}</span>
-                <nav class="workspace-tool-tabs" aria-label={format!("{} mode tools", self.mode.label())}>
-                    { for WorkspaceTool::for_mode(self.mode).iter().copied().map(|tool| html! {
-                        <button
-                            class={classes!((self.workspace_tool == tool).then_some("active"))}
-                            aria-pressed={(self.workspace_tool == tool).to_string()}
-                            title={tool.description()}
-                            onclick={ctx.link().callback(move |_| Msg::SetWorkspaceTool(tool))}
-                        ><span class="selector-icon">{tool.icon()}</span><span>{tool.label()}</span><kbd>{tool.key()}</kbd></button>
-                    }) }
+        if self.mode == Mode::Map {
+            let drawing_walls = self.workspace_tool == WorkspaceTool::Cells
+                && self.map_paint_kind == Some(CellKind::Wall);
+            let clearing_walls = self.workspace_tool == WorkspaceTool::Cells
+                && self.map_paint_kind == Some(CellKind::Floor);
+            let resizing = self.workspace_tool == WorkspaceTool::Resize;
+            return html! {
+                <nav class="canvas-toolbox contextual-canvas-tools" aria-label="Map Design context tools">
+                    <button class={classes!(drawing_walls.then_some("active"))} aria-pressed={drawing_walls.to_string()} onclick={ctx.link().callback(|_| Msg::SetMapPaintKind(CellKind::Wall))}>{ui_icon(UiIcon::DrawWall, 14)}<span>{"Draw Wall"}</span></button>
+                    <button class={classes!(clearing_walls.then_some("active"))} aria-pressed={clearing_walls.to_string()} onclick={ctx.link().callback(|_| Msg::SetMapPaintKind(CellKind::Floor))}>{ui_icon(UiIcon::ClearWall, 14)}<span>{"Clear Wall"}</span></button>
+                    <button class={classes!(resizing.then_some("active"))} aria-pressed={resizing.to_string()} onclick={ctx.link().callback(|_| Msg::SetWorkspaceTool(WorkspaceTool::Resize))}>{ui_icon(UiIcon::Resize, 14)}<span>{"Resize"}</span></button>
+                    <button disabled=true title="Requires an atomic trim command">{ui_icon(UiIcon::MapDesign, 14)}<span>{"Strip Map"}</span></button>
+                    <button disabled=true title="Requires an atomic clear command">{ui_icon(UiIcon::ClearWall, 14)}<span>{"Clear All"}</span></button>
                 </nav>
-                <div class="tool-context-readout"><code>{format!("{} x {}", self.model.timeline().snapshot().size().width(), self.model.timeline().snapshot().size().height())}</code><span>{format!("{:.0}%", self.viewport.scale * 100.0)}</span></div>
-            </div>
+            };
         }
+        Html::default()
     }
 
     fn view_blame_popover(&self, ctx: &Context<Self>, blame: Option<BlameEntry>) -> Html {
@@ -2655,46 +3327,42 @@ impl App {
     }
 
     fn view_right_sidebar(&self, ctx: &Context<Self>) -> Html {
-        let selected_blame = self.blame_for_selection();
+        let tabs = [
+            RightTab::Inspector,
+            RightTab::LevelStructure,
+            RightTab::LevelConfiguration,
+        ];
+        let toggle_layout_label = self.right_panel_layout.toggle_label();
+        let toggle_layout_icon = if self.right_panel_layout == PanelLayout::Docked {
+            UiIcon::Float
+        } else {
+            UiIcon::DockRight
+        };
         html! {
-            <aside class={classes!("right-sidebar", "panel", (self.right_tab == RightTab::Activity).then_some("with-presence"), (self.right_panel_layout == PanelLayout::Floating).then_some("panel-floating"))}>
-                <div class="panel-tabs">
-                    <button
-                        class={if self.right_tab == RightTab::Inspector { "active" } else { "" }}
-                        onclick={ctx.link().callback(|_| Msg::SetRightTab(RightTab::Inspector))}
-                    >{"Inspector"}</button>
-                    <button
-                        class={if self.right_tab == RightTab::Activity { "active" } else { "" }}
-                        onclick={ctx.link().callback(|_| Msg::SetRightTab(RightTab::Activity))}
-                    >{"Activity"}</button>
-                    <button
-                        class={if self.right_tab == RightTab::Blame { "active" } else { "" }}
-                        onclick={ctx.link().callback(|_| Msg::SetRightTab(RightTab::Blame))}
-                    >{"Blame"}</button>
-                    <div class="panel-layout-actions"><button title="Dock panel" onclick={ctx.link().callback(|_| Msg::SetPanelLayout(SidebarSide::Right, PanelLayout::Docked))}>{"D"}</button><button title="Float panel" onclick={ctx.link().callback(|_| Msg::SetPanelLayout(SidebarSide::Right, PanelLayout::Floating))}>{"F"}</button><button title="Hide panel" onclick={ctx.link().callback(|_| Msg::SetPanelLayout(SidebarSide::Right, PanelLayout::Hidden))}>{"x"}</button></div>
+            <aside class={classes!("right-sidebar", "panel", (self.right_panel_layout == PanelLayout::Floating).then_some("panel-floating"))}>
+                <div class="panel-tabs compact-tab-bar">
+                    { for tabs.into_iter().map(|tab| {
+                        let active = self.right_tab == tab;
+                        html! {
+                            <button
+                                class={classes!("sidebar-tab", active.then_some("active"))}
+                                title={tab.label()}
+                                aria-pressed={active.to_string()}
+                                onclick={ctx.link().callback(move |_| Msg::SetRightTab(tab))}
+                            ><span class="sidebar-tab-icon">{ui_icon(tab.icon(), 14)}</span><span class="sidebar-tab-label">{tab.label()}</span></button>
+                        }
+                    }) }
+                    <div class="panel-layout-actions"><button aria-label={format!("{} inspector panel", toggle_layout_label)} title={format!("{} inspector panel", toggle_layout_label)} onclick={ctx.link().callback(|_| Msg::TogglePanelLayout(SidebarSide::Right))}>{ui_icon(toggle_layout_icon, 12)}</button><button aria-label="Hide panel" title="Hide panel" onclick={ctx.link().callback(|_| Msg::SetPanelLayout(SidebarSide::Right, PanelLayout::Hidden))}>{ui_icon(UiIcon::HideRight, 12)}</button></div>
                 </div>
-                {
-                    match self.right_tab {
-                        RightTab::Inspector => self.view_selection_inspector(ctx),
-                        RightTab::Activity => self.view_activity_feed(),
-                        RightTab::Blame => self.view_blame_panel(selected_blame),
+                <div class="right-panel-content">
+                    {
+                        match self.right_tab {
+                            RightTab::Inspector => self.view_selection_inspector(ctx),
+                            RightTab::LevelStructure => self.view_level_structure(ctx),
+                            RightTab::LevelConfiguration => self.view_level_configuration_panel(ctx),
+                        }
                     }
-                }
-                { if self.right_tab == RightTab::Activity { html! {
-                    <section class="collaborators">
-                        <div class="section-title"><span>{"PRESENCE"}</span><code>{format!("{} ACTORS / {} TABS", self.presence.actor_count(), self.presence.participant_count())}</code></div>
-                        <div class="collaborator-list">
-                            { for self.presence.participants().map(|participant| html! {
-                                <article class="collaborator" key={participant.id.as_str().to_owned()}>
-                                    <span class="presence" style={format!("background:{}", presence_color(participant.actor.as_str()))}>{actor_mark(participant.actor.as_str())}</span>
-                                    <div><strong>{participant.actor.to_string()}</strong><small>{if self.presence.is_self(&participant.id) { "This tab" } else if participant.cursor.is_some() { "Editing canvas" } else { "Viewing level" }}</small></div>
-                                    <code>{participant.cursor.map(|point| format!("{:02}:{:02}", point.x, point.y)).unwrap_or_else(|| "--:--".to_owned())}</code>
-                                </article>
-                            }) }
-                            { if self.presence.participant_count() == 0 { html! { <div class="presence-unavailable"><strong>{"Connecting roster"}</strong><small>{"Presence appears after the collaboration stream is ready."}</small></div> } } else { Html::default() } }
-                        </div>
-                    </section>
-                } } else { Html::default() } }
+                </div>
             </aside>
         }
     }
@@ -2766,7 +3434,7 @@ impl App {
         }
     }
 
-    fn view_status(&self) -> Html {
+    fn view_status(&self, ctx: &Context<Self>) -> Html {
         let local_hash = self.model.timeline().snapshot().content_hash().to_string();
         let hash = if matches!(self.rpc_state, RpcState::Online | RpcState::Resyncing) {
             self.server_hash.as_deref().unwrap_or(&local_hash)
@@ -2784,6 +3452,11 @@ impl App {
             .as_ref()
             .map(RpcClient::endpoint)
             .unwrap_or("ws(s)://host/rpc");
+        let theme_source = if self.theme.user_override.is_some() {
+            "User override"
+        } else {
+            "Project default"
+        };
         html! {
             <footer class="statusbar">
                 <span class="status-primary"><i class={classes!("status-dot", if matches!(self.rpc_state, RpcState::Online) { "online" } else { "local" })}></i>{rpc_label}</span>
@@ -2793,6 +3466,12 @@ impl App {
                 <span>{self.server_sequence.map(|sequence| if matches!(self.rpc_state, RpcState::Online | RpcState::Resyncing) { format!("SEQ #{sequence:04}") } else { format!("LAST #{sequence:04}") }).unwrap_or_else(|| "SEQ LOCAL".to_owned())}</span>
                 <span class="status-hash">{format!("HASH {}", &hash[..12.min(hash.len())])}</span>
                 <span title={self.model.actor().to_string()}>{format!("ACTOR {}", actor_mark(self.model.actor().as_str()))}</span>
+                <span class="status-theme-source" title={format!("{} theme / {}", self.theme.active().label(), theme_source)}>
+                    <i class="source-dot"></i>
+                    <span>{format!("THEME {}", self.theme.active().label().to_ascii_uppercase())}</span>
+                    <small>{theme_source}</small>
+                    { if self.theme.user_override.is_some() { html! { <button onclick={ctx.link().callback(|_| Msg::UseProjectTheme)}>{"Reset"}</button> } } else { Html::default() } }
+                </span>
                 <span class="status-spacer"></span>
                 <span>{"Q/W/B/P modes"}</span>
                 <span>{"Z/X/C tools"}</span>
@@ -2903,6 +3582,7 @@ impl App {
     fn enter_catalog(&mut self, ctx: &Context<Self>, user: UserSummary) {
         self.invalidate_rpc();
         self.selected_workspace_id = user.personal_workspace_id.clone();
+        self.inspector_collapsed = load_inspector_collapsed_sections(&user.id);
         self.user = Some(user);
         self.phase = Phase::Catalog;
         self.workspaces.clear();
@@ -2980,6 +3660,11 @@ impl App {
         self.shape_draft_name.clear();
         self.shape_draft_mask = 1;
         self.shape_catalog_pending = true;
+        self.image_catalog.clear();
+        self.image_catalog_pending = false;
+        self.image_draft_name.clear();
+        self.image_file = None;
+        self.image_import_error = None;
         self.server_events.clear();
         self.remote_blame.clear();
         self.remote_entity_blame.clear();
@@ -2999,6 +3684,112 @@ impl App {
                 result: RestClient.list_shape_catalog(&project_id).await,
             });
         });
+        self.load_image_catalog(ctx);
+    }
+
+    fn load_image_catalog(&mut self, ctx: &Context<Self>) {
+        if self.phase != Phase::Editor
+            || self.image_catalog_pending
+            || self.target.project_id.as_str().is_empty()
+        {
+            return;
+        }
+        self.image_catalog_pending = true;
+        let project_id = self.target.project_id.to_string();
+        let request_project_id = project_id.clone();
+        let link = ctx.link().clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            link.send_message(Msg::ImageCatalogLoaded {
+                project_id: request_project_id,
+                result: RestClient.list_image_catalog(&project_id).await,
+            });
+        });
+    }
+
+    fn select_pasted_image(&mut self, event: ClipboardEvent) -> bool {
+        if self.studio_modal != Some(StudioModal::Image)
+            || self.image_catalog_pending
+            || !self.can_edit_timeline
+            || event_target_is_text_entry(event.target())
+        {
+            return false;
+        }
+        let Some(file) = event
+            .clipboard_data()
+            .and_then(|clipboard| clipboard.files())
+            .and_then(|files| {
+                (0..files.length())
+                    .filter_map(|index| files.get(index))
+                    .find(|file| supported_image_media_type(file).is_some())
+            })
+        else {
+            return false;
+        };
+        event.prevent_default();
+        self.select_image_file(Some(file))
+    }
+
+    fn select_image_file(&mut self, file: Option<File>) -> bool {
+        let Some(file) = file else {
+            return false;
+        };
+        const MAX_UPLOAD_BYTES: f64 = 512.0 * 1024.0;
+        if supported_image_media_type(&file).is_none() {
+            self.image_file = None;
+            self.image_import_error = Some("Choose a PNG, JPEG, or WebP image.".to_owned());
+            return true;
+        }
+        if file.size() > MAX_UPLOAD_BYTES {
+            self.image_file = None;
+            self.image_import_error = Some("Image files must be 512 KiB or smaller.".to_owned());
+            return true;
+        }
+        let file_name = file.name();
+        self.image_draft_name = file_name
+            .rsplit_once('.')
+            .map_or(file_name.as_str(), |(stem, _)| stem)
+            .trim()
+            .to_owned();
+        if self.image_draft_name.is_empty() {
+            self.image_draft_name = "Imported image".to_owned();
+        }
+        self.image_file = Some(file);
+        self.image_import_error = None;
+        true
+    }
+
+    fn import_image(&mut self, ctx: &Context<Self>) -> bool {
+        if self.image_catalog_pending || !self.can_edit_timeline {
+            return false;
+        }
+        let Some(file) = self.image_file.clone() else {
+            self.image_import_error = Some("Choose an image first.".to_owned());
+            return true;
+        };
+        let Some(media_type) = supported_image_media_type(&file) else {
+            self.image_file = None;
+            self.image_import_error = Some("Choose a PNG, JPEG, or WebP image.".to_owned());
+            return true;
+        };
+        let name = self.image_draft_name.trim().to_owned();
+        if name.is_empty() {
+            self.image_import_error = Some("Give the shared template a name.".to_owned());
+            return true;
+        }
+        self.image_catalog_pending = true;
+        self.image_import_error = None;
+        let project_id = self.target.project_id.to_string();
+        let request_project_id = project_id.clone();
+        let link = ctx.link().clone();
+        wasm_bindgen_futures::spawn_local(async move {
+            link.send_message(Msg::ImageImported {
+                project_id: request_project_id,
+                result: RestClient
+                    .upload_image(&project_id, &name, file, media_type)
+                    .await,
+            });
+        });
+        true
     }
 
     fn accept_level_configuration(&mut self, configuration: LevelConfiguration) {
@@ -3085,6 +3876,7 @@ impl App {
         self.level_duration_seconds = 0.0;
         self.level_configuration_open = false;
         self.can_edit_timeline = false;
+        self.inspector_collapsed.clear();
         self.auth_password.clear();
     }
 
@@ -3127,7 +3919,6 @@ impl App {
         }
         self.mode = mode;
         self.workspace_tool = WorkspaceTool::default_for(mode);
-        self.left_tab = LeftTab::Tool;
         self.blind_brush_tool = BlindBrushTool::Paint;
         self.drag_kind = None;
         self.last_drag = None;
@@ -3172,6 +3963,64 @@ impl App {
         }
         self.canvas_dirty = true;
         true
+    }
+
+    fn select_and_focus_inspector(&mut self, selection: Selection) {
+        self.selection = Some(selection);
+        self.right_tab = RightTab::Inspector;
+    }
+
+    fn select_entities_and_focus_inspector(&mut self, entity_ids: Vec<EntityId>) {
+        self.select_and_focus_inspector(Selection::Entities(entity_ids));
+    }
+
+    fn set_panel_layout(&mut self, side: SidebarSide, layout: PanelLayout) -> bool {
+        let current = match side {
+            SidebarSide::Left => &mut self.left_panel_layout,
+            SidebarSide::Right => &mut self.right_panel_layout,
+        };
+        if *current == layout {
+            return false;
+        }
+        *current = layout;
+        self.sidebar_resize = None;
+        self.canvas_dirty = true;
+        true
+    }
+
+    fn inspector_section_is_collapsed(&self, section: InspectorSection) -> bool {
+        self.inspector_collapsed.contains(&section)
+    }
+
+    fn toggle_inspector_section(&mut self, section: InspectorSection) -> bool {
+        if !self.inspector_collapsed.insert(section) {
+            self.inspector_collapsed.remove(&section);
+        }
+        if let Some(user) = self.user.as_ref() {
+            persist_inspector_collapsed_sections(&user.id, &self.inspector_collapsed);
+        }
+        true
+    }
+
+    fn view_inspector_section_header(
+        &self,
+        ctx: &Context<Self>,
+        section: InspectorSection,
+        title: &'static str,
+    ) -> Html {
+        let collapsed = self.inspector_section_is_collapsed(section);
+        html! {
+            <div class="inspector-section-heading">
+                <h2>{title}</h2>
+                <button
+                    class="inspector-section-toggle"
+                    type="button"
+                    aria-controls={section.content_id()}
+                    aria-expanded={(!collapsed).to_string()}
+                    onclick={ctx.link().callback(move |_| Msg::ToggleInspectorSection(section))}
+                >{if collapsed { "Expand" } else { "Collapse" }}</button>
+            </div>
+        }
     }
 
     fn begin_placement_drag(&mut self, kind: PlacementKind, shape: Shape) -> bool {
@@ -3301,11 +4150,24 @@ impl App {
         };
         self.capture_pointer(event.pointer_id());
         if self.mode == Mode::Select {
-            let additive = event.shift_key() || event.ctrl_key() || event.meta_key();
+            let duplicate_drag = event.ctrl_key() && event.shift_key() && !event.meta_key();
+            let additive =
+                !duplicate_drag && (event.shift_key() || event.ctrl_key() || event.meta_key());
             if let Some(entity) = self.model.timeline().snapshot().entity_at(point) {
                 let entity_id = entity.id().clone();
-                self.selection = select_entity(self.selection.as_ref(), entity_id, additive);
-                if event.button() == 0 && !additive && self.can_edit_timeline {
+                if duplicate_drag
+                    && !matches!(&self.selection, Some(Selection::Entities(entity_ids)) if entity_ids.contains(&entity_id))
+                {
+                    self.select_entities_and_focus_inspector(vec![entity_id.clone()]);
+                } else if !duplicate_drag {
+                    let selection = select_entity(self.selection.as_ref(), entity_id, additive);
+                    if let Some(Selection::Entities(entity_ids)) = selection {
+                        self.select_entities_and_focus_inspector(entity_ids);
+                    } else {
+                        self.selection = selection;
+                    }
+                }
+                if event.button() == 0 && (!additive || duplicate_drag) && self.can_edit_timeline {
                     let origins = self
                         .selected_entity_ids()
                         .iter()
@@ -3331,6 +4193,8 @@ impl App {
                             start: point,
                             current: point,
                             origins,
+                            duplicate: duplicate_drag,
+                            rotation_steps: 0,
                             start_canvas_x,
                             start_canvas_y,
                             active: false,
@@ -3357,7 +4221,7 @@ impl App {
                 });
             }
         } else {
-            self.selection = Some(Selection::Cell(point));
+            self.select_and_focus_inspector(Selection::Cell(point));
         }
         self.last_drag = Some(point);
         self.canvas_dirty = true;
@@ -3370,10 +4234,10 @@ impl App {
         let Some(current) = self.effective_cell(point) else {
             return true;
         };
-        let kind = match current {
+        let kind = self.map_paint_kind.unwrap_or(match current {
             CellKind::Floor => CellKind::Wall,
             CellKind::Wall => CellKind::Floor,
-        };
+        });
         self.drag_kind = Some(kind);
         self.apply_cell(ctx, point, kind);
         true
@@ -3490,7 +4354,7 @@ impl App {
             return false;
         }
         self.last_drag = Some(point);
-        self.selection = Some(Selection::Cell(point));
+        self.select_and_focus_inspector(Selection::Cell(point));
         self.apply_cell(ctx, point, kind);
         true
     }
@@ -3541,8 +4405,14 @@ impl App {
             }
             let delta_x = i32::from(drag.current.x) - i32::from(drag.start.x);
             let delta_y = i32::from(drag.current.y) - i32::from(drag.start.y);
-            if delta_x == 0 && delta_y == 0 {
+            if delta_x == 0 && delta_y == 0 && drag.rotation_steps == 0 {
                 return true;
+            }
+            if drag.duplicate {
+                return self.duplicate_entities_from_drag(ctx, drag);
+            }
+            if drag.rotation_steps != 0 {
+                return self.transform_entities_from_drag(ctx, drag);
             }
             return self.move_entities_from_origins(ctx, drag.origins, delta_x, delta_y);
         }
@@ -3570,12 +4440,12 @@ impl App {
                     }
                 }
                 if !entity_ids.is_empty() {
-                    self.selection = Some(Selection::Entities(entity_ids));
+                    self.select_entities_and_focus_inspector(entity_ids);
                 } else if !gesture.additive {
                     self.selection = None;
                 }
             } else if !gesture.additive {
-                self.selection = Some(Selection::Cell(gesture.current));
+                self.select_and_focus_inspector(Selection::Cell(gesture.current));
             }
             self.canvas_dirty = true;
             return true;
@@ -4047,7 +4917,7 @@ impl App {
             unreachable!("default placement preparation returns PlaceEntity");
         };
         let entity_id = entity.id().clone();
-        self.selection = Some(Selection::Cell(point));
+        self.select_and_focus_inspector(Selection::Cell(point));
         self.submit_entity_command(ctx, envelope, [entity_id], placement_points)
     }
 
@@ -4153,36 +5023,26 @@ impl App {
         true
     }
 
-    fn toggle_blind_isolation(&mut self) -> bool {
-        let Some(entity_id) = self.selected_entity_id().cloned() else {
-            return false;
-        };
-        if self
-            .model
-            .timeline()
-            .snapshot()
-            .entity(&entity_id)
-            .is_none_or(|entity| entity.as_blind().is_none())
-        {
+    fn move_selected_entity_with_keyboard(
+        &mut self,
+        ctx: &Context<Self>,
+        direction: MoveDirection,
+    ) -> bool {
+        if self.mode != Mode::Select {
             return false;
         }
-        self.isolated_blind =
-            (self.isolated_blind.as_ref() != Some(&entity_id)).then_some(entity_id);
-        self.canvas_dirty = true;
-        true
+        let (delta_x, delta_y) = direction.offset();
+        self.move_selected_entities(ctx, i32::from(delta_x), i32::from(delta_y))
     }
 
     fn edit_selected_entity(&mut self, ctx: &Context<Self>, action: EntityAction) -> bool {
         if self.mode != Mode::Select {
             return false;
         }
-        if let EntityAction::Move(direction) = action {
-            let (delta_x, delta_y) = direction.offset();
-            return self.move_selected_entities(ctx, i32::from(delta_x), i32::from(delta_y));
-        }
-        let Some(entity_id) = self.selected_entity_id().cloned() else {
+        let entity_ids = self.selected_entity_ids().to_vec();
+        if entity_ids.is_empty() {
             return false;
-        };
+        }
         if !self.can_edit_timeline {
             self.push_toast(
                 "Editing requires the exact edit_timeline capability".to_owned(),
@@ -4197,39 +5057,52 @@ impl App {
             );
             return true;
         }
-        if self.pending_entities.contains_key(&entity_id) {
+        if entity_ids
+            .iter()
+            .any(|entity_id| self.pending_entities.contains_key(entity_id))
+        {
             return false;
         }
-        if self
-            .model
-            .timeline()
-            .snapshot()
-            .entity(&entity_id)
-            .is_none()
-        {
+        let entities = entity_ids
+            .iter()
+            .filter_map(|entity_id| self.model.timeline().snapshot().entity(entity_id).cloned())
+            .collect::<Vec<_>>();
+        if entities.len() != entity_ids.len() {
             self.selection = None;
             return true;
         }
 
-        let envelope = match action {
-            EntityAction::Move(_) => unreachable!(),
-            EntityAction::RotateClockwise => self
-                .model
-                .prepare_rotate_entity_clockwise(entity_id.clone(), now_ms()),
-            EntityAction::FlipHorizontal => self
-                .model
-                .prepare_flip_entity_horizontal(entity_id.clone(), now_ms()),
-            EntityAction::Delete => self
-                .model
-                .prepare_delete_entity(entity_id.clone(), now_ms()),
+        let (envelope, placement_points) = match action {
+            EntityAction::Delete => (
+                self.model
+                    .prepare_delete_entities(entity_ids.clone(), now_ms()),
+                Vec::new(),
+            ),
+            EntityAction::RotateClockwise | EntityAction::FlipHorizontal => {
+                let transformed = entities
+                    .into_iter()
+                    .map(|entity| match action {
+                        EntityAction::RotateClockwise => entity.rotated_clockwise(),
+                        EntityAction::FlipHorizontal => entity.flipped_horizontal(),
+                        EntityAction::Delete => unreachable!(),
+                    })
+                    .collect::<Vec<_>>();
+                let placement_points = transformed
+                    .iter()
+                    .flat_map(|entity| {
+                        shape_world_points(entity.origin(), entity.shape()).unwrap_or_default()
+                    })
+                    .collect();
+                (
+                    self.model.prepare_transform_entities(transformed, now_ms()),
+                    placement_points,
+                )
+            }
         };
-        self.submit_entity_command(ctx, envelope, [entity_id], Vec::new())
+        self.submit_entity_command(ctx, envelope, entity_ids, placement_points)
     }
 
     fn set_pool_resolution(&mut self, ctx: &Context<Self>, pixels_per_cell: u8) -> bool {
-        let Some(entity_id) = self.selected_entity_id().cloned() else {
-            return false;
-        };
         if !(1..=32).contains(&pixels_per_cell) {
             self.push_toast(
                 "Pool resolution must be between 1 and 32".to_owned(),
@@ -4237,13 +5110,8 @@ impl App {
             );
             return true;
         }
-        let Some(entity) = self.model.timeline().snapshot().entity(&entity_id) else {
-            return false;
-        };
-        let Some(blind) = entity.as_blind() else {
-            return false;
-        };
-        if blind.pixels_per_cell() == pixels_per_cell {
+        let entity_ids = self.selected_entity_ids().to_vec();
+        if entity_ids.is_empty() || self.mode != Mode::Select {
             return false;
         }
         if !self.can_edit_timeline || !matches!(self.rpc_state, RpcState::Online) {
@@ -4253,12 +5121,159 @@ impl App {
             );
             return true;
         }
-        if self.pending_entities.contains_key(&entity_id) {
+        if entity_ids
+            .iter()
+            .any(|entity_id| self.pending_entities.contains_key(entity_id))
+        {
             return false;
         }
+        let entities = entity_ids
+            .iter()
+            .filter_map(|entity_id| self.model.timeline().snapshot().entity(entity_id).cloned())
+            .collect::<Vec<_>>();
+        if entities.len() != entity_ids.len()
+            || entities.iter().any(|entity| entity.as_blind().is_none())
+        {
+            return false;
+        }
+        let mut transformed = Vec::with_capacity(entities.len());
+        for entity in entities {
+            let Ok(resampled) = entity.resampled_blind(pixels_per_cell) else {
+                self.push_toast("Pool resolution could not be applied".to_owned(), "warning");
+                return true;
+            };
+            transformed.push(resampled);
+        }
+        if transformed
+            .iter()
+            .all(|entity| self.model.timeline().snapshot().entity(entity.id()) == Some(entity))
+        {
+            return false;
+        }
+        let placement_points = transformed
+            .iter()
+            .flat_map(|entity| {
+                shape_world_points(entity.origin(), entity.shape()).unwrap_or_default()
+            })
+            .collect();
+        let envelope = self.model.prepare_transform_entities(transformed, now_ms());
+        self.submit_entity_command(ctx, envelope, entity_ids, placement_points)
+    }
+
+    fn set_block_layer_capacity(
+        &mut self,
+        ctx: &Context<Self>,
+        layer_index: usize,
+        value: &str,
+    ) -> bool {
+        let value = value.trim();
+        let capacity = if value.eq_ignore_ascii_case("unlimited") {
+            CollectCapacity::Unlimited
+        } else {
+            let Ok(capacity) = value.parse::<u32>() else {
+                self.push_toast(
+                    "Capacity must be a non-negative number or 'unlimited'".to_owned(),
+                    "warning",
+                );
+                return true;
+            };
+            CollectCapacity::Finite(capacity)
+        };
+        let entity_ids = self.selected_entity_ids().to_vec();
+        if entity_ids.is_empty()
+            || self.mode != Mode::Select
+            || !self.can_edit_timeline
+            || !matches!(self.rpc_state, RpcState::Online)
+            || entity_ids
+                .iter()
+                .any(|entity_id| self.pending_entities.contains_key(entity_id))
+        {
+            return false;
+        }
+        let all_editable = entity_ids.iter().all(|entity_id| {
+            self.model
+                .timeline()
+                .snapshot()
+                .entity(entity_id)
+                .and_then(|entity| match entity.kind() {
+                    PlaceableEntityKind::Block(block) => {
+                        Some(block.collect_layers().len() > layer_index)
+                    }
+                    PlaceableEntityKind::Blind(_) => None,
+                })
+                .unwrap_or(false)
+        });
+        if !all_editable {
+            self.push_toast(
+                "Select Blocks with a matching capacity layer to batch-edit it".to_owned(),
+                "info",
+            );
+            return true;
+        }
+        let envelope = self.model.prepare_set_block_layer_capacity(
+            entity_ids.clone(),
+            layer_index,
+            capacity,
+            now_ms(),
+        );
+        self.submit_entity_command(ctx, envelope, entity_ids, Vec::new())
+    }
+
+    fn add_block_collect_layer(&mut self, ctx: &Context<Self>) -> bool {
+        let Some(entity_id) = self.selected_entity_id().cloned() else {
+            return false;
+        };
+        if self.mode != Mode::Select
+            || !self.can_edit_timeline
+            || !matches!(self.rpc_state, RpcState::Online)
+            || self.pending_entities.contains_key(&entity_id)
+        {
+            return false;
+        }
+        let Some(entity) = self.model.timeline().snapshot().entity(&entity_id) else {
+            return false;
+        };
+        let PlaceableEntityKind::Block(block) = entity.kind() else {
+            return false;
+        };
+        let mut layers = block.collect_layers().to_vec();
+        layers.push(CollectLayer::new(
+            1,
+            None,
+            CollectCapacity::Unlimited,
+            false,
+        ));
         let envelope =
             self.model
-                .prepare_set_blind_resolution(entity_id.clone(), pixels_per_cell, now_ms());
+                .prepare_set_block_collect_layers(entity_id.clone(), layers, now_ms());
+        self.submit_entity_command(ctx, envelope, [entity_id], Vec::new())
+    }
+
+    fn remove_block_collect_layer(&mut self, ctx: &Context<Self>, layer_index: usize) -> bool {
+        let Some(entity_id) = self.selected_entity_id().cloned() else {
+            return false;
+        };
+        if self.mode != Mode::Select
+            || !self.can_edit_timeline
+            || !matches!(self.rpc_state, RpcState::Online)
+            || self.pending_entities.contains_key(&entity_id)
+        {
+            return false;
+        }
+        let Some(entity) = self.model.timeline().snapshot().entity(&entity_id) else {
+            return false;
+        };
+        let PlaceableEntityKind::Block(block) = entity.kind() else {
+            return false;
+        };
+        let mut layers = block.collect_layers().to_vec();
+        if layer_index >= layers.len() {
+            return false;
+        }
+        layers.remove(layer_index);
+        let envelope =
+            self.model
+                .prepare_set_block_collect_layers(entity_id.clone(), layers, now_ms());
         self.submit_entity_command(ctx, envelope, [entity_id], Vec::new())
     }
 
@@ -4333,6 +5348,122 @@ impl App {
         self.submit_entity_command(ctx, envelope, entity_ids, Vec::new())
     }
 
+    fn duplicate_entities_from_drag(&mut self, ctx: &Context<Self>, drag: EntityDrag) -> bool {
+        if drag.origins.is_empty() || self.mode != Mode::Select {
+            return false;
+        }
+        if !self.can_edit_timeline {
+            self.push_toast(
+                "Editing requires the exact edit_timeline capability".to_owned(),
+                "warning",
+            );
+            return true;
+        }
+        if !matches!(self.rpc_state, RpcState::Online) {
+            self.push_toast(
+                "Wait for collaboration sync before editing".to_owned(),
+                "info",
+            );
+            return true;
+        }
+        if drag
+            .origins
+            .iter()
+            .any(|(entity_id, _)| self.pending_entities.contains_key(entity_id))
+        {
+            return false;
+        }
+        let snapshot = self.model.timeline().snapshot();
+        let mut duplicates = Vec::with_capacity(drag.origins.len());
+        let mut placement_points = Vec::new();
+        for (entity_id, origin) in &drag.origins {
+            let Some(destination) =
+                dragged_entity_origin(*origin, drag.start, drag.current, drag.rotation_steps)
+            else {
+                self.push_toast(
+                    "Duplicate rejected: selection would leave the grid".to_owned(),
+                    "warning",
+                );
+                return true;
+            };
+            let Some(source) = snapshot.entity(entity_id) else {
+                return false;
+            };
+            let mut copy = source.clone();
+            for _ in 0..drag.rotation_steps {
+                copy = copy.rotated_clockwise();
+            }
+            placement_points
+                .extend(shape_world_points(destination, copy.shape()).unwrap_or_default());
+            duplicates.push((copy, destination));
+        }
+        let (envelope, duplicate_ids) = self.model.prepare_duplicate_entities(duplicates, now_ms());
+        let submitted = self.submit_entity_command(ctx, envelope, duplicate_ids, placement_points);
+        if submitted {
+            self.push_toast(
+                "Duplicated selection (decorators are not copied)".to_owned(),
+                "info",
+            );
+        }
+        submitted
+    }
+
+    fn transform_entities_from_drag(&mut self, ctx: &Context<Self>, drag: EntityDrag) -> bool {
+        if drag.origins.is_empty() || self.mode != Mode::Select {
+            return false;
+        }
+        if !self.can_edit_timeline {
+            self.push_toast(
+                "Editing requires the exact edit_timeline capability".to_owned(),
+                "warning",
+            );
+            return true;
+        }
+        if !matches!(self.rpc_state, RpcState::Online) {
+            self.push_toast(
+                "Wait for collaboration sync before editing".to_owned(),
+                "info",
+            );
+            return true;
+        }
+        if drag
+            .origins
+            .iter()
+            .any(|(entity_id, _)| self.pending_entities.contains_key(entity_id))
+        {
+            return false;
+        }
+        let snapshot = self.model.timeline().snapshot();
+        let mut transformed = Vec::with_capacity(drag.origins.len());
+        let mut placement_points = Vec::new();
+        let mut entity_ids = Vec::with_capacity(drag.origins.len());
+        for (entity_id, origin) in &drag.origins {
+            let Some(destination) =
+                dragged_entity_origin(*origin, drag.start, drag.current, drag.rotation_steps)
+            else {
+                self.push_toast(
+                    "Transform rejected: selection would leave the grid".to_owned(),
+                    "warning",
+                );
+                return true;
+            };
+            let Some(source) = snapshot.entity(entity_id) else {
+                return false;
+            };
+            let mut entity = source.clone();
+            for _ in 0..drag.rotation_steps {
+                entity = entity.rotated_clockwise();
+            }
+            entity = entity.moved_to(destination);
+            placement_points
+                .extend(shape_world_points(destination, entity.shape()).unwrap_or_default());
+            entity_ids.push(entity_id.clone());
+            transformed.push(entity);
+        }
+        let envelope = self.model.prepare_transform_entities(transformed, now_ms());
+        self.submit_entity_command(ctx, envelope, entity_ids, placement_points)
+    }
+
     fn edit_selected_decorator(&mut self, ctx: &Context<Self>, action: DecoratorAction) -> bool {
         if self.mode != Mode::Select {
             return false;
@@ -4340,13 +5471,21 @@ impl App {
         let Some(entity_id) = self.selected_entity_id().cloned() else {
             return false;
         };
-        let is_block = self
+        let supports_action = self
             .model
             .timeline()
             .snapshot()
             .entity(&entity_id)
-            .is_some_and(|entity| matches!(entity.kind(), PlaceableEntityKind::Block(_)));
-        if !is_block {
+            .is_some_and(|entity| match &action {
+                DecoratorAction::ToggleGlass => entity.as_blind().is_some(),
+                DecoratorAction::ToggleIce
+                | DecoratorAction::CycleDirection
+                | DecoratorAction::SetDirection(_)
+                | DecoratorAction::BeginKeyLocker => {
+                    matches!(entity.kind(), PlaceableEntityKind::Block(_))
+                }
+            });
+        if !supports_action {
             return false;
         }
         if !self.can_edit_timeline {
@@ -4378,6 +5517,9 @@ impl App {
         let envelope = match action {
             DecoratorAction::ToggleIce => {
                 self.model.prepare_toggle_ice(entity_id.clone(), now_ms())
+            }
+            DecoratorAction::ToggleGlass => {
+                self.model.prepare_toggle_glass(entity_id.clone(), now_ms())
             }
             DecoratorAction::CycleDirection => self
                 .model
@@ -4417,6 +5559,35 @@ impl App {
         let envelope = self
             .model
             .prepare_set_ice(entity_id.clone(), blocking_count, now_ms());
+        self.submit_decorator_command(ctx, envelope, [entity_id])
+    }
+
+    fn set_selected_glass_count(&mut self, ctx: &Context<Self>, value: &str) -> bool {
+        let Ok(blocking_count) = value.parse::<u32>() else {
+            return false;
+        };
+        if self.mode != Mode::Select
+            || !self.can_edit_timeline
+            || !matches!(self.rpc_state, RpcState::Online)
+        {
+            return false;
+        }
+        let Some(entity_id) = self.selected_entity_id().cloned() else {
+            return false;
+        };
+        if self.pending_entities.contains_key(&entity_id)
+            || self
+                .model
+                .timeline()
+                .snapshot()
+                .entity(&entity_id)
+                .is_none_or(|entity| entity.as_blind().is_none())
+        {
+            return false;
+        }
+        let envelope = self
+            .model
+            .prepare_set_glass(entity_id.clone(), blocking_count, now_ms());
         self.submit_decorator_command(ctx, envelope, [entity_id])
     }
 
@@ -4585,13 +5756,48 @@ impl App {
     }
 
     fn key_down(&mut self, ctx: &Context<Self>, event: KeyboardEvent) -> bool {
+        if self.studio_modal.is_some() {
+            if event.key() == "Escape" {
+                event.prevent_default();
+                self.studio_modal = None;
+                return true;
+            }
+            // The root shell receives bubbling key events from the focused studio. Do not
+            // let workspace shortcuts mutate the obscured canvas while a modal is open.
+            return false;
+        }
         let scope = if self.palette_open {
             ShortcutScope::Palette
-        } else if event_target_is_text_entry(&event) {
+        } else if event_target_is_text_entry(event.target()) {
             ShortcutScope::TextEntry
         } else {
             ShortcutScope::Workspace
         };
+        if scope == ShortcutScope::Workspace
+            && event.key().eq_ignore_ascii_case("r")
+            && !event.ctrl_key()
+            && !event.meta_key()
+            && !event.alt_key()
+            && !event.shift_key()
+            && self.entity_drag.as_ref().is_some_and(|drag| drag.active)
+        {
+            event.prevent_default();
+            if let Some(drag) = self.entity_drag.as_mut() {
+                drag.rotation_steps = (drag.rotation_steps + 1) % 4;
+            }
+            self.canvas_dirty = true;
+            return true;
+        }
+        if scope == ShortcutScope::Workspace
+            && event.key() == "Delete"
+            && !event.ctrl_key()
+            && !event.meta_key()
+            && !event.alt_key()
+            && self.mode == Mode::Select
+        {
+            event.prevent_default();
+            return self.edit_selected_entity(ctx, EntityAction::Delete);
+        }
         if scope == ShortcutScope::Workspace
             && !event.ctrl_key()
             && !event.meta_key()
@@ -4631,6 +5837,7 @@ impl App {
         {
             let action = match event.key().to_ascii_lowercase().as_str() {
                 "i" => Some(DecoratorAction::ToggleIce),
+                "g" => Some(DecoratorAction::ToggleGlass),
                 "d" => Some(DecoratorAction::CycleDirection),
                 "k" => Some(DecoratorAction::BeginKeyLocker),
                 _ => None,
@@ -4694,7 +5901,7 @@ impl App {
         match shortcut {
             Shortcut::SelectMode(mode) => self.set_mode(mode),
             Shortcut::MoveSelection(direction) => {
-                self.edit_selected_entity(ctx, EntityAction::Move(direction))
+                self.move_selected_entity_with_keyboard(ctx, direction)
             }
             Shortcut::Undo => self.undo(ctx),
             Shortcut::TogglePalette => {
@@ -5418,6 +6625,9 @@ impl App {
             return false;
         }
         *target = width;
+        // CSS-grid width changes may reset/stretch the canvas before ResizeObserver
+        // delivers its next callback. Force the current render pass to repaint it.
+        self.canvas_dirty = true;
         true
     }
 
@@ -5488,21 +6698,25 @@ impl App {
         else {
             return entity.origin();
         };
-        let delta_x = i32::from(drag.current.x) - i32::from(drag.start.x);
-        let delta_y = i32::from(drag.current.y) - i32::from(drag.start.y);
-        let Ok(delta_x) = i16::try_from(delta_x) else {
-            return *origin;
-        };
-        let Ok(delta_y) = i16::try_from(delta_y) else {
-            return *origin;
-        };
-        match (
-            origin.x.checked_add_signed(delta_x),
-            origin.y.checked_add_signed(delta_y),
-        ) {
-            (Some(x), Some(y)) => GridPoint::new(x, y),
-            _ => *origin,
+        dragged_entity_origin(*origin, drag.start, drag.current, drag.rotation_steps)
+            .unwrap_or(*origin)
+    }
+
+    fn preview_entity(&self, entity: &PlaceableEntity) -> PlaceableEntity {
+        let rotation_steps = self
+            .entity_drag
+            .as_ref()
+            .filter(|drag| {
+                drag.origins
+                    .iter()
+                    .any(|(entity_id, _)| entity_id == entity.id())
+            })
+            .map_or(0, |drag| drag.rotation_steps);
+        let mut preview = entity.clone();
+        for _ in 0..rotation_steps {
+            preview = preview.rotated_clockwise();
         }
+        preview.moved_to(self.preview_origin(entity))
     }
 
     fn activity_events(&self) -> &[HistoryEvent] {
@@ -5532,6 +6746,14 @@ impl App {
             Some(Selection::Entities(entity_ids)) => entity_ids,
             _ => &[],
         }
+    }
+
+    fn selected_entities(&self) -> Vec<&PlaceableEntity> {
+        let snapshot = self.model.timeline().snapshot();
+        self.selected_entity_ids()
+            .iter()
+            .filter_map(|entity_id| snapshot.entity(entity_id))
+            .collect()
     }
 
     fn selected_entity(&self) -> Option<&PlaceableEntity> {
@@ -5752,7 +6974,7 @@ impl App {
             {
                 continue;
             }
-            let display = entity.moved_to(self.preview_origin(entity));
+            let display = self.preview_entity(entity);
             self.draw_entity(&context, &palette, &display)?;
         }
         if self.isolated_blind.is_none() {
@@ -5780,8 +7002,9 @@ impl App {
                 context.set_line_width(3.0);
                 for entity_id in entity_ids {
                     if let Some(entity) = self.model.timeline().snapshot().entity(entity_id) {
-                        let origin = self.preview_origin(entity);
-                        for cell in entity.shape().occupied_cells() {
+                        let display = self.preview_entity(entity);
+                        let origin = display.origin();
+                        for cell in display.shape().occupied_cells() {
                             let left =
                                 BOARD_ORIGIN + f64::from(origin.x + u16::from(cell.x)) * CELL_SIZE;
                             let top =
@@ -5791,7 +7014,7 @@ impl App {
                                 left,
                                 top,
                                 3.5,
-                                shape_boundary_edges(entity.shape(), cell),
+                                shape_boundary_edges(display.shape(), cell),
                             );
                         }
                     }
@@ -6129,7 +7352,7 @@ impl App {
                     let Some(owner) = snapshot.entity(entity) else {
                         continue;
                     };
-                    let owner = owner.moved_to(self.preview_origin(owner));
+                    let owner = self.preview_entity(owner);
                     context.set_stroke_style_str("#54caec");
                     context.set_line_width(2.0);
                     for cell in owner.shape().occupied_cells() {
@@ -6161,11 +7384,50 @@ impl App {
                         );
                     }
                 }
+                DecoratorKind::Glass {
+                    entity,
+                    blocking_count,
+                } if *blocking_count > 0 => {
+                    let Some(owner) = snapshot.entity(entity) else {
+                        continue;
+                    };
+                    let owner = self.preview_entity(owner);
+                    context.set_stroke_style_str("#a5e5f7");
+                    context.set_line_width(2.0);
+                    for cell in owner.shape().occupied_cells() {
+                        let left = BOARD_ORIGIN
+                            + f64::from(owner.origin().x + u16::from(cell.x)) * CELL_SIZE;
+                        let top = BOARD_ORIGIN
+                            + f64::from(owner.origin().y + u16::from(cell.y)) * CELL_SIZE;
+                        context.stroke_rect(
+                            left + 8.0,
+                            top + 8.0,
+                            CELL_SIZE - 16.0,
+                            CELL_SIZE - 16.0,
+                        );
+                    }
+                    if let Some(cell) = owner.shape().occupied_cells().next() {
+                        let left = BOARD_ORIGIN
+                            + f64::from(owner.origin().x + u16::from(cell.x)) * CELL_SIZE;
+                        let top = BOARD_ORIGIN
+                            + f64::from(owner.origin().y + u16::from(cell.y)) * CELL_SIZE;
+                        context.set_fill_style_str("#14313e");
+                        context.fill_rect(left + 9.0, top + 9.0, 24.0, 20.0);
+                        context.set_stroke_style_str("#a5e5f7");
+                        context.stroke_rect(left + 9.5, top + 9.5, 23.0, 19.0);
+                        context.set_fill_style_str("#e0f8ff");
+                        let _ = context.fill_text(
+                            &format!("G{blocking_count}"),
+                            left + 21.0,
+                            top + 19.0,
+                        );
+                    }
+                }
                 DecoratorKind::Direction { entity, direction } => {
                     let Some(owner) = snapshot.entity(entity) else {
                         continue;
                     };
-                    let owner = owner.moved_to(self.preview_origin(owner));
+                    let owner = self.preview_entity(owner);
                     let Some(cell) = owner.shape().occupied_cells().next() else {
                         continue;
                     };
@@ -6191,8 +7453,8 @@ impl App {
                     else {
                         continue;
                     };
-                    let lock = lock.moved_to(self.preview_origin(lock));
-                    let key_owner = key_owner.moved_to(self.preview_origin(key_owner));
+                    let lock = self.preview_entity(lock);
+                    let key_owner = self.preview_entity(key_owner);
                     let (key_x, key_y) = entity_canvas_center(&key_owner);
                     let (lock_x, lock_y) = entity_canvas_center(&lock);
                     context.set_stroke_style_str("#e3b341");
@@ -6217,13 +7479,13 @@ impl App {
                         );
                     }
                 }
-                DecoratorKind::Ice { .. } => {}
+                DecoratorKind::Ice { .. } | DecoratorKind::Glass { .. } => {}
             }
         }
         if let Some(key_entity_id) = self.key_locker_assignment.as_ref()
             && let Some(key) = snapshot.entity(key_entity_id)
         {
-            let key = key.moved_to(self.preview_origin(key));
+            let key = self.preview_entity(key);
             let (x, y) = entity_canvas_center(&key);
             context.set_stroke_style_str("#ffd15a");
             context.set_line_width(3.0);
@@ -6261,15 +7523,6 @@ fn draw_role_badge(
     context.stroke_rect(x - 10.5, y - 10.5, 21.0, 21.0);
     context.set_fill_style_str(foreground);
     let _ = context.fill_text(label, x, y);
-}
-
-fn mode_icon(mode: Mode) -> &'static str {
-    match mode {
-        Mode::Select => "@",
-        Mode::Map => "#",
-        Mode::Brush => "/",
-        Mode::Sandbox => ">",
-    }
 }
 
 fn catalog_text_matches<const N: usize>(query: &str, values: [&str; N]) -> bool {
@@ -6455,7 +7708,7 @@ fn entity_kind_label(kind: &PlaceableEntityKind) -> &'static str {
     }
 }
 
-fn view_entity_kind_details(entity: &PlaceableEntity) -> Html {
+fn view_entity_kind_details(entity: &PlaceableEntity, collapsed: bool, header: Html) -> Html {
     match entity.kind() {
         PlaceableEntityKind::Block(block) => {
             let colors = if block.collect_layers().is_empty() {
@@ -6468,19 +7721,6 @@ fn view_entity_kind_details(entity: &PlaceableEntity) -> Html {
                     .collect::<Vec<_>>()
                     .join(", ")
             };
-            let capacities = if block.collect_layers().is_empty() {
-                "none".to_owned()
-            } else {
-                block
-                    .collect_layers()
-                    .iter()
-                    .map(|layer| match layer.capacity() {
-                        CollectCapacity::Unlimited => "unlimited".to_owned(),
-                        CollectCapacity::Finite(capacity) => capacity.to_string(),
-                    })
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
             let locked = block
                 .collect_layers()
                 .iter()
@@ -6488,13 +7728,22 @@ fn view_entity_kind_details(entity: &PlaceableEntity) -> Html {
                 .count();
             html! {
                 <section class="inspector-section">
-                    <h2>{"Block data"}</h2>
-                    <div class="property-table">
-                        <div><span>{"Colors"}</span><code>{colors}</code></div>
-                        <div><span>{"Collect layers"}</span><strong>{block.collect_layers().len()}</strong></div>
-                        <div><span>{"Capacities"}</span><code>{capacities}</code></div>
-                        <div><span>{"Locked layers"}</span><strong>{locked}</strong></div>
-                    </div>
+                    { header }
+                    {
+                        if !collapsed {
+                            html! {
+                                <div id={InspectorSection::EntityData.content_id()} class="inspector-section-body">
+                                    <div class="property-table">
+                                        <div><span>{"Colors"}</span><code>{colors}</code></div>
+                                        <div><span>{"Layers"}</span><strong>{block.collect_layers().len()}</strong></div>
+                                        <div><span>{"Locked layers"}</span><strong>{locked}</strong></div>
+                                    </div>
+                                </div>
+                            }
+                        } else {
+                            Html::default()
+                        }
+                    }
                 </section>
             }
         }
@@ -6525,17 +7774,49 @@ fn view_entity_kind_details(entity: &PlaceableEntity) -> Html {
             };
             html! {
                 <section class="inspector-section">
-                    <h2>{"Pool data"}</h2>
-                    <div class="property-table">
-                        <div><span>{"Resolution"}</span><code>{format!("{} px/cell", blind.pixels_per_cell())}</code></div>
-                        <div><span>{"Tiles"}</span><strong>{blind.tiles().len()}</strong></div>
-                        <div><span>{"Painted"}</span><code>{format!("{painted} / {total} px")}</code></div>
-                        <div><span>{"Colors"}</span><code>{colors}</code></div>
-                    </div>
+                    { header }
+                    {
+                        if !collapsed {
+                            html! {
+                                <div id={InspectorSection::EntityData.content_id()} class="inspector-section-body">
+                                    <div class="property-table">
+                                        <div><span>{"Resolution"}</span><code>{format!("{} px/cell", blind.pixels_per_cell())}</code></div>
+                                        <div><span>{"Tiles"}</span><strong>{blind.tiles().len()}</strong></div>
+                                        <div><span>{"Painted"}</span><code>{format!("{painted} / {total} px")}</code></div>
+                                        <div><span>{"Colors"}</span><code>{colors}</code></div>
+                                    </div>
+                                </div>
+                            }
+                        } else {
+                            Html::default()
+                        }
+                    }
                 </section>
             }
         }
     }
+}
+
+fn dragged_entity_origin(
+    origin: GridPoint,
+    start: GridPoint,
+    landing: GridPoint,
+    rotation_steps: u8,
+) -> Option<GridPoint> {
+    let mut x = i32::from(origin.x).checked_add(i32::from(landing.x) - i32::from(start.x))?;
+    let mut y = i32::from(origin.y).checked_add(i32::from(landing.y) - i32::from(start.y))?;
+    let anchor_x = i32::from(landing.x);
+    let anchor_y = i32::from(landing.y);
+    for _ in 0..rotation_steps % 4 {
+        let relative_x = x.checked_sub(anchor_x)?;
+        let relative_y = y.checked_sub(anchor_y)?;
+        x = anchor_x.checked_sub(relative_y)?;
+        y = anchor_y.checked_add(relative_x)?;
+    }
+    if !(0..=i32::from(u16::MAX)).contains(&x) || !(0..=i32::from(u16::MAX)).contains(&y) {
+        return None;
+    }
+    Some(GridPoint::new(x as u16, y as u16))
 }
 
 fn selection_status(selection: Option<&Selection>) -> String {
@@ -6546,6 +7827,62 @@ fn selection_status(selection: Option<&Selection>) -> String {
         }
         Some(Selection::Entities(entity_ids)) => format!("GROUP {}", entity_ids.len()),
         None => "TARGET --".to_owned(),
+    }
+}
+
+fn inspector_target_status(selection: Option<&Selection>) -> String {
+    match selection {
+        Some(Selection::Entities(entity_ids)) if entity_ids.len() == 1 => {
+            format!("ENTITY {}", truncate_entity_id(&entity_ids[0]))
+        }
+        _ => selection_status(selection),
+    }
+}
+
+fn truncate_entity_id(entity_id: &EntityId) -> String {
+    const MAX_VISIBLE_CHARS: usize = 18;
+    let value = entity_id.to_string();
+    let char_count = value.chars().count();
+    if char_count <= MAX_VISIBLE_CHARS {
+        return value;
+    }
+    let prefix = value
+        .chars()
+        .take(MAX_VISIBLE_CHARS.saturating_sub(3))
+        .collect::<String>();
+    format!("{prefix}...")
+}
+
+fn shape_occupied_count(sample: &ShapeCatalogEntry) -> u32 {
+    Shape::new(
+        sample.shape.width,
+        sample.shape.height,
+        sample.shape.occupied_mask,
+    )
+    .map_or(0, |shape| shape.occupied_count())
+}
+
+fn shape_template_thumbnail(sample: &ShapeCatalogEntry) -> Html {
+    let Ok(shape) = Shape::new(
+        sample.shape.width,
+        sample.shape.height,
+        sample.shape.occupied_mask,
+    ) else {
+        return html! { <div class="shape-template-thumbnail invalid">{"INVALID"}</div> };
+    };
+    let width = shape.width();
+    let height = shape.height();
+    html! {
+        <div
+            class="shape-template-thumbnail"
+            style={format!("--shape-template-columns: {width}; --shape-template-rows: {height};")}
+            aria-hidden="true"
+        >
+            { for (0..height).flat_map(|y| (0..width).map(move |x| {
+                let occupied = shape.contains(ShapeCell::new(x, y));
+                html! { <span class={classes!(occupied.then_some("occupied"))}></span> }
+            })) }
+        </div>
     }
 }
 
@@ -6574,6 +7911,13 @@ fn visual_anchor_to_grid(anchor: GridAnchor) -> GridAnchor {
         GridAnchor::BottomLeft => GridAnchor::TopLeft,
         GridAnchor::Bottom => GridAnchor::Top,
         GridAnchor::BottomRight => GridAnchor::TopRight,
+    }
+}
+
+fn collect_capacity_label(capacity: CollectCapacity) -> String {
+    match capacity {
+        CollectCapacity::Unlimited => "unlimited".to_owned(),
+        CollectCapacity::Finite(capacity) => capacity.to_string(),
     }
 }
 
@@ -6667,6 +8011,45 @@ fn storage() -> Option<web_sys::Storage> {
     web_sys::window()?.local_storage().ok().flatten()
 }
 
+fn inspector_collapse_storage_key(user_id: &str) -> String {
+    format!("{INSPECTOR_COLLAPSE_STORAGE_PREFIX}{user_id}")
+}
+
+fn load_inspector_collapsed_sections(user_id: &str) -> BTreeSet<InspectorSection> {
+    storage()
+        .and_then(|store| {
+            store
+                .get_item(&inspector_collapse_storage_key(user_id))
+                .ok()
+                .flatten()
+        })
+        .map(|value| parse_inspector_collapsed_sections(&value))
+        .unwrap_or_default()
+}
+
+fn parse_inspector_collapsed_sections(value: &str) -> BTreeSet<InspectorSection> {
+    if value.is_empty() {
+        return BTreeSet::new();
+    }
+    value
+        .split(',')
+        .map(InspectorSection::from_storage_key)
+        .collect::<Option<BTreeSet<_>>>()
+        .unwrap_or_default()
+}
+
+fn persist_inspector_collapsed_sections(user_id: &str, sections: &BTreeSet<InspectorSection>) {
+    let Some(store) = storage() else {
+        return;
+    };
+    let value = sections
+        .iter()
+        .map(|section| section.storage_key())
+        .collect::<Vec<_>>()
+        .join(",");
+    let _ = store.set_item(&inspector_collapse_storage_key(user_id), &value);
+}
+
 fn load_draft(key: &str) -> Option<LevelSnapshot> {
     let json = storage()?.get_item(key).ok().flatten()?;
     serde_json::from_str(&json).ok()
@@ -6698,11 +8081,33 @@ fn cell_kind_label(kind: CellKind) -> &'static str {
     }
 }
 
-fn event_target_is_text_entry(event: &KeyboardEvent) -> bool {
-    let Some(element) = event
-        .target()
-        .and_then(|target| target.dyn_into::<Element>().ok())
-    else {
+fn supported_image_media_type(file: &File) -> Option<&'static str> {
+    supported_image_media_type_parts(&file.type_(), &file.name())
+}
+
+fn supported_image_media_type_parts(media_type: &str, file_name: &str) -> Option<&'static str> {
+    match media_type.to_ascii_lowercase().as_str() {
+        "image/png" => return Some("image/png"),
+        "image/jpeg" | "image/jpg" => return Some("image/jpeg"),
+        "image/webp" | "image/x-webp" => return Some("image/webp"),
+        "" => {}
+        _ => return None,
+    }
+
+    match file_name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("png") => Some("image/png"),
+        Some("jpg" | "jpeg") => Some("image/jpeg"),
+        Some("webp") => Some("image/webp"),
+        _ => None,
+    }
+}
+
+fn event_target_is_text_entry(target: Option<web_sys::EventTarget>) -> bool {
+    let Some(element) = target.and_then(|target| target.dyn_into::<Element>().ok()) else {
         return false;
     };
     matches!(element.tag_name().as_str(), "INPUT" | "TEXTAREA" | "SELECT")
@@ -6729,6 +8134,9 @@ fn view_history_event(event: &HistoryEvent) -> Html {
                 entity.origin().y
             ),
         ),
+        LevelCommand::PlaceEntities { entities } => {
+            ("Duplicate entities", format!("{} entities", entities.len()))
+        }
         LevelCommand::MoveEntity { entity_id, origin } => (
             "Move entity",
             format!("{entity_id} -> {:02}:{:02}", origin.x, origin.y),
@@ -6737,17 +8145,48 @@ fn view_history_event(event: &HistoryEvent) -> Html {
             "Move entities",
             format!("{} selected entities", moves.len()),
         ),
+        LevelCommand::TransformEntities { entities } => (
+            "Transform entities",
+            format!("{} selected entities", entities.len()),
+        ),
         LevelCommand::RotateEntityClockwise { entity_id } => {
             ("Rotate entity", entity_id.to_string())
         }
         LevelCommand::FlipEntityHorizontal { entity_id } => ("Flip entity", entity_id.to_string()),
+        LevelCommand::SetBlockCollectLayers { entity_id, layers } => (
+            "Set capacity layers",
+            format!("{entity_id} / {} layers", layers.len()),
+        ),
+        LevelCommand::SetBlockLayerCapacity {
+            entity_ids,
+            layer_index,
+            capacity,
+        } => (
+            "Set capacity",
+            format!(
+                "{} Blocks / layer {} / {}",
+                entity_ids.len(),
+                layer_index + 1,
+                collect_capacity_label(*capacity)
+            ),
+        ),
         LevelCommand::DeleteEntity { entity_id } => ("Delete entity", entity_id.to_string()),
+        LevelCommand::DeleteEntities { entity_ids } => (
+            "Delete entities",
+            format!("{} selected entities", entity_ids.len()),
+        ),
         LevelCommand::ToggleIce { entity_id, .. } => ("Toggle Ice", entity_id.to_string()),
         LevelCommand::SetIce {
             entity_id,
             blocking_count,
             ..
         } => ("Set Ice", format!("{entity_id} / count {blocking_count}")),
+        LevelCommand::ToggleGlass { entity_id, .. } => ("Toggle Glass", entity_id.to_string()),
+        LevelCommand::SetGlass {
+            entity_id,
+            blocking_count,
+            ..
+        } => ("Set Glass", format!("{entity_id} / count {blocking_count}")),
         LevelCommand::CycleDirection { entity_id, .. } => {
             ("Cycle direction", entity_id.to_string())
         }

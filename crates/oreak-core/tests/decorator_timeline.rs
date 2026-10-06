@@ -109,6 +109,68 @@ fn ice_count_uses_a_stable_zero_count_tombstone() {
 }
 
 #[test]
+fn glass_count_uses_a_stable_zero_count_tombstone() {
+    let mut timeline = LevelTimeline::new(snapshot(vec![blind("pool", 0)], Vec::new())).unwrap();
+    timeline
+        .apply(command(
+            "set",
+            LevelCommand::SetGlass {
+                decorator_id: DecoratorId::from("glass-pool"),
+                entity_id: EntityId::from("pool"),
+                blocking_count: 3,
+            },
+        ))
+        .unwrap();
+    assert_eq!(
+        timeline
+            .snapshot()
+            .glass_blocking_count(&EntityId::from("pool")),
+        3
+    );
+
+    timeline
+        .apply(command(
+            "off",
+            LevelCommand::ToggleGlass {
+                decorator_id: DecoratorId::from("glass-pool"),
+                entity_id: EntityId::from("pool"),
+            },
+        ))
+        .unwrap();
+    let tombstone = timeline
+        .snapshot()
+        .decorator(&DecoratorId::from("glass-pool"))
+        .unwrap();
+    assert_eq!(tombstone.id().as_str(), "glass-pool");
+    assert_eq!(tombstone.glass_blocking_count(), Some(0));
+
+    timeline
+        .apply(command(
+            "on",
+            LevelCommand::ToggleGlass {
+                decorator_id: DecoratorId::from("glass-pool"),
+                entity_id: EntityId::from("pool"),
+            },
+        ))
+        .unwrap();
+    assert_eq!(
+        timeline
+            .snapshot()
+            .glass_blocking_count(&EntityId::from("pool")),
+        1
+    );
+    timeline
+        .undo_latest(CommandMetadata::new("undo", "alice", 200))
+        .unwrap();
+    assert_eq!(
+        timeline
+            .snapshot()
+            .glass_blocking_count(&EntityId::from("pool")),
+        0
+    );
+}
+
+#[test]
 fn direction_cycles_horizontal_vertical_and_disabled() {
     let mut timeline = LevelTimeline::new(snapshot(vec![block("a", 0)], Vec::new())).unwrap();
     for (id, expected) in [
@@ -331,6 +393,53 @@ fn deletion_cascades_owned_and_endpoint_decorators_and_undo_restores_them() {
 }
 
 #[test]
+fn deletion_cascades_glass_from_a_blind_and_undo_restores_it() {
+    let mut timeline = LevelTimeline::new(snapshot(
+        vec![blind("pool", 0)],
+        vec![Decorator::glass_with_blocking_count(
+            "glass-pool",
+            "pool",
+            2,
+        )],
+    ))
+    .unwrap();
+    let ApplyOutcome::Applied(event) = timeline
+        .apply(command(
+            "delete-pool",
+            LevelCommand::DeleteEntity {
+                entity_id: EntityId::from("pool"),
+            },
+        ))
+        .unwrap()
+    else {
+        panic!("expected deletion");
+    };
+    assert_eq!(event.changes.len(), 2);
+    assert!(
+        timeline
+            .snapshot()
+            .entity(&EntityId::from("pool"))
+            .is_none()
+    );
+    assert!(
+        timeline
+            .snapshot()
+            .decorator(&DecoratorId::from("glass-pool"))
+            .is_none()
+    );
+
+    timeline
+        .undo_latest(CommandMetadata::new("undo-delete-pool", "alice", 200))
+        .unwrap();
+    assert_eq!(
+        timeline
+            .snapshot()
+            .glass_blocking_count(&EntityId::from("pool")),
+        2
+    );
+}
+
+#[test]
 fn malformed_and_duplicate_decorator_ownership_is_rejected() {
     let entities = vec![block("a", 0), block("b", 2)];
     let size = GridSize::new(12, 4).unwrap();
@@ -385,6 +494,56 @@ fn ice_and_direction_reject_blind_owners() {
         ));
     }
     assert!(timeline.events().is_empty());
+}
+
+#[test]
+fn glass_rejects_block_owners_and_duplicate_blind_owners() {
+    let mut timeline = LevelTimeline::new(snapshot(vec![block("block", 0)], Vec::new())).unwrap();
+    assert!(matches!(
+        timeline.apply(command(
+            "glass-block",
+            LevelCommand::SetGlass {
+                decorator_id: DecoratorId::from("glass-block"),
+                entity_id: EntityId::from("block"),
+                blocking_count: 1,
+            },
+        )),
+        Err(TimelineError::InvalidLevel(
+            LevelError::DecoratorOwnerNotBlind { .. }
+        ))
+    ));
+    assert!(timeline.events().is_empty());
+    assert!(matches!(
+        timeline.apply(command(
+            "glass-missing",
+            LevelCommand::SetGlass {
+                decorator_id: DecoratorId::from("glass-missing"),
+                entity_id: EntityId::from("missing"),
+                blocking_count: 1,
+            },
+        )),
+        Err(TimelineError::InvalidLevel(LevelError::EntityNotFound(_)))
+    ));
+    assert!(timeline.events().is_empty());
+
+    let size = GridSize::new(12, 4).unwrap();
+    let error = LevelSnapshot::from_parts(
+        size,
+        vec![CellKind::Floor; size.cell_count()],
+        vec![blind("pool", 0)],
+        vec![
+            Decorator::glass("glass-a", "pool"),
+            Decorator::glass("glass-b", "pool"),
+        ],
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        LevelError::DecoratorOwnershipConflict {
+            role: DecoratorRole::Glass,
+            ..
+        }
+    ));
 }
 
 #[test]

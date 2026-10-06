@@ -48,16 +48,46 @@ If the subscription closes or hydration fails, all timeline controls become
 read-only and reconnect automatically with bounded exponential backoff. The
 client never falls back to an independent offline edit timeline.
 
-The working area keeps mode and action selection separate. Select, Map, Brush,
-and Sandbox modes are tabbed across the top of the canvas. The bottom tool tabs
-show only actions for the current mode; `Z`, `X`, and `C` choose those tools in
-order. The left sidebar switches between the selected tool's behavior and
-reusable entity templates. Both desktop sidebars have drag handles and can be
-docked, floated over the canvas, or hidden from their panel controls and the
-View menu. The right sidebar switches between Inspector, Activity, and Blame
-without mixing those workflows into one scrolling panel. The rectangular canvas
-fills the remaining workbench; right or middle drag pans it, the wheel zooms
-around the pointer, and Frame fits the complete level.
+The working area has a primary left sidebar (Shape Templates, Blame, Project
+Explorer, Comments, and Collaboration Session), a secondary right sidebar
+(Inspector, Level Structure, and Level Configuration), and a central real-time
+canvas. Selecting an entity or cell from the canvas, marquee, or Project Explorer
+opens the Inspector tab without overriding a deliberately hidden right panel. Inspector
+sections can be collapsed independently; their user-scoped preferences persist in
+browser storage. The active sidebar tab expands to show its label; inactive tabs
+remain icon-only. Both desktop sidebars have drag handles, one Dock/Float toggle,
+and a separate Hide action in their panel controls and the View menu. The active
+theme source is shown in the bottom status line, where a user override can be
+reset to the project default.
+
+The primary floating tool selection is centered above the canvas and enters
+Place Entity, Map Design, Shape Studio, and Image Studio workflows. Context
+selection and level zoom controls share a secondary floating toolbox centered
+below the canvas, avoiding the selection-blame popover. Context tools appear
+only for Place Entity or Map Design: choosing a Sand Block or Pool context
+focuses Shape Templates; wall paint, erase, and resize are directly available. Strip Map and Clear All
+remain visibly disabled until they have atomic authoritative commands. Shape
+Templates is a browse-only library with procedural footprint thumbnails: use its
+thumbnail-only grid or named list view, then drag a template using the current
+Block/Pool placement context. Shape Studio is the focused modal for saved-shape
+creation, editing, and properties. Image Studio imports bounded static PNG, JPEG,
+and WebP files as project-scoped,
+server-verified shared templates. Users can choose a file or paste a copied
+image while Image Studio is open; reads require project view access and imports
+require `edit_timeline`. The MVP server holds those templates only for its
+running process, so a durable blob store is still required before production. Pixelation
+and canvas placement remain unavailable until derived-image and level-asset
+commands exist. Comments likewise reserve a shell tab until a comment model and
+RPC surface exist.
+
+The central renderer is currently Canvas 2D rather than WebGL; it continues to
+render editing and collaboration progress in real time. WebGL and Unity/native
+integration are phased in [the UI shell plan](../../docs/LEVEL_EDITOR_UI_SHELL_PLAN.md)
+without changing server authority. Right or middle drag pans the canvas, the
+wheel zooms around the pointer, and Frame fits the complete level. `Z`, `X`,
+and `C` choose the current mode's workspace tools in order; keyboard shortcuts
+and the command palette retain access to non-primary modes without restoring a
+sidebar mode bar.
 
 Map Resize exposes one draggable handle on each edge. Dragging previews a
 single-axis resize, clamps inward movement before it would clip authored cells
@@ -68,21 +98,26 @@ anchor rules while preserving its screen position for every subscribed client.
 ## Core placeables
 
 Select mode hit-tests Block and Blind (`Pool` in the browser UI) footprints
-before their underlying floor cells. The Inspector tab shows the selected
-entity ID, kind, origin, shape bounds and occupied-cell count, plus Block
-collect-layer or Pool tile summaries. Pool resolution is configurable from 1 to
-32 pixels per cell through an undoable command with deterministic nearest-center
-resampling. The Transform tool moves one grid cell in
-four directions, rotates clockwise, flips horizontally, or deletes. Holding and
+before their underlying floor cells. The Inspector tab shows selected entity
+ID, kind, origin, shape bounds, and occupied-cell count; Block Capacity is its
+own collapsible section with editable capacity layers. A same-type multi-selection
+shows common values or literal `<different>` values and can batch-apply a capacity
+value where every selected Block has that layer. Pool resolution is configurable
+from 1 to 32 pixels per cell through an undoable command with deterministic
+nearest-center resampling and can be batch-applied to a same-type Pool selection. The Transform tool moves one grid cell in four
+directions, rotates clockwise, flips horizontally, or deletes. Holding and
 dragging any entity in Select mode moves it directly after a short movement
-threshold, independent of the active Select tool. Ctrl/Command or Shift-click
-adds entities to the ordered selection, and dragging from an empty cell creates
-a marquee that selects intersecting footprints. Workspace arrow keys perform
-one-cell moves while Transform is active. Commands remain disabled during
-initial sync/resync and for users without `edit_timeline`.
+threshold, independent of the active Select tool. `Ctrl`+`Shift`-drag duplicates
+the selected entity group (decorators are intentionally not cloned); while a
+drag is active, `R` rotates the group clockwise around the landing grid point.
+`Delete` removes the selected entity group as one undoable operation.
+Ctrl/Command or Shift-click adds entities to the ordered selection, and dragging
+from an empty cell creates a marquee that selects intersecting footprints.
+Workspace arrow keys perform one-cell moves while Transform is active. Commands
+remain disabled during initial sync/resync and for users without `edit_timeline`.
 
-Drag a Block or Pool template from the Place panel, or a connected draft from
-Entity templates, and drop it on an unoccupied floor footprint. One drop emits
+Choose the Block or Pool placement context in Shape Studio, then drag a saved
+thumbnail from Shape Templates onto an unoccupied floor footprint. One drop emits
 one authoritative placement command for the complete shape. The default Block
 mirrors the reference editor: color index `1`, default
 collect radius, unlimited capacity, and unlocked capacity. The default Blind is

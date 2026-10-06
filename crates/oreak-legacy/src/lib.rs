@@ -57,6 +57,8 @@ pub struct LegacyLevel {
     snapshot: LevelSnapshot,
     duration: f32,
     records: Vec<LegacyRecord>,
+    tombstones: Vec<TombstoneRecord>,
+    tombstone_sidecar_writable: bool,
     compatibility: CompatibilityState,
 }
 
@@ -70,6 +72,15 @@ struct LegacyRecord {
 }
 
 #[derive(Clone, Debug)]
+enum TombstoneRecord {
+    Glass(LegacyRecord),
+    Opaque {
+        id: Option<String>,
+        envelope: JsonNode,
+    },
+}
+
+#[derive(Clone, Debug)]
 enum RecordKind {
     Block {
         metadata: GridMetadata,
@@ -80,6 +91,9 @@ enum RecordKind {
         placeholder: bool,
     },
     Ice {
+        count: u32,
+    },
+    Glass {
         count: u32,
     },
     Direction,
@@ -200,6 +214,22 @@ impl LegacyLevel {
                     });
                     RecordKind::Ice { count }
                 }
+                "glass" => {
+                    let target = parse_decorator_target(payload, &path, "deco")?;
+                    let count =
+                        parse_u32(required(payload, "count")?, &format!("{path}[1].count"))?;
+                    if count == 0 {
+                        return Err(invalid(
+                            format!("{path}[1].count"),
+                            "zero-count Glass must be stored in _led.dt",
+                        ));
+                    }
+                    pending_decorators.push(PendingDecorator {
+                        id: id.clone(),
+                        kind: PendingDecoratorKind::Glass { target, count },
+                    });
+                    RecordKind::Glass { count }
+                }
                 "direction" => {
                     let target = parse_decorator_target(payload, &path, "deco")?;
                     let direction = match required(payload, "dir")?.as_str() {
@@ -249,6 +279,8 @@ impl LegacyLevel {
                 kind,
             });
         }
+        let (tombstones, tombstone_sidecar_writable) =
+            parse_glass_tombstones(&source, &mut ids, &mut pending_decorators)?;
 
         let resolution = inferred_resolution.unwrap_or(usize::from(DEFAULT_BLIND_PIXELS_PER_CELL));
         for pending in pending_blinds {
@@ -299,6 +331,8 @@ impl LegacyLevel {
             snapshot,
             duration,
             records,
+            tombstones,
+            tombstone_sidecar_writable,
             compatibility,
         })
     }
@@ -342,6 +376,15 @@ impl LegacyLevel {
         })
     }
 
+    #[must_use]
+    pub fn glass_count(&self, id: &DecoratorId) -> Option<u32> {
+        self.glass_source_record(id)
+            .and_then(|record| match &record.kind {
+                RecordKind::Glass { count } => Some(*count),
+                _ => None,
+            })
+    }
+
     pub fn export(&self, snapshot: &LevelSnapshot) -> Result<String, LegacyError> {
         self.export_with_duration(snapshot, self.duration)
     }
@@ -356,6 +399,7 @@ impl LegacyLevel {
         }
         snapshot.validate_domain().map_err(domain)?;
         validate_legacy_semantics(snapshot)?;
+        self.validate_opaque_tombstone_ids(snapshot)?;
         if matches!(self.compatibility, CompatibilityState::ReadOnly { .. })
             && (snapshot != &self.snapshot || duration != self.duration)
         {
@@ -401,6 +445,9 @@ impl LegacyLevel {
             root = root
                 .set(ENTITIES_PROPERTY, JsonNode::array(entities))
                 .map_err(json_internal)?;
+            if self.glass_tombstones_changed(snapshot) {
+                root = self.patch_glass_tombstones(root, self.build_tombstones(snapshot)?)?;
+            }
         }
         Ok(root.render())
     }
@@ -443,7 +490,10 @@ impl LegacyLevel {
                     emitted.insert(record.id.clone());
                     output.push(self.build_placeable(record, entity)?);
                 }
-                RecordKind::Ice { .. } | RecordKind::Direction | RecordKind::KeyLocker => {
+                RecordKind::Ice { .. }
+                | RecordKind::Glass { .. }
+                | RecordKind::Direction
+                | RecordKind::KeyLocker => {
                     if entities.contains_key(record.id.as_str()) {
                         return Err(LegacyError::UnsupportedChange {
                             entity_id: record.id.clone(),
@@ -454,6 +504,16 @@ impl LegacyLevel {
                     let Some(decorator) = decorators.get(record.id.as_str()) else {
                         continue;
                     };
+                    if is_glass_tombstone(decorator) {
+                        if matches!(&record.kind, RecordKind::Glass { .. }) {
+                            continue;
+                        }
+                        return Err(LegacyError::UnsupportedChange {
+                            entity_id: record.id.clone(),
+                            reason: "changing a decorator marker would discard marker-specific payload data"
+                                .to_owned(),
+                        });
+                    }
                     emitted.insert(record.id.clone());
                     output.push(self.build_decorator(record, decorator)?);
                 }
@@ -465,11 +525,158 @@ impl LegacyLevel {
             }
         }
         for decorator in snapshot.decorators() {
-            if emitted.insert(decorator.id().as_str().to_owned()) {
+            if !is_glass_tombstone(decorator) && emitted.insert(decorator.id().as_str().to_owned())
+            {
+                let envelope = if matches!(decorator.kind(), DecoratorKind::Glass { .. }) {
+                    if let Some(record) = self.glass_source_record(decorator.id()) {
+                        self.build_decorator(record, decorator)?
+                    } else {
+                        self.build_new_decorator(decorator)?
+                    }
+                } else {
+                    self.build_new_decorator(decorator)?
+                };
+                output.push(envelope);
+            }
+        }
+        Ok(output)
+    }
+
+    fn validate_opaque_tombstone_ids(&self, snapshot: &LevelSnapshot) -> Result<(), LegacyError> {
+        for id in self
+            .tombstones
+            .iter()
+            .filter_map(|tombstone| match tombstone {
+                TombstoneRecord::Opaque { id, .. } => id.as_deref(),
+                TombstoneRecord::Glass(_) => None,
+            })
+        {
+            if snapshot
+                .entities()
+                .iter()
+                .any(|entity| entity.id().as_str() == id)
+                || snapshot
+                    .decorators()
+                    .iter()
+                    .any(|decorator| decorator.id().as_str() == id)
+            {
+                return Err(LegacyError::DuplicateEntityId(id.to_owned()));
+            }
+        }
+        Ok(())
+    }
+
+    fn glass_tombstones_changed(&self, snapshot: &LevelSnapshot) -> bool {
+        let baseline: Vec<_> = self
+            .snapshot
+            .decorators()
+            .iter()
+            .filter(|decorator| is_glass_tombstone(decorator))
+            .collect();
+        let current: Vec<_> = snapshot
+            .decorators()
+            .iter()
+            .filter(|decorator| is_glass_tombstone(decorator))
+            .collect();
+        baseline != current
+    }
+
+    fn glass_source_record(&self, id: &DecoratorId) -> Option<&LegacyRecord> {
+        self.records
+            .iter()
+            .find(|record| {
+                record.id == id.as_str() && matches!(&record.kind, RecordKind::Glass { .. })
+            })
+            .or_else(|| {
+                self.tombstones
+                    .iter()
+                    .find_map(|tombstone| match tombstone {
+                        TombstoneRecord::Glass(record)
+                            if record.id == id.as_str()
+                                && matches!(&record.kind, RecordKind::Glass { .. }) =>
+                        {
+                            Some(record)
+                        }
+                        TombstoneRecord::Glass(_) | TombstoneRecord::Opaque { .. } => None,
+                    })
+            })
+    }
+
+    fn build_tombstones(&self, snapshot: &LevelSnapshot) -> Result<Vec<JsonNode>, LegacyError> {
+        let decorators: HashMap<_, _> = snapshot
+            .decorators()
+            .iter()
+            .map(|decorator| (decorator.id().as_str(), decorator))
+            .collect();
+        let mut emitted = HashSet::new();
+        let mut output = Vec::new();
+        for tombstone in &self.tombstones {
+            match tombstone {
+                TombstoneRecord::Opaque { envelope, .. } => output.push(envelope.clone()),
+                TombstoneRecord::Glass(record) => {
+                    let Some(decorator) = decorators.get(record.id.as_str()) else {
+                        continue;
+                    };
+                    if !matches!(decorator.kind(), DecoratorKind::Glass { .. }) {
+                        return Err(LegacyError::UnsupportedChange {
+                            entity_id: record.id.clone(),
+                            reason: "changing a decorator marker would discard marker-specific payload data"
+                                .to_owned(),
+                        });
+                    }
+                    if !is_glass_tombstone(decorator) {
+                        continue;
+                    }
+                    emitted.insert(record.id.clone());
+                    output.push(self.build_decorator(record, decorator)?);
+                }
+            }
+        }
+        for record in &self.records {
+            if !matches!(&record.kind, RecordKind::Glass { .. }) {
+                continue;
+            }
+            let Some(decorator) = decorators.get(record.id.as_str()) else {
+                continue;
+            };
+            if is_glass_tombstone(decorator) && emitted.insert(record.id.clone()) {
+                output.push(self.build_decorator(record, decorator)?);
+            }
+        }
+        for decorator in snapshot.decorators() {
+            if is_glass_tombstone(decorator) && emitted.insert(decorator.id().as_str().to_owned()) {
                 output.push(self.build_new_decorator(decorator)?);
             }
         }
         Ok(output)
+    }
+
+    fn patch_glass_tombstones(
+        &self,
+        root: JsonNode,
+        tombstones: Vec<JsonNode>,
+    ) -> Result<JsonNode, LegacyError> {
+        if !self.tombstone_sidecar_writable {
+            return Err(LegacyError::UnsupportedChange {
+                entity_id: "_led".to_owned(),
+                reason: "cannot change Glass tombstones because _led.dt is opaque".to_owned(),
+            });
+        }
+        let tombstones = JsonNode::array(tombstones);
+        let sidecar = match root.get("_led") {
+            Some(existing) => {
+                if existing.as_object().is_none() {
+                    return Err(LegacyError::UnsupportedChange {
+                        entity_id: "_led".to_owned(),
+                        reason: "cannot add decorator tombstones because _led is not an object"
+                            .to_owned(),
+                    });
+                }
+                existing.set("dt", tombstones).map_err(json_internal)?
+            }
+            None => JsonNode::object(vec![("dt", tombstones)]),
+        };
+        root.set("_led", sidecar).map_err(json_internal)
     }
 
     fn build_placeable(
@@ -708,6 +915,16 @@ impl LegacyLevel {
     }
 }
 
+fn is_glass_tombstone(decorator: &Decorator) -> bool {
+    matches!(
+        decorator.kind(),
+        DecoratorKind::Glass {
+            blocking_count: 0,
+            ..
+        }
+    )
+}
+
 #[must_use]
 pub const fn resolved_collect_radius(layer: &CollectLayer) -> u8 {
     match layer.radius() {
@@ -725,6 +942,10 @@ struct PendingDecorator {
 #[derive(Clone, Debug)]
 enum PendingDecoratorKind {
     Ice {
+        target: String,
+        count: u32,
+    },
+    Glass {
         target: String,
         count: u32,
     },
@@ -805,6 +1026,83 @@ fn parse_envelope<'a>(
         .as_object()
         .ok_or_else(|| invalid(format!("{path}[1]"), "must be an object"))?;
     Ok((marker, payload))
+}
+
+fn opaque_tombstone_id(envelope: &JsonNode) -> Option<String> {
+    envelope
+        .as_array()?
+        .get(1)?
+        .as_object()?
+        .get("eid")?
+        .as_str()
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned)
+}
+
+fn parse_glass_tombstones(
+    source: &JsonNode,
+    ids: &mut HashSet<String>,
+    pending_decorators: &mut Vec<PendingDecorator>,
+) -> Result<(Vec<TombstoneRecord>, bool), LegacyError> {
+    let Some(sidecar) = source.get("_led") else {
+        return Ok((Vec::new(), true));
+    };
+    let Some(sidecar) = sidecar.as_object() else {
+        return Ok((Vec::new(), false));
+    };
+    let Some(tombstones) = sidecar.get("dt") else {
+        return Ok((Vec::new(), true));
+    };
+    let Some(tombstones) = tombstones.as_array() else {
+        return Ok((Vec::new(), false));
+    };
+    let mut records = Vec::with_capacity(tombstones.len());
+    for (index, envelope) in tombstones.iter().enumerate() {
+        let path = format!("_led.dt[{index}]");
+        let is_glass = envelope
+            .as_array()
+            .and_then(|values| values.first())
+            .and_then(JsonNode::as_str)
+            == Some("glass");
+        if !is_glass {
+            let id = opaque_tombstone_id(envelope);
+            if let Some(id) = &id
+                && !ids.insert(id.clone())
+            {
+                return Err(LegacyError::DuplicateEntityId(id.clone()));
+            }
+            records.push(TombstoneRecord::Opaque {
+                id,
+                envelope: envelope.clone(),
+            });
+            continue;
+        }
+        let (marker, payload) = parse_envelope(envelope, &path)?;
+        let id = parse_nonempty_string(required(payload, "eid")?, &format!("{path}[1].eid"))?;
+        if !ids.insert(id.clone()) {
+            return Err(LegacyError::DuplicateEntityId(id));
+        }
+        let target = parse_decorator_target(payload, &path, "deco")?;
+        let count = parse_u32(required(payload, "count")?, &format!("{path}[1].count"))?;
+        if count != 0 {
+            return Err(invalid(
+                format!("{path}[1].count"),
+                "Glass tombstone count must be zero",
+            ));
+        }
+        pending_decorators.push(PendingDecorator {
+            id: id.clone(),
+            kind: PendingDecoratorKind::Glass { target, count },
+        });
+        records.push(TombstoneRecord::Glass(LegacyRecord {
+            id,
+            marker,
+            envelope: envelope.clone(),
+            payload: payload.clone(),
+            kind: RecordKind::Glass { count },
+        }));
+    }
+    Ok((records, true))
 }
 
 fn parse_grid(
@@ -1206,7 +1504,15 @@ fn resolve_decorators(
                 .then_some(entity.id().as_str().to_owned())
         })
         .collect();
+    let blinds: HashSet<_> = placeables
+        .iter()
+        .filter_map(|entity| {
+            matches!(entity.kind(), PlaceableEntityKind::Blind(_))
+                .then_some(entity.id().as_str().to_owned())
+        })
+        .collect();
     let mut ice_targets = HashSet::new();
+    let mut glass_targets = HashSet::new();
     let mut direction_targets = HashSet::new();
     let mut key_targets = HashSet::new();
     let mut locker_targets = HashSet::new();
@@ -1222,6 +1528,16 @@ fn resolve_decorators(
                     ));
                 }
                 Decorator::ice_with_blocking_count(decorator.id, target, count)
+            }
+            PendingDecoratorKind::Glass { target, count } => {
+                require_blind(&blinds, &decorator.id, &target, "deco")?;
+                if !glass_targets.insert(target.clone()) {
+                    return Err(invalid(
+                        decorator.id,
+                        format!("Pool '{target}' has more than one Glass decorator"),
+                    ));
+                }
+                Decorator::glass_with_blocking_count(decorator.id, target, count)
             }
             PendingDecoratorKind::Direction { target, direction } => {
                 require_block(&blocks, &decorator.id, &target, "deco")?;
@@ -1279,6 +1595,23 @@ fn require_block(
     }
 }
 
+fn require_blind(
+    blinds: &HashSet<String>,
+    decorator: &str,
+    target: &str,
+    field: &str,
+) -> Result<(), LegacyError> {
+    if blinds.contains(target) {
+        Ok(())
+    } else {
+        Err(LegacyError::InvalidReference {
+            decorator_id: decorator.to_owned(),
+            field: field.to_owned(),
+            entity_id: target.to_owned(),
+        })
+    }
+}
+
 fn validate_legacy_semantics(snapshot: &LevelSnapshot) -> Result<(), LegacyError> {
     let mut ids: HashSet<&str> = snapshot
         .entities()
@@ -1299,7 +1632,15 @@ fn validate_legacy_semantics(snapshot: &LevelSnapshot) -> Result<(), LegacyError
             matches!(entity.kind(), PlaceableEntityKind::Block(_)).then_some(entity.id())
         })
         .collect();
+    let blinds: HashSet<_> = snapshot
+        .entities()
+        .iter()
+        .filter_map(|entity| {
+            matches!(entity.kind(), PlaceableEntityKind::Blind(_)).then_some(entity.id())
+        })
+        .collect();
     let mut ice = HashSet::new();
+    let mut glass = HashSet::new();
     let mut direction = HashSet::new();
     let mut keys = HashSet::new();
     let mut lockers = HashSet::new();
@@ -1320,6 +1661,22 @@ fn validate_legacy_semantics(snapshot: &LevelSnapshot) -> Result<(), LegacyError
                     return Err(invalid(
                         decorator.id().as_str(),
                         "duplicate Ice decorator on one Block",
+                    ));
+                }
+            }
+            DecoratorKind::Glass { entity, .. } => {
+                validate_target(&blinds, decorator, entity, "deco")?;
+                let count = decorator.glass_blocking_count().unwrap_or_default();
+                if count > i32::MAX as u32 {
+                    return Err(invalid(
+                        decorator.id().as_str(),
+                        "Glass blocking count exceeds the legacy signed 32-bit range",
+                    ));
+                }
+                if !glass.insert(entity) {
+                    return Err(invalid(
+                        decorator.id().as_str(),
+                        "duplicate Glass decorator on one Pool",
                     ));
                 }
             }
@@ -1675,6 +2032,15 @@ fn patch_decorator_payload(
                 .set("count", JsonNode::number(*blocking_count))
                 .map_err(json_internal)?;
         }
+        DecoratorKind::Glass {
+            entity,
+            blocking_count,
+        } => {
+            payload = payload
+                .set("deco", JsonNode::string(entity.as_str()))
+                .and_then(|payload| payload.set("count", JsonNode::number(*blocking_count)))
+                .map_err(json_internal)?;
+        }
         DecoratorKind::Direction { entity, direction } => {
             let axis = match direction {
                 CardinalDirection::Left | CardinalDirection::Right => "Horizontal",
@@ -1698,6 +2064,7 @@ fn patch_decorator_payload(
 fn marker_for_decorator(decorator: &Decorator) -> &'static str {
     match decorator.kind() {
         DecoratorKind::Ice { .. } => "ice",
+        DecoratorKind::Glass { .. } => "glass",
         DecoratorKind::Direction { .. } => "direction",
         DecoratorKind::KeyLocker { .. } => "key-locker",
     }
@@ -1836,7 +2203,7 @@ pub enum LegacyError {
     #[error("duplicate global entity ID '{0}'")]
     DuplicateEntityId(String),
     #[error(
-        "decorator '{decorator_id}' field '{field}' references missing or non-Block entity '{entity_id}'"
+        "decorator '{decorator_id}' field '{field}' references a missing or incompatible entity '{entity_id}'"
     )]
     InvalidReference {
         decorator_id: String,

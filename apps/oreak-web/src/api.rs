@@ -128,6 +128,24 @@ pub struct ShapeCatalogList {
     pub shapes: Vec<ShapeCatalogEntry>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct ImageCatalogEntry {
+    pub id: String,
+    pub name: String,
+    pub media_type: String,
+    pub content_hash: String,
+    pub byte_size: usize,
+    pub width: u32,
+    pub height: u32,
+    pub created_by: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+struct ImageCatalogList {
+    images: Vec<ImageCatalogEntry>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CredentialsRequest<'a> {
     pub email: &'a str,
@@ -416,6 +434,32 @@ impl RestClient {
         .await
     }
 
+    pub async fn list_image_catalog(
+        self,
+        project_id: &str,
+    ) -> Result<Vec<ImageCatalogEntry>, ApiError> {
+        self.get::<ImageCatalogList>(&format!("/api/projects/{project_id}/images"))
+            .await
+            .map(|response| response.images)
+    }
+
+    pub async fn upload_image(
+        self,
+        project_id: &str,
+        name: &str,
+        file: web_sys::File,
+        media_type: &str,
+    ) -> Result<ImageCatalogEntry, ApiError> {
+        let name: String = js_sys::encode_uri_component(name).into();
+        self.request_binary_json(
+            "POST",
+            &format!("/api/projects/{project_id}/images?name={name}"),
+            file.into(),
+            media_type,
+        )
+        .await
+    }
+
     async fn get<T: serde::de::DeserializeOwned>(self, path: &str) -> Result<T, ApiError> {
         self.request_json("GET", path, None).await
     }
@@ -454,6 +498,21 @@ impl RestClient {
         body: Option<String>,
     ) -> Result<T, ApiError> {
         let (status, text, retry_after) = send(method, path, body).await?;
+        if !(200..300).contains(&status) {
+            return Err(parse_api_error(status, &text, retry_after.as_deref()));
+        }
+        serde_json::from_str(&text)
+            .map_err(|error| ApiError::network(format!("invalid API response: {error}")))
+    }
+
+    async fn request_binary_json<T: serde::de::DeserializeOwned>(
+        self,
+        method: &str,
+        path: &str,
+        body: wasm_bindgen::JsValue,
+        content_type: &str,
+    ) -> Result<T, ApiError> {
+        let (status, text, retry_after) = send_binary(method, path, body, content_type).await?;
         if !(200..300).contains(&status) {
             return Err(parse_api_error(status, &text, retry_after.as_deref()));
         }
@@ -527,6 +586,53 @@ async fn send(
 }
 
 #[cfg(target_arch = "wasm32")]
+async fn send_binary(
+    method: &str,
+    path: &str,
+    body: wasm_bindgen::JsValue,
+    content_type: &str,
+) -> Result<(u16, String, Option<String>), ApiError> {
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_futures::JsFuture;
+    use web_sys::{Request, RequestCredentials, RequestInit, Response};
+
+    let init = RequestInit::new();
+    init.set_method(method);
+    init.set_credentials(RequestCredentials::Include);
+    init.set_body(&body);
+    let request = Request::new_with_str_and_init(path, &init)
+        .map_err(|error| ApiError::network(js_error(error)))?;
+    request
+        .headers()
+        .set("Content-Type", content_type)
+        .map_err(|error| ApiError::network(js_error(error)))?;
+    request
+        .headers()
+        .set("Accept", "application/json")
+        .map_err(|error| ApiError::network(js_error(error)))?;
+
+    let window =
+        web_sys::window().ok_or_else(|| ApiError::network("browser window unavailable"))?;
+    let response = JsFuture::from(window.fetch_with_request(&request))
+        .await
+        .map_err(|error| ApiError::network(js_error(error)))?
+        .dyn_into::<Response>()
+        .map_err(|error| ApiError::network(js_error(error)))?;
+    let status = response.status();
+    let retry_after = response.headers().get("Retry-After").ok().flatten();
+    let text = JsFuture::from(
+        response
+            .text()
+            .map_err(|error| ApiError::network(js_error(error)))?,
+    )
+    .await
+    .map_err(|error| ApiError::network(js_error(error)))?
+    .as_string()
+    .unwrap_or_default();
+    Ok((status, text, retry_after))
+}
+
+#[cfg(target_arch = "wasm32")]
 fn js_error(error: wasm_bindgen::JsValue) -> String {
     error
         .as_string()
@@ -555,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn rest_dtos_deserialize_server_shapes() {
+    fn rest_dtos_deserialize_server_catalogs() {
         let user: UserSummary = serde_json::from_str(
             r#"{"id":"usr_1","email":"a@example.com","personal_workspace_id":"ws_1"}"#,
         )
@@ -568,12 +674,17 @@ mod tests {
             r#"{"shapes":[{"id":"shp_1","name":"Corner","shape":{"width":2,"height":2,"occupied_mask":7},"created_by":"usr_1","created_at_ms":1000,"updated_by":"usr_1","updated_at_ms":1000}]}"#,
         )
         .unwrap();
+        let images: ImageCatalogList = serde_json::from_str(
+            r#"{"images":[{"id":"img_1","name":"Portal texture","media_type":"image/png","content_hash":"blake3:abc","byte_size":72,"width":1,"height":1,"created_by":"usr_1","created_at_ms":1000}]}"#,
+        )
+        .unwrap();
 
         assert_eq!(user.personal_workspace_id, "ws_1");
         assert!(catalog.projects[0].project.can_edit_timeline());
         assert_eq!(catalog.projects[0].levels[0].name, "Opening");
         assert_eq!(catalog.projects[0].levels[0].duration_seconds, 90.0);
         assert_eq!(shapes.shapes[0].shape.occupied_mask, 7);
+        assert_eq!(images.images[0].content_hash, "blake3:abc");
     }
 
     #[test]

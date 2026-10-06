@@ -215,6 +215,23 @@ impl LevelSnapshot {
     }
 
     #[must_use]
+    pub fn glass_for_entity(&self, entity_id: &EntityId) -> Option<&Decorator> {
+        self.decorators.iter().find(|decorator| {
+            matches!(
+                decorator.kind(),
+                DecoratorKind::Glass { entity, .. } if entity == entity_id
+            )
+        })
+    }
+
+    #[must_use]
+    pub fn glass_blocking_count(&self, entity_id: &EntityId) -> u32 {
+        self.glass_for_entity(entity_id)
+            .and_then(Decorator::glass_blocking_count)
+            .unwrap_or_default()
+    }
+
+    #[must_use]
     pub fn direction_for_entity(&self, entity_id: &EntityId) -> Option<&Decorator> {
         self.decorators.iter().find(|decorator| {
             matches!(
@@ -445,6 +462,17 @@ impl LevelSnapshot {
                         hasher.update(&blocking_count.to_le_bytes());
                     }
                 }
+                DecoratorKind::Glass {
+                    entity,
+                    blocking_count,
+                } => {
+                    hasher.update(&[3]);
+                    hash_string(&mut hasher, entity.as_str());
+                    if *blocking_count != 1 {
+                        hasher.update(b"oreak-glass-blocking-count");
+                        hasher.update(&blocking_count.to_le_bytes());
+                    }
+                }
                 DecoratorKind::Direction { entity, direction } => {
                     hasher.update(&[1]);
                     hash_string(&mut hasher, entity.as_str());
@@ -483,6 +511,7 @@ impl LevelSnapshot {
         }
 
         let mut ice_owners = BTreeMap::new();
+        let mut glass_owners = BTreeMap::new();
         let mut direction_owners = BTreeMap::new();
         let mut key_owners = BTreeMap::new();
         let mut lock_owners = BTreeMap::new();
@@ -500,6 +529,15 @@ impl LevelSnapshot {
                 DecoratorKind::Ice { entity, .. } => {
                     self.validate_decorator_block_owner(decorator.id(), entity)?;
                     insert_owner(&mut ice_owners, DecoratorRole::Ice, entity, decorator.id())?
+                }
+                DecoratorKind::Glass { entity, .. } => {
+                    self.validate_decorator_blind_owner(decorator.id(), entity)?;
+                    insert_owner(
+                        &mut glass_owners,
+                        DecoratorRole::Glass,
+                        entity,
+                        decorator.id(),
+                    )?
                 }
                 DecoratorKind::Direction { entity, .. } => {
                     self.validate_decorator_block_owner(decorator.id(), entity)?;
@@ -553,6 +591,23 @@ impl LevelSnapshot {
             return Ok(());
         }
         Err(LevelError::DecoratorOwnerNotBlock {
+            decorator_id: decorator_id.clone(),
+            entity_id: entity_id.clone(),
+        })
+    }
+
+    fn validate_decorator_blind_owner(
+        &self,
+        decorator_id: &DecoratorId,
+        entity_id: &EntityId,
+    ) -> Result<(), LevelError> {
+        if self
+            .entity(entity_id)
+            .is_some_and(|entity| matches!(entity.kind(), PlaceableEntityKind::Blind(_)))
+        {
+            return Ok(());
+        }
+        Err(LevelError::DecoratorOwnerNotBlind {
             decorator_id: decorator_id.clone(),
             entity_id: entity_id.clone(),
         })
@@ -655,6 +710,7 @@ fn hash_string(hasher: &mut blake3::Hasher, value: &str) {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DecoratorRole {
     Ice,
+    Glass,
     Direction,
     Key,
     Lock,
@@ -749,6 +805,12 @@ pub enum LevelError {
 
     #[error("decorator '{decorator_id}' owner '{entity_id}' is not a Block")]
     DecoratorOwnerNotBlock {
+        decorator_id: DecoratorId,
+        entity_id: EntityId,
+    },
+
+    #[error("decorator '{decorator_id}' owner '{entity_id}' is not a Blind")]
+    DecoratorOwnerNotBlind {
         decorator_id: DecoratorId,
         entity_id: EntityId,
     },

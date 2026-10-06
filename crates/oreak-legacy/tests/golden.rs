@@ -1,6 +1,6 @@
 use oreak_core::{
     Blind, BlindTile, CardinalDirection, CollectCapacity, CommandEnvelope, CommandMetadata,
-    DecoratorKind, EntityId, GridPoint, LevelCommand, LevelSnapshot, LevelTimeline,
+    DecoratorId, DecoratorKind, EntityId, GridPoint, LevelCommand, LevelSnapshot, LevelTimeline,
     PlaceableEntity, PlaceableEntityKind,
 };
 use oreak_legacy::{
@@ -331,6 +331,289 @@ fn decorators_resolve_after_entities_and_preserve_roles_and_count() {
         level.snapshot().decorators()[2].kind(),
         DecoratorKind::KeyLocker { entity, key }
             if entity.as_str() == "locker" && key.as_str() == "key"
+    ));
+}
+
+#[test]
+fn glass_resolves_after_pool_and_patches_its_known_payload() {
+    let board = token(&[1]);
+    let shape = token(&[1]);
+    let json = format!(
+        r#"{{"dur":0,"bes":[1,1],"bdat":"{board}","entitites":[["glass",{{"eid":"g","deco":"p","count":2,"future":"keep"}}],["pool",{{"eid":"p","g":{{"r":[0,0,1,1],"d":"{shape}"}},"stc":{{"c":{{"r":[1,1],"cmp":true,"data":null}}}}}}]]}}"#
+    );
+    let level = LegacyLevel::parse(&json).unwrap();
+    assert_eq!(level.glass_count(&DecoratorId::from("g")), Some(2));
+    assert!(matches!(
+        level.snapshot().decorators()[0].kind(),
+        DecoratorKind::Glass {
+            blocking_count: 2,
+            ..
+        }
+    ));
+    assert_eq!(level.export(level.snapshot()).unwrap(), json);
+
+    let mut timeline = LevelTimeline::new(level.snapshot().clone()).unwrap();
+    timeline
+        .apply(CommandEnvelope::new(
+            CommandMetadata::new("set-glass", "web", 100),
+            LevelCommand::SetGlass {
+                decorator_id: DecoratorId::from("g"),
+                entity_id: EntityId::from("p"),
+                blocking_count: 5,
+            },
+        ))
+        .unwrap();
+    let output = level.export(timeline.snapshot()).unwrap();
+    assert!(output.contains(r#""count":5"#));
+    assert!(output.contains(r#""future":"keep""#));
+    assert_eq!(
+        LegacyLevel::parse(&output).unwrap().snapshot(),
+        timeline.snapshot()
+    );
+
+    let patched_level = LegacyLevel::parse(&output).unwrap();
+    let mut disabled_timeline = LevelTimeline::new(patched_level.snapshot().clone()).unwrap();
+    disabled_timeline
+        .apply(CommandEnvelope::new(
+            CommandMetadata::new("disable-glass", "web", 101),
+            LevelCommand::ToggleGlass {
+                decorator_id: DecoratorId::from("g"),
+                entity_id: EntityId::from("p"),
+            },
+        ))
+        .unwrap();
+    let archived = patched_level.export(disabled_timeline.snapshot()).unwrap();
+    assert!(archived.contains(r#""future":"keep""#));
+    let archived_level = LegacyLevel::parse(&archived).unwrap();
+    let mut enabled_timeline = LevelTimeline::new(archived_level.snapshot().clone()).unwrap();
+    enabled_timeline
+        .apply(CommandEnvelope::new(
+            CommandMetadata::new("enable-glass", "web", 102),
+            LevelCommand::ToggleGlass {
+                decorator_id: DecoratorId::from("g"),
+                entity_id: EntityId::from("p"),
+            },
+        ))
+        .unwrap();
+    assert!(
+        archived_level
+            .export(enabled_timeline.snapshot())
+            .unwrap()
+            .contains(r#""future":"keep""#)
+    );
+}
+
+#[test]
+fn new_active_glass_exports_with_the_legacy_marker() {
+    let board = token(&[1]);
+    let shape = token(&[1]);
+    let json = format!(
+        r#"{{"dur":0,"bes":[1,1],"bdat":"{board}","entitites":[["pool",{{"eid":"p","g":{{"r":[0,0,1,1],"d":"{shape}"}},"stc":{{"c":{{"r":[1,1],"cmp":true,"data":null}}}}}}]]}}"#
+    );
+    let level = LegacyLevel::parse(&json).unwrap();
+    let mut timeline = LevelTimeline::new(level.snapshot().clone()).unwrap();
+    timeline
+        .apply(CommandEnvelope::new(
+            CommandMetadata::new("set-glass", "web", 100),
+            LevelCommand::SetGlass {
+                decorator_id: DecoratorId::from("g"),
+                entity_id: EntityId::from("p"),
+                blocking_count: 2,
+            },
+        ))
+        .unwrap();
+    let output = level.export(timeline.snapshot()).unwrap();
+    assert!(output.contains(r#"["glass",{"eid":"g","deco":"p","count":2}]"#));
+    assert_eq!(
+        LegacyLevel::parse(&output).unwrap().snapshot(),
+        timeline.snapshot()
+    );
+}
+
+#[test]
+fn glass_tombstones_move_between_active_entities_and_led_dt() {
+    let board = token(&[1]);
+    let shape = token(&[1]);
+    let json = format!(
+        r#"{{"dur":0,"bes":[1,1],"bdat":"{board}","entitites":[["pool",{{"eid":"p","g":{{"r":[0,0,1,1],"d":"{shape}"}},"stc":{{"c":{{"r":[1,1],"cmp":true,"data":null}}}}}}]],"_led":{{"future":{{"keep":[1,  2]}},"dt":[["custom-tomb",{{"opaque":[1,  2]}}]]}}}}"#
+    );
+    let level = LegacyLevel::parse(&json).unwrap();
+    let mut active_timeline = LevelTimeline::new(level.snapshot().clone()).unwrap();
+    active_timeline
+        .apply(CommandEnvelope::new(
+            CommandMetadata::new("set-glass", "web", 100),
+            LevelCommand::SetGlass {
+                decorator_id: DecoratorId::from("g"),
+                entity_id: EntityId::from("p"),
+                blocking_count: 2,
+            },
+        ))
+        .unwrap();
+    let active = level.export(active_timeline.snapshot()).unwrap();
+    let active_level = LegacyLevel::parse(&active).unwrap();
+
+    let mut disabled_timeline = LevelTimeline::new(active_level.snapshot().clone()).unwrap();
+    disabled_timeline
+        .apply(CommandEnvelope::new(
+            CommandMetadata::new("disable-glass", "web", 101),
+            LevelCommand::ToggleGlass {
+                decorator_id: DecoratorId::from("g"),
+                entity_id: EntityId::from("p"),
+            },
+        ))
+        .unwrap();
+    let disabled = active_level.export(disabled_timeline.snapshot()).unwrap();
+    let disabled_value: serde_json::Value = serde_json::from_str(&disabled).unwrap();
+    assert_eq!(disabled_value["entitites"].as_array().unwrap().len(), 1);
+    let tombstones = disabled_value["_led"]["dt"].as_array().unwrap();
+    assert!(
+        tombstones.iter().any(|entry| {
+            entry[0] == "glass" && entry[1]["eid"] == "g" && entry[1]["count"] == 0
+        })
+    );
+    assert!(tombstones.iter().any(|entry| {
+        entry[0] == "custom-tomb" && entry[1]["opaque"] == serde_json::json!([1, 2])
+    }));
+    assert!(disabled.contains(r#""future":{"keep":[1,  2]}"#));
+
+    let disabled_level = LegacyLevel::parse(&disabled).unwrap();
+    assert_eq!(
+        disabled_level
+            .snapshot()
+            .glass_blocking_count(&EntityId::from("p")),
+        0
+    );
+    assert_eq!(disabled_level.glass_count(&DecoratorId::from("g")), Some(0));
+    let mut reenabled_timeline = LevelTimeline::new(disabled_level.snapshot().clone()).unwrap();
+    reenabled_timeline
+        .apply(CommandEnvelope::new(
+            CommandMetadata::new("enable-glass", "web", 102),
+            LevelCommand::ToggleGlass {
+                decorator_id: DecoratorId::from("g"),
+                entity_id: EntityId::from("p"),
+            },
+        ))
+        .unwrap();
+    let reenabled = disabled_level
+        .export(reenabled_timeline.snapshot())
+        .unwrap();
+    let reenabled_value: serde_json::Value = serde_json::from_str(&reenabled).unwrap();
+    assert!(
+        reenabled_value["entitites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| {
+                entry[0] == "glass" && entry[1]["eid"] == "g" && entry[1]["count"] == 1
+            })
+    );
+    assert!(
+        !reenabled_value["_led"]["dt"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| { entry[0] == "glass" })
+    );
+    assert_eq!(
+        LegacyLevel::parse(&reenabled).unwrap().snapshot(),
+        reenabled_timeline.snapshot()
+    );
+}
+
+#[test]
+fn new_zero_glass_creates_led_dt() {
+    let board = token(&[1]);
+    let shape = token(&[1]);
+    let json = format!(
+        r#"{{"dur":0,"bes":[1,1],"bdat":"{board}","entitites":[["pool",{{"eid":"p","g":{{"r":[0,0,1,1],"d":"{shape}"}},"stc":{{"c":{{"r":[1,1],"cmp":true,"data":null}}}}}}]]}}"#
+    );
+    let level = LegacyLevel::parse(&json).unwrap();
+    let mut timeline = LevelTimeline::new(level.snapshot().clone()).unwrap();
+    timeline
+        .apply(CommandEnvelope::new(
+            CommandMetadata::new("set-glass", "web", 100),
+            LevelCommand::SetGlass {
+                decorator_id: DecoratorId::from("g"),
+                entity_id: EntityId::from("p"),
+                blocking_count: 0,
+            },
+        ))
+        .unwrap();
+    let output = level.export(timeline.snapshot()).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert!(
+        value["_led"]["dt"].as_array().unwrap().iter().any(|entry| {
+            entry[0] == "glass" && entry[1]["eid"] == "g" && entry[1]["count"] == 0
+        })
+    );
+    assert_eq!(
+        LegacyLevel::parse(&output).unwrap().snapshot(),
+        timeline.snapshot()
+    );
+}
+
+#[test]
+fn active_zero_glass_is_rejected_in_favor_of_led_dt() {
+    let board = token(&[1]);
+    let shape = token(&[1]);
+    let json = format!(
+        r#"{{"dur":0,"bes":[1,1],"bdat":"{board}","entitites":[["glass",{{"eid":"g","deco":"p","count":0}}],["pool",{{"eid":"p","g":{{"r":[0,0,1,1],"d":"{shape}"}},"stc":{{"c":{{"r":[1,1],"cmp":true,"data":null}}}}}}]]}}"#
+    );
+    assert!(matches!(
+        LegacyLevel::parse(&json),
+        Err(LegacyError::InvalidField { message, .. }) if message.contains("_led.dt")
+    ));
+}
+
+#[test]
+fn opaque_led_dt_is_preserved_and_blocks_new_glass_tombstones() {
+    let board = token(&[1]);
+    let shape = token(&[1]);
+    let json = format!(
+        r#"{{"dur":0,"bes":[1,1],"bdat":"{board}","entitites":[["pool",{{"eid":"p","g":{{"r":[0,0,1,1],"d":"{shape}"}},"stc":{{"c":{{"r":[1,1],"cmp":true,"data":null}}}}}}]],"_led":{{"dt":"opaque"}}}}"#
+    );
+    let level = LegacyLevel::parse(&json).unwrap();
+    assert_eq!(level.export(level.snapshot()).unwrap(), json);
+
+    let mut timeline = LevelTimeline::new(level.snapshot().clone()).unwrap();
+    timeline
+        .apply(CommandEnvelope::new(
+            CommandMetadata::new("set-glass", "web", 100),
+            LevelCommand::SetGlass {
+                decorator_id: DecoratorId::from("g"),
+                entity_id: EntityId::from("p"),
+                blocking_count: 0,
+            },
+        ))
+        .unwrap();
+    assert!(matches!(
+        level.export(timeline.snapshot()),
+        Err(LegacyError::UnsupportedChange { entity_id, .. }) if entity_id == "_led"
+    ));
+}
+
+#[test]
+fn opaque_led_dt_ids_block_conflicting_new_decorators() {
+    let board = token(&[1]);
+    let shape = token(&[1]);
+    let json = format!(
+        r#"{{"dur":0,"bes":[1,1],"bdat":"{board}","entitites":[["pool",{{"eid":"p","g":{{"r":[0,0,1,1],"d":"{shape}"}},"stc":{{"c":{{"r":[1,1],"cmp":true,"data":null}}}}}}]],"_led":{{"dt":[["future",{{"eid":"g"}}]]}}}}"#
+    );
+    let level = LegacyLevel::parse(&json).unwrap();
+    let mut timeline = LevelTimeline::new(level.snapshot().clone()).unwrap();
+    timeline
+        .apply(CommandEnvelope::new(
+            CommandMetadata::new("set-glass", "web", 100),
+            LevelCommand::SetGlass {
+                decorator_id: DecoratorId::from("g"),
+                entity_id: EntityId::from("p"),
+                blocking_count: 1,
+            },
+        ))
+        .unwrap();
+    assert!(matches!(
+        level.export(timeline.snapshot()),
+        Err(LegacyError::DuplicateEntityId(id)) if id == "g"
     ));
 }
 

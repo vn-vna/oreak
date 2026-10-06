@@ -8,8 +8,10 @@ publish = false
 [dependencies]
 argon2 = "0.5"
 axum = "0.8"
+blake3 = "1.8"
 getrandom = "0.3"
 httpdate = "1"
+image = { version = "=0.25.9", default-features = false, features = ["jpeg", "png", "webp"] }
 jsonrpsee = { version = "0.26", features = ["server"] }
 oreak-core = { path = "../../crates/oreak-core" }
 oreak-plugin-api = { path = "../../crates/oreak-plugin-api" }

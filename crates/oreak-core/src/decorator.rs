@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{DecoratorId, EntityId};
 
-const fn default_ice_blocking_count() -> u32 {
+const fn default_blocking_count() -> u32 {
     1
 }
 
@@ -36,7 +36,12 @@ impl CardinalDirection {
 pub enum DecoratorKind {
     Ice {
         entity: EntityId,
-        #[serde(default = "default_ice_blocking_count")]
+        #[serde(default = "default_blocking_count")]
+        blocking_count: u32,
+    },
+    Glass {
+        entity: EntityId,
+        #[serde(default = "default_blocking_count")]
         blocking_count: u32,
     },
     Direction {
@@ -58,7 +63,7 @@ pub struct Decorator {
 impl Decorator {
     #[must_use]
     pub fn ice(id: impl Into<DecoratorId>, entity: impl Into<EntityId>) -> Self {
-        Self::ice_with_blocking_count(id, entity, default_ice_blocking_count())
+        Self::ice_with_blocking_count(id, entity, default_blocking_count())
     }
 
     #[must_use]
@@ -70,6 +75,26 @@ impl Decorator {
         Self {
             id: id.into(),
             kind: DecoratorKind::Ice {
+                entity: entity.into(),
+                blocking_count,
+            },
+        }
+    }
+
+    #[must_use]
+    pub fn glass(id: impl Into<DecoratorId>, entity: impl Into<EntityId>) -> Self {
+        Self::glass_with_blocking_count(id, entity, default_blocking_count())
+    }
+
+    #[must_use]
+    pub fn glass_with_blocking_count(
+        id: impl Into<DecoratorId>,
+        entity: impl Into<EntityId>,
+        blocking_count: u32,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            kind: DecoratorKind::Glass {
                 entity: entity.into(),
                 blocking_count,
             },
@@ -140,6 +165,14 @@ impl Decorator {
     }
 
     #[must_use]
+    pub const fn glass_blocking_count(&self) -> Option<u32> {
+        match &self.kind {
+            DecoratorKind::Glass { blocking_count, .. } => Some(*blocking_count),
+            _ => None,
+        }
+    }
+
+    #[must_use]
     pub const fn direction_constraint(&self) -> Option<DirectionMode> {
         match &self.kind {
             DecoratorKind::Direction { direction, .. } => Some(direction.mode()),
@@ -150,18 +183,18 @@ impl Decorator {
     #[must_use]
     pub fn references(&self, entity_id: &EntityId) -> bool {
         match &self.kind {
-            DecoratorKind::Ice { entity, .. } | DecoratorKind::Direction { entity, .. } => {
-                entity == entity_id
-            }
+            DecoratorKind::Ice { entity, .. }
+            | DecoratorKind::Glass { entity, .. }
+            | DecoratorKind::Direction { entity, .. } => entity == entity_id,
             DecoratorKind::KeyLocker { entity, key } => entity == entity_id || key == entity_id,
         }
     }
 
     pub(crate) fn referenced_entities(&self) -> impl Iterator<Item = &EntityId> {
         let (first, second) = match &self.kind {
-            DecoratorKind::Ice { entity, .. } | DecoratorKind::Direction { entity, .. } => {
-                (entity, None)
-            }
+            DecoratorKind::Ice { entity, .. }
+            | DecoratorKind::Glass { entity, .. }
+            | DecoratorKind::Direction { entity, .. } => (entity, None),
             DecoratorKind::KeyLocker { entity, key } => (entity, Some(key)),
         };
         std::iter::once(first).chain(second)

@@ -2,8 +2,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ActorId, BlindGuide, BlindGuidePatch, BlindGuideSet, BlindPixel, BlindStroke, BlindTile,
-    BlindTilePatch, CellKind, CommandId, Decorator, DecoratorId, DirectionMode, EntityId,
-    GridPoint, GridSize, LevelHash, LevelSnapshot, PlaceableEntity, ShapeCell,
+    BlindTilePatch, CellKind, CollectCapacity, CollectLayer, CommandId, Decorator, DecoratorId,
+    DirectionMode, EntityId, GridPoint, GridSize, LevelHash, LevelSnapshot, PlaceableEntity,
+    ShapeCell,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,16 +61,25 @@ pub enum LevelCommandKind {
     RestoreSnapshot,
     SetCell,
     PlaceEntity,
+    PlaceEntities,
     MoveEntity,
     MoveEntities,
+    TransformEntities,
     RotateEntityClockwise,
     FlipEntityHorizontal,
     SetBlindResolution,
+    SetBlockCollectLayers,
+    SetBlockLayerCapacity,
     DeleteEntity,
+    DeleteEntities,
     RestoreEntity,
+    RestoreEntities,
     RestoreDeletedEntity,
+    RestoreDeletedEntities,
     ToggleIce,
     SetIce,
+    ToggleGlass,
+    SetGlass,
     CycleDirection,
     SetDirection,
     AssignKeyLocker,
@@ -101,12 +111,19 @@ pub enum LevelCommand {
     PlaceEntity {
         entity: PlaceableEntity,
     },
+    PlaceEntities {
+        entities: Vec<PlaceableEntity>,
+    },
     MoveEntity {
         entity_id: EntityId,
         origin: GridPoint,
     },
     MoveEntities {
         moves: Vec<EntityMove>,
+    },
+    /// Atomically replaces existing entities with transformed versions of themselves.
+    TransformEntities {
+        entities: Vec<PlaceableEntity>,
     },
     RotateEntityClockwise {
         entity_id: EntityId,
@@ -118,17 +135,40 @@ pub enum LevelCommand {
         entity_id: EntityId,
         pixels_per_cell: u8,
     },
+    SetBlockCollectLayers {
+        entity_id: EntityId,
+        layers: Vec<CollectLayer>,
+    },
+    SetBlockLayerCapacity {
+        entity_ids: Vec<EntityId>,
+        layer_index: usize,
+        capacity: CollectCapacity,
+    },
     DeleteEntity {
         entity_id: EntityId,
+    },
+    DeleteEntities {
+        entity_ids: Vec<EntityId>,
     },
     /// Exact entity restoration used by compensating history events.
     #[doc(hidden)]
     RestoreEntity {
         entity: PlaceableEntity,
     },
+    /// Exact multi-entity restoration used by compensating history events.
+    #[doc(hidden)]
+    RestoreEntities {
+        entities: Vec<PlaceableEntity>,
+    },
     #[doc(hidden)]
     RestoreDeletedEntity {
         entity: PlaceableEntity,
+        decorators: Vec<Decorator>,
+    },
+    /// Exact multi-entity/decorator restoration used by compensating history events.
+    #[doc(hidden)]
+    RestoreDeletedEntities {
+        entities: Vec<PlaceableEntity>,
         decorators: Vec<Decorator>,
     },
     ToggleIce {
@@ -136,6 +176,15 @@ pub enum LevelCommand {
         entity_id: EntityId,
     },
     SetIce {
+        decorator_id: DecoratorId,
+        entity_id: EntityId,
+        blocking_count: u32,
+    },
+    ToggleGlass {
+        decorator_id: DecoratorId,
+        entity_id: EntityId,
+    },
+    SetGlass {
         decorator_id: DecoratorId,
         entity_id: EntityId,
         blocking_count: u32,
@@ -200,16 +249,25 @@ impl LevelCommand {
             Self::RestoreSnapshot { .. } => LevelCommandKind::RestoreSnapshot,
             Self::SetCell { .. } => LevelCommandKind::SetCell,
             Self::PlaceEntity { .. } => LevelCommandKind::PlaceEntity,
+            Self::PlaceEntities { .. } => LevelCommandKind::PlaceEntities,
             Self::MoveEntity { .. } => LevelCommandKind::MoveEntity,
             Self::MoveEntities { .. } => LevelCommandKind::MoveEntities,
+            Self::TransformEntities { .. } => LevelCommandKind::TransformEntities,
             Self::RotateEntityClockwise { .. } => LevelCommandKind::RotateEntityClockwise,
             Self::FlipEntityHorizontal { .. } => LevelCommandKind::FlipEntityHorizontal,
             Self::SetBlindResolution { .. } => LevelCommandKind::SetBlindResolution,
+            Self::SetBlockCollectLayers { .. } => LevelCommandKind::SetBlockCollectLayers,
+            Self::SetBlockLayerCapacity { .. } => LevelCommandKind::SetBlockLayerCapacity,
             Self::DeleteEntity { .. } => LevelCommandKind::DeleteEntity,
+            Self::DeleteEntities { .. } => LevelCommandKind::DeleteEntities,
             Self::RestoreEntity { .. } => LevelCommandKind::RestoreEntity,
+            Self::RestoreEntities { .. } => LevelCommandKind::RestoreEntities,
             Self::RestoreDeletedEntity { .. } => LevelCommandKind::RestoreDeletedEntity,
+            Self::RestoreDeletedEntities { .. } => LevelCommandKind::RestoreDeletedEntities,
             Self::ToggleIce { .. } => LevelCommandKind::ToggleIce,
             Self::SetIce { .. } => LevelCommandKind::SetIce,
+            Self::ToggleGlass { .. } => LevelCommandKind::ToggleGlass,
+            Self::SetGlass { .. } => LevelCommandKind::SetGlass,
             Self::CycleDirection { .. } => LevelCommandKind::CycleDirection,
             Self::SetDirection { .. } => LevelCommandKind::SetDirection,
             Self::AssignKeyLocker { .. } => LevelCommandKind::AssignKeyLocker,

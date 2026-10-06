@@ -717,6 +717,16 @@ impl PlaceableEntity {
         }
     }
 
+    pub fn with_block_collect_layers(
+        &self,
+        layers: Vec<CollectLayer>,
+    ) -> Result<Self, EntityError> {
+        if !matches!(&self.kind, PlaceableEntityKind::Block(_)) {
+            return Err(EntityError::NotBlock(self.id.clone()));
+        }
+        Self::block(self.id.clone(), self.origin, self.shape, Block::new(layers))
+    }
+
     pub fn apply_blind_operation(
         &self,
         operation: &BlindBrushOperation,
@@ -1035,6 +1045,15 @@ pub enum EntityError {
 
     #[error("entity '{0}' is not a Blind")]
     NotBlind(EntityId),
+
+    #[error("entity '{0}' is not a Block")]
+    NotBlock(EntityId),
+
+    #[error("entity '{entity_id}' has no collect layer at index {layer_index}")]
+    CollectLayerNotFound {
+        entity_id: EntityId,
+        layer_index: usize,
+    },
 
     #[error(transparent)]
     InvalidBrush(#[from] BrushError),

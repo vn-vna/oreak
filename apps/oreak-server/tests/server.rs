@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{io::Cursor, net::SocketAddr, time::Duration};
 
 use axum::{
     Router,
@@ -9,6 +9,10 @@ use axum::{
     },
 };
 use http_body_util::BodyExt;
+use image::{
+    DynamicImage, ExtendedColorType, ImageBuffer, ImageEncoder, ImageFormat, Rgba,
+    codecs::png::PngEncoder,
+};
 use jsonrpsee::{
     core::client::Error as ClientError,
     server::ServerHandle,
@@ -16,7 +20,8 @@ use jsonrpsee::{
 };
 use oreak_core::{
     Blind, BlindPixel, BlindStroke, BlindTile, Block, CellKind, CommandEnvelope, CommandMetadata,
-    EntityId, EntityMove, GridAnchor, GridPoint, GridSize, LevelCommand, PlaceableEntity, Shape,
+    DecoratorId, EntityId, EntityMove, GridAnchor, GridPoint, GridSize, LevelCommand,
+    PlaceableEntity, Shape,
 };
 use oreak_protocol::{
     ApplyCommandRequest, ApplyCommandResult, HealthResponse, HealthStatus, LevelHistoryRequest,
@@ -105,6 +110,151 @@ async fn api_request(
         )
         .await
         .unwrap()
+}
+
+async fn binary_request(
+    router: &Router,
+    method: Method,
+    uri: &str,
+    content_type: &str,
+    body: Vec<u8>,
+    cookie: Option<&str>,
+) -> Response<Body> {
+    let mut request = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header(CONTENT_TYPE, content_type);
+    if let Some(cookie) = cookie {
+        request = request.header(COOKIE, cookie);
+    }
+    router
+        .clone()
+        .oneshot(request.body(Body::from(body)).unwrap())
+        .await
+        .unwrap()
+}
+
+fn rgba_png(width: u32, height: u32) -> Vec<u8> {
+    let mut png = Vec::new();
+    let pixels = vec![0_u8; width as usize * height as usize * 4];
+    PngEncoder::new(&mut png)
+        .write_image(&pixels, width, height, ExtendedColorType::Rgba8)
+        .unwrap();
+    png
+}
+
+fn encoded_rgba_image(format: ImageFormat) -> Vec<u8> {
+    encoded_rgba_image_at_size(format, 2, 1)
+}
+
+fn encoded_rgba_image_at_size(format: ImageFormat, width: u32, height: u32) -> Vec<u8> {
+    let image = DynamicImage::ImageRgba8(ImageBuffer::from_pixel(
+        width,
+        height,
+        Rgba([24, 96, 176, 255]),
+    ));
+    let mut encoded = Cursor::new(Vec::new());
+    image.write_to(&mut encoded, format).unwrap();
+    encoded.into_inner()
+}
+
+fn png_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut chunk = Vec::with_capacity(12 + data.len());
+    chunk.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    chunk.extend_from_slice(kind);
+    chunk.extend_from_slice(data);
+    let crc = png_crc32(&chunk[4..]);
+    chunk.extend_from_slice(&crc.to_be_bytes());
+    chunk
+}
+
+fn png_crc32(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for byte in bytes {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = if crc & 1 == 0 {
+                crc >> 1
+            } else {
+                (crc >> 1) ^ 0xedb8_8320
+            };
+        }
+    }
+    !crc
+}
+
+fn animated_png() -> Vec<u8> {
+    let png = rgba_png(1, 1);
+    let ihdr_end = 8 + 4 + 4 + 13 + 4;
+    let mut animated = png[..ihdr_end].to_vec();
+    animated.extend(png_chunk(b"acTL", &[0, 0, 0, 1, 0, 0, 0, 0]));
+    animated.extend(png_chunk(
+        b"fcTL",
+        &[
+            0, 0, 0, 0, // sequence number
+            0, 0, 0, 1, // width
+            0, 0, 0, 1, // height
+            0, 0, 0, 0, // x offset
+            0, 0, 0, 0, // y offset
+            0, 1, // delay numerator
+            0, 10, // delay denominator
+            0,  // dispose op
+            0,  // blend op
+        ],
+    ));
+    animated.extend(&png[ihdr_end..]);
+    animated
+}
+
+fn riff_chunk(kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut chunk = Vec::with_capacity(8 + data.len() + data.len() % 2);
+    chunk.extend_from_slice(kind);
+    chunk.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    chunk.extend_from_slice(data);
+    if data.len() % 2 != 0 {
+        chunk.push(0);
+    }
+    chunk
+}
+
+fn animated_webp() -> Vec<u8> {
+    let still = encoded_rgba_image(ImageFormat::WebP);
+    let frame_image_chunk = &still[12..];
+    let mut anmf = vec![
+        0, 0, 0, // x offset
+        0, 0, 0, // y offset
+        1, 0, 0, // width minus one
+        0, 0, 0, // height minus one
+        1, 0, 0, // duration
+        0, // flags
+    ];
+    anmf.extend_from_slice(frame_image_chunk);
+
+    let mut payload = Vec::new();
+    payload.extend(riff_chunk(
+        b"VP8X",
+        &[
+            0b0000_0010,
+            0,
+            0,
+            0, // animation flags and reserved bytes
+            1,
+            0,
+            0, // canvas width minus one
+            0,
+            0,
+            0, // canvas height minus one
+        ],
+    ));
+    payload.extend(riff_chunk(b"ANIM", &[0, 0, 0, 0, 0, 0]));
+    payload.extend(riff_chunk(b"ANMF", &anmf));
+
+    let mut animated = Vec::with_capacity(12 + payload.len());
+    animated.extend_from_slice(b"RIFF");
+    animated.extend_from_slice(&((4 + payload.len()) as u32).to_le_bytes());
+    animated.extend_from_slice(b"WEBP");
+    animated.extend(payload);
+    animated
 }
 
 async fn json_body(response: Response<Body>) -> serde_json::Value {
@@ -900,6 +1050,292 @@ async fn project_shape_catalog_supports_validated_editor_crud() {
 }
 
 #[tokio::test]
+async fn project_image_catalog_imports_authorized_verified_png_templates() {
+    const ONE_PIXEL_PNG: &[u8] = &[
+        137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0, 1, 8, 4,
+        0, 0, 0, 181, 28, 12, 2, 0, 0, 0, 11, 73, 68, 65, 84, 120, 218, 99, 100, 248, 15, 0, 1, 5,
+        1, 1, 39, 24, 227, 102, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
+    ];
+
+    let router = build_application().into_router();
+    let (owner_cookie, target, _) = create_project_level(&router, "image-owner@example.com").await;
+    let (outsider_cookie, _) = register(&router, "image-outsider@example.com").await;
+    let catalog_uri = format!("/api/projects/{}/images", target.project_id);
+
+    let rejected = binary_request(
+        &router,
+        Method::POST,
+        &catalog_uri,
+        "image/png",
+        b"not a png".to_vec(),
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+    let unsupported_gif = binary_request(
+        &router,
+        Method::POST,
+        &catalog_uri,
+        "image/gif",
+        vec![
+            71, 73, 70, 56, 57, 97, 1, 0, 1, 0, 128, 0, 0, 0, 0, 0, 255, 255, 255, 33, 249, 4, 1,
+            0, 0, 0, 0, 44, 0, 0, 0, 0, 1, 0, 1, 0, 0, 2, 2, 68, 1, 0, 59,
+        ],
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(unsupported_gif.status(), StatusCode::BAD_REQUEST);
+
+    let above_json_limit = binary_request(
+        &router,
+        Method::POST,
+        &catalog_uri,
+        "image/png",
+        vec![0; 20 * 1024],
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(above_json_limit.status(), StatusCode::BAD_REQUEST);
+
+    let oversized_upload = binary_request(
+        &router,
+        Method::POST,
+        &catalog_uri,
+        "image/png",
+        vec![0; 512 * 1024 + 1],
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(oversized_upload.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let oversized_dimensions = binary_request(
+        &router,
+        Method::POST,
+        &catalog_uri,
+        "image/png",
+        rgba_png(1_025, 1),
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(oversized_dimensions.status(), StatusCode::BAD_REQUEST);
+
+    let created = binary_request(
+        &router,
+        Method::POST,
+        &format!("{catalog_uri}?name=Portal%20texture"),
+        "image/png",
+        ONE_PIXEL_PNG.to_vec(),
+        Some(&owner_cookie),
+    )
+    .await;
+    let created_status = created.status();
+    let created_body = created.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        created_status,
+        StatusCode::CREATED,
+        "{}",
+        String::from_utf8_lossy(&created_body)
+    );
+    let created: serde_json::Value = serde_json::from_slice(&created_body).unwrap();
+    let image_id = created["id"].as_str().unwrap();
+    assert_eq!(created["name"], "Portal texture");
+    assert_eq!(created["media_type"], "image/png");
+    assert_eq!(created["width"], 1);
+    assert_eq!(created["height"], 1);
+    assert!(
+        created["content_hash"]
+            .as_str()
+            .unwrap()
+            .starts_with("blake3:")
+    );
+
+    let untrusted_content_type = binary_request(
+        &router,
+        Method::POST,
+        &catalog_uri,
+        "application/octet-stream",
+        ONE_PIXEL_PNG.to_vec(),
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(untrusted_content_type.status(), StatusCode::CREATED);
+
+    let denied_upload = binary_request(
+        &router,
+        Method::POST,
+        &catalog_uri,
+        "image/png",
+        ONE_PIXEL_PNG.to_vec(),
+        Some(&outsider_cookie),
+    )
+    .await;
+    assert_eq!(denied_upload.status(), StatusCode::FORBIDDEN);
+
+    let listed = api_request(
+        &router,
+        Method::GET,
+        &catalog_uri,
+        None,
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(listed.status(), StatusCode::OK);
+    assert_eq!(json_body(listed).await["images"][0]["id"], image_id);
+
+    let content_uri = format!("{catalog_uri}/{image_id}/content");
+    let downloaded = api_request(
+        &router,
+        Method::GET,
+        &content_uri,
+        None,
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(downloaded.status(), StatusCode::OK);
+    assert_eq!(downloaded.headers()[CONTENT_TYPE], "image/png");
+    assert_eq!(downloaded.headers()["cache-control"], "private, no-store");
+    assert_eq!(downloaded.headers()["x-content-type-options"], "nosniff");
+    assert!(downloaded.headers().contains_key("etag"));
+    let downloaded_bytes = downloaded.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(downloaded_bytes.as_ref(), ONE_PIXEL_PNG);
+
+    let denied_list = api_request(
+        &router,
+        Method::GET,
+        &catalog_uri,
+        None,
+        Some(&outsider_cookie),
+    )
+    .await;
+    assert_eq!(denied_list.status(), StatusCode::FORBIDDEN);
+    let denied_content = api_request(
+        &router,
+        Method::GET,
+        &content_uri,
+        None,
+        Some(&outsider_cookie),
+    )
+    .await;
+    assert_eq!(denied_content.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn project_image_catalog_rejects_animated_png_and_webp() {
+    let router = build_application().into_router();
+    let (owner_cookie, target, _) =
+        create_project_level(&router, "image-animation@example.com").await;
+    let catalog_uri = format!("/api/projects/{}/images", target.project_id);
+
+    for (media_type, image) in [
+        ("image/png", animated_png()),
+        ("image/webp", animated_webp()),
+    ] {
+        let response = binary_request(
+            &router,
+            Method::POST,
+            &catalog_uri,
+            media_type,
+            image,
+            Some(&owner_cookie),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+#[tokio::test]
+async fn project_image_catalog_detects_jpeg_and_webp_content() {
+    let router = build_application().into_router();
+    let (owner_cookie, target, _) =
+        create_project_level(&router, "image-formats@example.com").await;
+    let catalog_uri = format!("/api/projects/{}/images", target.project_id);
+
+    for (format, media_type) in [
+        (ImageFormat::Jpeg, "image/jpeg"),
+        (ImageFormat::WebP, "image/webp"),
+    ] {
+        let original = encoded_rgba_image(format);
+        let created = binary_request(
+            &router,
+            Method::POST,
+            &catalog_uri,
+            "application/octet-stream",
+            original.clone(),
+            Some(&owner_cookie),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created = json_body(created).await;
+        assert_eq!(created["media_type"], media_type);
+        assert_eq!(created["width"], 2);
+        assert_eq!(created["height"], 1);
+        let image_id = created["id"].as_str().unwrap();
+        let content_uri = format!("{catalog_uri}/{image_id}/content");
+
+        let downloaded = api_request(
+            &router,
+            Method::GET,
+            &content_uri,
+            None,
+            Some(&owner_cookie),
+        )
+        .await;
+        assert_eq!(downloaded.status(), StatusCode::OK);
+        assert_eq!(downloaded.headers()[CONTENT_TYPE], media_type);
+        assert_eq!(downloaded.headers()["cache-control"], "private, no-store");
+        assert_eq!(downloaded.headers()["x-content-type-options"], "nosniff");
+        let downloaded = downloaded.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(downloaded.as_ref(), original.as_slice());
+    }
+
+    for format in [ImageFormat::Jpeg, ImageFormat::WebP] {
+        let oversized = binary_request(
+            &router,
+            Method::POST,
+            &catalog_uri,
+            "application/octet-stream",
+            encoded_rgba_image_at_size(format, 1_025, 1),
+            Some(&owner_cookie),
+        )
+        .await;
+        assert_eq!(oversized.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+#[tokio::test]
+async fn project_image_catalog_enforces_template_quota() {
+    let router = build_application().into_router();
+    let (owner_cookie, target, _) = create_project_level(&router, "image-quota@example.com").await;
+    let catalog_uri = format!("/api/projects/{}/images", target.project_id);
+    let image = rgba_png(1, 1);
+
+    for _ in 0..64 {
+        let response = binary_request(
+            &router,
+            Method::POST,
+            &catalog_uri,
+            "image/png",
+            image.clone(),
+            Some(&owner_cookie),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+    }
+
+    let exceeded = binary_request(
+        &router,
+        Method::POST,
+        &catalog_uri,
+        "image/png",
+        image,
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(exceeded.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn json_rpc_health_accepts_http() {
     let application = build_application();
     let _rpc_handle = application.rpc_handle();
@@ -1212,6 +1648,78 @@ async fn duplicate_accepted_command_returns_structured_error() {
     let data: RpcErrorData = serde_json::from_str(error.data().unwrap().get()).unwrap();
     assert_eq!(data.code, RpcErrorCode::DuplicateCommand);
     assert_eq!(data.message, RpcErrorCode::DuplicateCommand.message());
+}
+
+#[tokio::test]
+async fn glass_commands_apply_and_broadcast_through_the_authoritative_path() {
+    let server = TestServer::start().await;
+    let (cookie, target, user) =
+        create_project_level(&server.router, "glass-rpc@example.com").await;
+    let client = server.client(Some(&cookie)).await;
+    let entity_id = EntityId::from("glass-pool");
+    let entity = PlaceableEntity::blind(
+        entity_id.clone(),
+        GridPoint::new(2, 2),
+        Shape::new(1, 1, 1).unwrap(),
+        Blind::new(2, vec![BlindTile::empty(2).unwrap()]).unwrap(),
+    )
+    .unwrap();
+    client
+        .apply_command(ApplyCommandRequest {
+            target: target.clone(),
+            command: CommandEnvelope::new(
+                CommandMetadata::new("place-glass-pool", "spoofed", 1),
+                LevelCommand::PlaceEntity { entity },
+            ),
+        })
+        .await
+        .unwrap();
+
+    let mut subscription = client.subscribe_level(target.clone()).await.unwrap();
+    let initial = timeout(Duration::from_secs(1), subscription.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        initial,
+        LevelSubscriptionItem::Snapshot { snapshot } if snapshot.server_sequence == 1
+    ));
+
+    let response = client
+        .apply_command(ApplyCommandRequest {
+            target: target.clone(),
+            command: CommandEnvelope::new(
+                CommandMetadata::new("set-glass", "spoofed", 1),
+                LevelCommand::SetGlass {
+                    decorator_id: DecoratorId::from("glass-pool-decorator"),
+                    entity_id: entity_id.clone(),
+                    blocking_count: 3,
+                },
+            ),
+        })
+        .await
+        .unwrap();
+    assert!(matches!(
+        response.result,
+        ApplyCommandResult::Applied { ref event }
+            if event.metadata.actor.as_str() == user["id"].as_str().unwrap()
+                && matches!(&event.command, LevelCommand::SetGlass { blocking_count: 3, .. })
+    ));
+
+    let update = timeout(Duration::from_secs(1), subscription.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        update,
+        LevelSubscriptionItem::Event { event }
+            if event.server_sequence == 2
+                && matches!(&event.event.command, LevelCommand::SetGlass { blocking_count: 3, .. })
+    ));
+    let snapshot = client.level_snapshot(target).await.unwrap().snapshot;
+    assert_eq!(snapshot.glass_blocking_count(&entity_id), 3);
 }
 
 #[tokio::test]

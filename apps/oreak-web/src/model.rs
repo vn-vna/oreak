@@ -4,8 +4,8 @@ use oreak_core::{
     ActorId, ApplyOutcome, BlameEntry, Blind, BlindPixel, BlindStroke, BlindTile, Block, CellKind,
     CollectCapacity, CollectLayer, CommandEnvelope, CommandMetadata, Decorator, DecoratorId,
     DecoratorKind, DirectionMode, EntityId, EntityMove, GridAnchor, GridPoint, GridSize,
-    HistoryEvent, LevelCommand, LevelSnapshot, LevelTarget, LevelTimeline, PlaceableEntity, Shape,
-    ShapeCell, ShapeError, TimelineError,
+    HistoryEvent, LevelCommand, LevelSnapshot, LevelTarget, LevelTimeline, PlaceableEntity,
+    PlaceableEntityKind, Shape, ShapeCell, ShapeError, TimelineError,
 };
 use oreak_protocol::{LevelPresenceItem, PresenceId, PresenceParticipant, ProjectLevelTarget};
 
@@ -110,8 +110,6 @@ pub enum Mode {
 
 #[cfg(target_arch = "wasm32")]
 impl Mode {
-    pub const ALL: [Self; 4] = [Self::Select, Self::Map, Self::Brush, Self::Sandbox];
-
     pub const fn key(self) -> char {
         match self {
             Self::Select => 'Q',
@@ -127,15 +125,6 @@ impl Mode {
             Self::Map => "Map",
             Self::Brush => "Brush",
             Self::Sandbox => "Sandbox",
-        }
-    }
-
-    pub const fn description(self) -> &'static str {
-        match self {
-            Self::Select => "Inspect cells and core placeables with collaborative provenance",
-            Self::Map => "Paint logical floor and wall cells",
-            Self::Brush => "Paint, erase, or fill pixels on the selected Pool",
-            Self::Sandbox => "Parity gated: source sandbox behavior is not available yet",
         }
     }
 
@@ -897,6 +886,50 @@ impl EditorModel {
         )
     }
 
+    pub fn prepare_duplicate_entities(
+        &mut self,
+        duplicates: Vec<(PlaceableEntity, GridPoint)>,
+        occurred_at_ms: i64,
+    ) -> (CommandEnvelope, Vec<EntityId>) {
+        let entities = duplicates
+            .into_iter()
+            .map(|(source, origin)| {
+                let kind = match source.kind() {
+                    PlaceableEntityKind::Block(_) => "block-copy",
+                    PlaceableEntityKind::Blind(_) => "blind-copy",
+                };
+                PlaceableEntity::new(
+                    self.next_entity_id(kind),
+                    origin,
+                    source.shape(),
+                    source.kind().clone(),
+                )
+                .expect("a cloned entity remains valid")
+            })
+            .collect::<Vec<_>>();
+        let entity_ids = entities.iter().map(|entity| entity.id().clone()).collect();
+        (
+            self.prepare_command(
+                "duplicate-entities",
+                LevelCommand::PlaceEntities { entities },
+                occurred_at_ms,
+            ),
+            entity_ids,
+        )
+    }
+
+    pub fn prepare_transform_entities(
+        &mut self,
+        entities: Vec<PlaceableEntity>,
+        occurred_at_ms: i64,
+    ) -> CommandEnvelope {
+        self.prepare_command(
+            "transform-entities",
+            LevelCommand::TransformEntities { entities },
+            occurred_at_ms,
+        )
+    }
+
     pub fn prepare_move_entities(
         &mut self,
         moves: Vec<EntityMove>,
@@ -922,6 +955,7 @@ impl EditorModel {
         )
     }
 
+    #[allow(dead_code)] // Preserves the single-entity command builder for model tests/protocol parity.
     pub fn prepare_rotate_entity_clockwise(
         &mut self,
         entity_id: EntityId,
@@ -934,6 +968,7 @@ impl EditorModel {
         )
     }
 
+    #[allow(dead_code)] // Preserves the single-entity command builder for model tests/protocol parity.
     pub fn prepare_flip_entity_horizontal(
         &mut self,
         entity_id: EntityId,
@@ -946,6 +981,7 @@ impl EditorModel {
         )
     }
 
+    #[allow(dead_code)] // Preserves the single-entity command builder for model tests/protocol parity.
     pub fn prepare_set_blind_resolution(
         &mut self,
         entity_id: EntityId,
@@ -962,6 +998,7 @@ impl EditorModel {
         )
     }
 
+    #[allow(dead_code)] // Preserves the single-entity command builder for model tests/protocol parity.
     pub fn prepare_delete_entity(
         &mut self,
         entity_id: EntityId,
@@ -970,6 +1007,49 @@ impl EditorModel {
         self.prepare_command(
             "delete-entity",
             LevelCommand::DeleteEntity { entity_id },
+            occurred_at_ms,
+        )
+    }
+
+    pub fn prepare_delete_entities(
+        &mut self,
+        entity_ids: Vec<EntityId>,
+        occurred_at_ms: i64,
+    ) -> CommandEnvelope {
+        self.prepare_command(
+            "delete-entities",
+            LevelCommand::DeleteEntities { entity_ids },
+            occurred_at_ms,
+        )
+    }
+
+    pub fn prepare_set_block_collect_layers(
+        &mut self,
+        entity_id: EntityId,
+        layers: Vec<CollectLayer>,
+        occurred_at_ms: i64,
+    ) -> CommandEnvelope {
+        self.prepare_command(
+            "set-block-collect-layers",
+            LevelCommand::SetBlockCollectLayers { entity_id, layers },
+            occurred_at_ms,
+        )
+    }
+
+    pub fn prepare_set_block_layer_capacity(
+        &mut self,
+        entity_ids: Vec<EntityId>,
+        layer_index: usize,
+        capacity: CollectCapacity,
+        occurred_at_ms: i64,
+    ) -> CommandEnvelope {
+        self.prepare_command(
+            "set-block-layer-capacity",
+            LevelCommand::SetBlockLayerCapacity {
+                entity_ids,
+                layer_index,
+                capacity,
+            },
             occurred_at_ms,
         )
     }
@@ -1049,6 +1129,40 @@ impl EditorModel {
         self.prepare_command(
             "set-ice",
             LevelCommand::SetIce {
+                decorator_id,
+                entity_id,
+                blocking_count,
+            },
+            occurred_at_ms,
+        )
+    }
+
+    pub fn prepare_toggle_glass(
+        &mut self,
+        entity_id: EntityId,
+        occurred_at_ms: i64,
+    ) -> CommandEnvelope {
+        let decorator_id = self.ordinary_decorator_id(&entity_id, "glass");
+        self.prepare_command(
+            "toggle-glass",
+            LevelCommand::ToggleGlass {
+                decorator_id,
+                entity_id,
+            },
+            occurred_at_ms,
+        )
+    }
+
+    pub fn prepare_set_glass(
+        &mut self,
+        entity_id: EntityId,
+        blocking_count: u32,
+        occurred_at_ms: i64,
+    ) -> CommandEnvelope {
+        let decorator_id = self.ordinary_decorator_id(&entity_id, "glass");
+        self.prepare_command(
+            "set-glass",
+            LevelCommand::SetGlass {
                 decorator_id,
                 entity_id,
                 blocking_count,
@@ -1179,6 +1293,7 @@ impl EditorModel {
     fn ordinary_decorator_id(&mut self, entity_id: &EntityId, kind: &str) -> DecoratorId {
         let existing = match kind {
             "ice" => self.timeline.snapshot().ice_for_entity(entity_id),
+            "glass" => self.timeline.snapshot().glass_for_entity(entity_id),
             "direction" => self.timeline.snapshot().direction_for_entity(entity_id),
             _ => None,
         };
@@ -1867,8 +1982,60 @@ mod tests {
             }
         ));
         assert!(matches!(
-            model.prepare_delete_entity(block_id, 105).command,
+            model.prepare_delete_entity(block_id.clone(), 105).command,
             LevelCommand::DeleteEntity { .. }
+        ));
+        let source = model
+            .timeline()
+            .snapshot()
+            .entity(&block_id)
+            .expect("the placed Block exists")
+            .clone();
+        let (duplicate, duplicate_ids) =
+            model.prepare_duplicate_entities(vec![(source.clone(), GridPoint::new(4, 4))], 106);
+        assert_eq!(duplicate_ids.len(), 1);
+        assert!(matches!(
+            duplicate.command,
+            LevelCommand::PlaceEntities { .. }
+        ));
+        assert!(matches!(
+            model
+                .prepare_transform_entities(
+                    vec![source.clone().moved_to(GridPoint::new(4, 4))],
+                    107
+                )
+                .command,
+            LevelCommand::TransformEntities { .. }
+        ));
+        assert!(matches!(
+            model
+                .prepare_set_block_collect_layers(
+                    block_id.clone(),
+                    vec![CollectLayer::new(
+                        1,
+                        None,
+                        CollectCapacity::Finite(3),
+                        false
+                    )],
+                    108,
+                )
+                .command,
+            LevelCommand::SetBlockCollectLayers { .. }
+        ));
+        assert!(matches!(
+            model
+                .prepare_set_block_layer_capacity(
+                    vec![block_id.clone()],
+                    0,
+                    CollectCapacity::Finite(5),
+                    109,
+                )
+                .command,
+            LevelCommand::SetBlockLayerCapacity { .. }
+        ));
+        assert!(matches!(
+            model.prepare_delete_entities(vec![block_id], 110).command,
+            LevelCommand::DeleteEntities { .. }
         ));
     }
 
@@ -2076,6 +2243,36 @@ mod tests {
             &reassign.command,
             LevelCommand::AssignKeyLocker { decorator_id, lock_entity_id, .. }
                 if decorator_id == &relation_id && lock_entity_id == &block_ids[2]
+        ));
+    }
+
+    #[test]
+    fn glass_commands_reuse_the_blind_decorator_id() {
+        let mut model = EditorModel::blank("alice", "glass-session");
+        let placement = model.prepare_place_default_blind(GridPoint::new(0, 0), 100);
+        let LevelCommand::PlaceEntity { entity } = &placement.command else {
+            panic!("expected Blind placement");
+        };
+        let blind_id = entity.id().clone();
+        model.apply_envelope(placement).unwrap();
+
+        let toggle = model.prepare_toggle_glass(blind_id.clone(), 101);
+        let LevelCommand::ToggleGlass {
+            decorator_id: glass_id,
+            ..
+        } = &toggle.command
+        else {
+            panic!("expected ToggleGlass");
+        };
+        let glass_id = glass_id.clone();
+        model.apply_envelope(toggle).unwrap();
+        assert!(matches!(
+            model.prepare_set_glass(blind_id, 4, 102).command,
+            LevelCommand::SetGlass {
+                decorator_id,
+                blocking_count: 4,
+                ..
+            } if decorator_id == glass_id
         ));
     }
 

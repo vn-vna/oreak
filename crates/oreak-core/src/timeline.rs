@@ -5,10 +5,10 @@ use thiserror::Error;
 
 use crate::{
     ActorId, BlindBrushOperation, BlindGuide, BlindGuidePatch, BlindTilePatch, CellKind,
-    CommandEnvelope, CommandId, CommandMetadata, Decorator, DecoratorId, DecoratorKind,
-    DirectionMode, EntityError, EntityId, EntityMove, GridAnchor, GridError, GridPoint, GridSize,
-    HistoryChange, HistoryEvent, LevelCommand, LevelCommandKind, LevelError, LevelHash,
-    LevelSnapshot, LevelTarget, LevelValue, PlaceableEntity,
+    CollectCapacity, CollectLayer, CommandEnvelope, CommandId, CommandMetadata, Decorator,
+    DecoratorId, DecoratorKind, DirectionMode, EntityError, EntityId, EntityMove, GridAnchor,
+    GridError, GridPoint, GridSize, HistoryChange, HistoryEvent, LevelCommand, LevelCommandKind,
+    LevelError, LevelHash, LevelSnapshot, LevelTarget, LevelValue, PlaceableEntity,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -317,6 +317,7 @@ fn apply_command(
         }
         LevelCommand::SetCell { point, kind } => apply_set_cell(snapshot, *point, *kind),
         LevelCommand::PlaceEntity { entity } => apply_place_entity(snapshot, entity),
+        LevelCommand::PlaceEntities { entities } => apply_place_entities(snapshot, entities),
         LevelCommand::MoveEntity { entity_id, origin } => {
             let before = required_entity(snapshot, entity_id)?;
             if before.origin() == *origin {
@@ -332,6 +333,9 @@ fn apply_command(
             )
         }
         LevelCommand::MoveEntities { moves } => apply_move_entities(snapshot, moves),
+        LevelCommand::TransformEntities { entities } => {
+            apply_transform_entities(snapshot, entities)
+        }
         LevelCommand::RotateEntityClockwise { entity_id } => {
             let before = required_entity(snapshot, entity_id)?;
             let after = before.rotated_clockwise();
@@ -379,7 +383,16 @@ fn apply_command(
                 },
             )
         }
+        LevelCommand::SetBlockCollectLayers { entity_id, layers } => {
+            apply_set_block_collect_layers(snapshot, entity_id, layers)
+        }
+        LevelCommand::SetBlockLayerCapacity {
+            entity_ids,
+            layer_index,
+            capacity,
+        } => apply_set_block_layer_capacity(snapshot, entity_ids, *layer_index, *capacity),
         LevelCommand::DeleteEntity { entity_id } => apply_delete_entity(snapshot, entity_id),
+        LevelCommand::DeleteEntities { entity_ids } => apply_delete_entities(snapshot, entity_ids),
         LevelCommand::RestoreEntity { entity } => {
             let before = required_entity(snapshot, entity.id())?;
             if before == entity {
@@ -393,9 +406,14 @@ fn apply_command(
                 },
             )
         }
+        LevelCommand::RestoreEntities { entities } => apply_restore_entities(snapshot, entities),
         LevelCommand::RestoreDeletedEntity { entity, decorators } => {
             apply_restore_deleted_entity(snapshot, entity, decorators)
         }
+        LevelCommand::RestoreDeletedEntities {
+            entities,
+            decorators,
+        } => apply_restore_deleted_entities(snapshot, entities, decorators),
         LevelCommand::ToggleIce {
             decorator_id,
             entity_id,
@@ -435,6 +453,51 @@ fn apply_command(
                 snapshot,
                 decorator_id,
                 Some(Decorator::ice_with_blocking_count(
+                    decorator_id.clone(),
+                    entity_id.clone(),
+                    *blocking_count,
+                )),
+            )
+        }
+        LevelCommand::ToggleGlass {
+            decorator_id,
+            entity_id,
+        } => {
+            let before = validate_ordinary_decorator_identity(
+                snapshot,
+                decorator_id,
+                entity_id,
+                OrdinaryDecoratorKind::Glass,
+            )?;
+            let blocking_count = match before.as_ref().and_then(Decorator::glass_blocking_count) {
+                None | Some(0) => 1,
+                Some(_) => 0,
+            };
+            apply_decorator_value(
+                snapshot,
+                decorator_id,
+                Some(Decorator::glass_with_blocking_count(
+                    decorator_id.clone(),
+                    entity_id.clone(),
+                    blocking_count,
+                )),
+            )
+        }
+        LevelCommand::SetGlass {
+            decorator_id,
+            entity_id,
+            blocking_count,
+        } => {
+            validate_ordinary_decorator_identity(
+                snapshot,
+                decorator_id,
+                entity_id,
+                OrdinaryDecoratorKind::Glass,
+            )?;
+            apply_decorator_value(
+                snapshot,
+                decorator_id,
+                Some(Decorator::glass_with_blocking_count(
                     decorator_id.clone(),
                     entity_id.clone(),
                     *blocking_count,
@@ -716,6 +779,118 @@ fn apply_place_entity(
     }))
 }
 
+fn apply_place_entities(
+    snapshot: &LevelSnapshot,
+    entities: &[PlaceableEntity],
+) -> Result<Option<CommandApplication>, TimelineError> {
+    if entities.is_empty() {
+        return Ok(None);
+    }
+    let mut next = snapshot.clone();
+    let mut ids = BTreeSet::new();
+    let mut changes = Vec::with_capacity(entities.len());
+    for entity in entities {
+        if !ids.insert(entity.id().clone()) {
+            return Err(LevelError::DuplicateEntityId(entity.id().clone()).into());
+        }
+        next.insert_entity(entity.clone())?;
+        changes.push(entity_change(
+            entity.id().clone(),
+            None,
+            Some(entity.clone()),
+        ));
+    }
+    Ok(Some(CommandApplication {
+        snapshot: next,
+        inverse: LevelCommand::DeleteEntities {
+            entity_ids: ids.into_iter().collect(),
+        },
+        changes,
+    }))
+}
+
+fn apply_transform_entities(
+    snapshot: &LevelSnapshot,
+    entities: &[PlaceableEntity],
+) -> Result<Option<CommandApplication>, TimelineError> {
+    if entities.is_empty() {
+        return Ok(None);
+    }
+    let mut seen = BTreeSet::new();
+    let mut replacements = Vec::with_capacity(entities.len());
+    let mut before_entities = Vec::with_capacity(entities.len());
+    let mut changes = Vec::with_capacity(entities.len());
+    for after in entities {
+        if !seen.insert(after.id().clone()) {
+            return Err(LevelError::DuplicateEntityMove(after.id().clone()).into());
+        }
+        let before = required_entity(snapshot, after.id())?;
+        if before == after {
+            continue;
+        }
+        replacements.push(after.clone());
+        before_entities.push(before.clone());
+        changes.push(entity_change(
+            after.id().clone(),
+            Some(before.clone()),
+            Some(after.clone()),
+        ));
+    }
+    if replacements.is_empty() {
+        return Ok(None);
+    }
+    let mut next = snapshot.clone();
+    next.replace_entities(replacements)?;
+    Ok(Some(CommandApplication {
+        snapshot: next,
+        inverse: LevelCommand::RestoreEntities {
+            entities: before_entities,
+        },
+        changes,
+    }))
+}
+
+fn apply_restore_entities(
+    snapshot: &LevelSnapshot,
+    entities: &[PlaceableEntity],
+) -> Result<Option<CommandApplication>, TimelineError> {
+    if entities.is_empty() {
+        return Ok(None);
+    }
+    let mut seen = BTreeSet::new();
+    let mut replacements = Vec::with_capacity(entities.len());
+    let mut before_entities = Vec::with_capacity(entities.len());
+    let mut changes = Vec::with_capacity(entities.len());
+    for after in entities {
+        if !seen.insert(after.id().clone()) {
+            return Err(LevelError::DuplicateEntityMove(after.id().clone()).into());
+        }
+        let before = required_entity(snapshot, after.id())?;
+        if before == after {
+            continue;
+        }
+        replacements.push(after.clone());
+        before_entities.push(before.clone());
+        changes.push(entity_change(
+            after.id().clone(),
+            Some(before.clone()),
+            Some(after.clone()),
+        ));
+    }
+    if replacements.is_empty() {
+        return Ok(None);
+    }
+    let mut next = snapshot.clone();
+    next.replace_entities(replacements)?;
+    Ok(Some(CommandApplication {
+        snapshot: next,
+        inverse: LevelCommand::TransformEntities {
+            entities: before_entities,
+        },
+        changes,
+    }))
+}
+
 fn apply_move_entities(
     snapshot: &LevelSnapshot,
     moves: &[EntityMove],
@@ -770,6 +945,63 @@ fn apply_entity_replacement(
     }))
 }
 
+fn apply_set_block_collect_layers(
+    snapshot: &LevelSnapshot,
+    entity_id: &EntityId,
+    layers: &[CollectLayer],
+) -> Result<Option<CommandApplication>, TimelineError> {
+    let before = required_entity(snapshot, entity_id)?;
+    let after = before
+        .with_block_collect_layers(layers.to_vec())
+        .map_err(LevelError::from)?;
+    apply_transform_entities(snapshot, &[after])
+}
+
+fn apply_set_block_layer_capacity(
+    snapshot: &LevelSnapshot,
+    entity_ids: &[EntityId],
+    layer_index: usize,
+    capacity: CollectCapacity,
+) -> Result<Option<CommandApplication>, TimelineError> {
+    if entity_ids.is_empty() {
+        return Ok(None);
+    }
+    let mut seen = BTreeSet::new();
+    let mut entities = Vec::with_capacity(entity_ids.len());
+    for entity_id in entity_ids {
+        if !seen.insert(entity_id.clone()) {
+            return Err(LevelError::DuplicateEntityMove(entity_id.clone()).into());
+        }
+        let before = required_entity(snapshot, entity_id)?;
+        let layers = match before.kind() {
+            crate::PlaceableEntityKind::Block(block) => block.collect_layers(),
+            crate::PlaceableEntityKind::Blind(_) => {
+                return Err(LevelError::from(EntityError::NotBlock(entity_id.clone())).into());
+            }
+        };
+        let Some(layer) = layers.get(layer_index) else {
+            return Err(LevelError::from(EntityError::CollectLayerNotFound {
+                entity_id: entity_id.clone(),
+                layer_index,
+            })
+            .into());
+        };
+        let mut next_layers = layers.to_vec();
+        next_layers[layer_index] = CollectLayer::new(
+            layer.color_index(),
+            layer.radius(),
+            capacity,
+            layer.is_locked(),
+        );
+        entities.push(
+            before
+                .with_block_collect_layers(next_layers)
+                .map_err(LevelError::from)?,
+        );
+    }
+    apply_transform_entities(snapshot, &entities)
+}
+
 fn apply_delete_entity(
     snapshot: &LevelSnapshot,
     entity_id: &EntityId,
@@ -790,6 +1022,52 @@ fn apply_delete_entity(
     Ok(Some(CommandApplication {
         snapshot: next,
         inverse: LevelCommand::RestoreDeletedEntity { entity, decorators },
+        changes,
+    }))
+}
+
+fn apply_delete_entities(
+    snapshot: &LevelSnapshot,
+    entity_ids: &[EntityId],
+) -> Result<Option<CommandApplication>, TimelineError> {
+    if entity_ids.is_empty() {
+        return Ok(None);
+    }
+    let mut next = snapshot.clone();
+    let mut seen = BTreeSet::new();
+    let mut entities = Vec::with_capacity(entity_ids.len());
+    let mut decorators = BTreeMap::new();
+    let mut changes = Vec::new();
+    for entity_id in entity_ids {
+        if !seen.insert(entity_id.clone()) {
+            return Err(LevelError::DuplicateEntityMove(entity_id.clone()).into());
+        }
+        let (entity, removed_decorators) = next.remove_entity_cascade(entity_id)?;
+        changes.push(entity_change(
+            entity.id().clone(),
+            Some(entity.clone()),
+            None,
+        ));
+        entities.push(entity);
+        for decorator in removed_decorators {
+            decorators
+                .entry(decorator.id().clone())
+                .or_insert_with(|| decorator.clone());
+        }
+    }
+    let decorators: Vec<_> = decorators.into_values().collect();
+    changes.extend(
+        decorators
+            .iter()
+            .cloned()
+            .map(|decorator| decorator_change(decorator.id().clone(), Some(decorator), None)),
+    );
+    Ok(Some(CommandApplication {
+        snapshot: next,
+        inverse: LevelCommand::RestoreDeletedEntities {
+            entities,
+            decorators,
+        },
         changes,
     }))
 }
@@ -816,6 +1094,44 @@ fn apply_restore_deleted_entity(
         snapshot: next,
         inverse: LevelCommand::DeleteEntity {
             entity_id: entity.id().clone(),
+        },
+        changes,
+    }))
+}
+
+fn apply_restore_deleted_entities(
+    snapshot: &LevelSnapshot,
+    entities: &[PlaceableEntity],
+    decorators: &[Decorator],
+) -> Result<Option<CommandApplication>, TimelineError> {
+    if entities.is_empty() {
+        return Ok(None);
+    }
+    let mut next = snapshot.clone();
+    for entity in entities {
+        next.insert_entity(entity.clone())?;
+    }
+    for decorator in decorators {
+        if next.decorator(decorator.id()).is_some() {
+            return Err(LevelError::DuplicateDecoratorId(decorator.id().clone()).into());
+        }
+        next.put_decorator(decorator.clone())?;
+    }
+    let mut changes = entities
+        .iter()
+        .cloned()
+        .map(|entity| entity_change(entity.id().clone(), None, Some(entity)))
+        .collect::<Vec<_>>();
+    changes.extend(
+        decorators
+            .iter()
+            .cloned()
+            .map(|decorator| decorator_change(decorator.id().clone(), None, Some(decorator))),
+    );
+    Ok(Some(CommandApplication {
+        snapshot: next,
+        inverse: LevelCommand::DeleteEntities {
+            entity_ids: entities.iter().map(|entity| entity.id().clone()).collect(),
         },
         changes,
     }))
@@ -1013,6 +1329,7 @@ fn required_entity<'a>(
 #[derive(Clone, Copy)]
 enum OrdinaryDecoratorKind {
     Ice,
+    Glass,
     Direction,
 }
 
@@ -1029,6 +1346,7 @@ fn validate_ordinary_decorator_identity(
     if let Some(decorator) = &existing {
         let valid = match (expected, decorator.kind()) {
             (OrdinaryDecoratorKind::Ice, DecoratorKind::Ice { entity, .. })
+            | (OrdinaryDecoratorKind::Glass, DecoratorKind::Glass { entity, .. })
             | (OrdinaryDecoratorKind::Direction, DecoratorKind::Direction { entity, .. }) => {
                 entity == entity_id
             }
@@ -1044,6 +1362,7 @@ fn validate_ordinary_decorator_identity(
 
     let owner = match expected {
         OrdinaryDecoratorKind::Ice => snapshot.ice_for_entity(entity_id),
+        OrdinaryDecoratorKind::Glass => snapshot.glass_for_entity(entity_id),
         OrdinaryDecoratorKind::Direction => snapshot.direction_for_entity(entity_id),
     };
     if owner.is_some_and(|decorator| decorator.id() != decorator_id) {

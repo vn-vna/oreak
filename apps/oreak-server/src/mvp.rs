@@ -2,6 +2,7 @@
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
+    io::Cursor,
     sync::{Arc, OnceLock},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -10,12 +11,18 @@ use argon2::{
     Algorithm, Argon2, Params, Version,
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
 };
+use image::{
+    ImageFormat, ImageReader, Limits,
+    codecs::{png::PngDecoder, webp::WebPDecoder},
+};
+
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Path, State},
+    body::Bytes,
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{
-        HeaderMap, HeaderValue, StatusCode,
-        header::{COOKIE, RETRY_AFTER, SET_COOKIE},
+        HeaderMap, HeaderName, HeaderValue, StatusCode,
+        header::{CACHE_CONTROL, CONTENT_TYPE, COOKIE, ETAG, RETRY_AFTER, SET_COOKIE},
     },
     response::{IntoResponse, Response},
     routing::{get, post, put},
@@ -32,6 +39,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, RwLock};
 
 const API_BODY_LIMIT: usize = 16 * 1024;
+const MAX_IMAGE_UPLOAD_BYTES: usize = 512 * 1024;
+const MAX_IMAGE_AXIS: u32 = 1_024;
+const MAX_IMAGE_PIXELS: u64 = 1_024 * 1_024;
+const MAX_IMAGE_DECODE_BYTES: u64 = MAX_IMAGE_PIXELS * 4;
+const MAX_PROJECT_IMAGE_CATALOG_ENTRIES: usize = 64;
+const MAX_PROJECT_IMAGE_CATALOG_BYTES: usize = 8 * 1024 * 1024;
 const AUTH_RATE_LIMIT: u32 = 5;
 const AUTH_RATE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_RATE_LIMIT_KEYS: usize = 1_024;
@@ -180,6 +193,7 @@ struct ProjectRecord {
     name: String,
     project: Project,
     shape_catalog: Vec<ShapeCatalogRecord>,
+    image_catalog: Vec<ImageCatalogRecord>,
 }
 
 struct ShapeCatalogRecord {
@@ -190,6 +204,19 @@ struct ShapeCatalogRecord {
     created_at_ms: i64,
     updated_by: UserId,
     updated_at_ms: i64,
+}
+
+struct ImageCatalogRecord {
+    id: String,
+    name: String,
+    media_type: &'static str,
+    content_hash: String,
+    byte_size: usize,
+    width: u32,
+    height: u32,
+    content: Vec<u8>,
+    created_by: UserId,
+    created_at_ms: i64,
 }
 
 struct RateLimiter {
@@ -543,6 +570,46 @@ impl From<&ShapeCatalogRecord> for ShapeCatalogEntry {
     }
 }
 
+#[derive(Deserialize)]
+struct ImageUploadQuery {
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Serialize)]
+struct ImageCatalogList {
+    images: Vec<ImageCatalogEntry>,
+}
+
+#[derive(Serialize)]
+struct ImageCatalogEntry {
+    id: String,
+    name: String,
+    media_type: &'static str,
+    content_hash: String,
+    byte_size: usize,
+    width: u32,
+    height: u32,
+    created_by: UserId,
+    created_at_ms: i64,
+}
+
+impl From<&ImageCatalogRecord> for ImageCatalogEntry {
+    fn from(record: &ImageCatalogRecord) -> Self {
+        Self {
+            id: record.id.clone(),
+            name: record.name.clone(),
+            media_type: record.media_type,
+            content_hash: record.content_hash.clone(),
+            byte_size: record.byte_size,
+            width: record.width,
+            height: record.height,
+            created_by: record.created_by.clone(),
+            created_at_ms: record.created_at_ms,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct AuditList {
     audit: Vec<AuditSummary>,
@@ -635,6 +702,16 @@ pub(crate) fn router(state: MvpState) -> Router {
         .route(
             "/api/projects/{project_id}/shapes/{shape_id}",
             put(update_shape_catalog_entry).delete(delete_shape_catalog_entry),
+        )
+        .route(
+            "/api/projects/{project_id}/images",
+            get(list_image_catalog)
+                .post(upload_image_catalog_entry)
+                .layer(DefaultBodyLimit::max(MAX_IMAGE_UPLOAD_BYTES)),
+        )
+        .route(
+            "/api/projects/{project_id}/images/{image_id}/content",
+            get(download_image_catalog_entry),
         )
         .route("/api/projects/{project_id}/audit", get(list_project_audit))
         .route(
@@ -963,6 +1040,7 @@ async fn create_project(
         name,
         project,
         shape_catalog: Vec::new(),
+        image_catalog: Vec::new(),
     };
 
     let mut store = state.store.write().await;
@@ -1392,6 +1470,113 @@ async fn delete_shape_catalog_entry(
     Ok(StatusCode::NO_CONTENT)
 }
 
+async fn list_image_catalog(
+    State(state): State<MvpState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Json<ImageCatalogList>, ApiError> {
+    let user_id = authenticate(&state, &headers).await?;
+    let project_id = parse_project_id(project_id)?;
+    let store = state.store.read().await;
+    let record = authorized_project(&store, &project_id, &user_id, ProjectAccess::View)?;
+    Ok(Json(ImageCatalogList {
+        images: record
+            .image_catalog
+            .iter()
+            .map(ImageCatalogEntry::from)
+            .collect(),
+    }))
+}
+
+async fn upload_image_catalog_entry(
+    State(state): State<MvpState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+    Query(input): Query<ImageUploadQuery>,
+    content: Bytes,
+) -> Result<(StatusCode, Json<ImageCatalogEntry>), ApiError> {
+    let user_id = authenticate(&state, &headers).await?;
+    let project_id = parse_project_id(project_id)?;
+    {
+        let store = state.store.read().await;
+        authorized_project(&store, &project_id, &user_id, ProjectAccess::EditLevel)?;
+    }
+    let (media_type, width, height) = validate_catalog_image(&content)?;
+    let name = validate_name(input.name.unwrap_or_else(|| "Imported image".to_owned()))?;
+    let id = random_identifier("img")?;
+    let created_at_ms = now_timestamp()?.as_i64();
+    let content_hash = format!("blake3:{}", blake3::hash(&content).to_hex());
+    let byte_size = content.len();
+    let mut store = state.store.write().await;
+    authorized_project(&store, &project_id, &user_id, ProjectAccess::EditLevel)?;
+    let record = store
+        .projects
+        .get_mut(&project_id)
+        .expect("project was authorized");
+    if record.image_catalog.len() >= MAX_PROJECT_IMAGE_CATALOG_ENTRIES {
+        return Err(ApiError::bad_request(
+            "project image catalog has reached its template limit",
+        ));
+    }
+    let stored_bytes = record
+        .image_catalog
+        .iter()
+        .try_fold(0_usize, |total, image| total.checked_add(image.byte_size));
+    if stored_bytes
+        .and_then(|total| total.checked_add(byte_size))
+        .is_none_or(|total| total > MAX_PROJECT_IMAGE_CATALOG_BYTES)
+    {
+        return Err(ApiError::bad_request(
+            "project image catalog has reached its storage limit",
+        ));
+    }
+    let image = ImageCatalogRecord {
+        id,
+        name,
+        media_type,
+        content_hash,
+        byte_size,
+        width,
+        height,
+        content: content.to_vec(),
+        created_by: user_id,
+        created_at_ms,
+    };
+    let summary = ImageCatalogEntry::from(&image);
+    record.image_catalog.push(image);
+    Ok((StatusCode::CREATED, Json(summary)))
+}
+
+async fn download_image_catalog_entry(
+    State(state): State<MvpState>,
+    headers: HeaderMap,
+    Path((project_id, image_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let user_id = authenticate(&state, &headers).await?;
+    let project_id = parse_project_id(project_id)?;
+    let store = state.store.read().await;
+    let record = authorized_project(&store, &project_id, &user_id, ProjectAccess::View)?;
+    let image = record
+        .image_catalog
+        .iter()
+        .find(|image| image.id == image_id)
+        .ok_or_else(|| ApiError::not_found("image"))?;
+    let mut response = image.content.clone().into_response();
+    let response_headers = response.headers_mut();
+    response_headers.insert(CONTENT_TYPE, HeaderValue::from_static(image.media_type));
+    response_headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    response_headers.insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    response_headers.insert(
+        ETAG,
+        HeaderValue::from_str(&format!("\"{}\"", image.content_hash))
+            .map_err(|_| ApiError::internal())?,
+    );
+    Ok(response)
+}
+
 async fn list_project_audit(
     State(state): State<MvpState>,
     headers: HeaderMap,
@@ -1640,6 +1825,89 @@ fn dummy_hash() -> String {
                 .expect("the fixed dummy password and salt are valid")
         })
         .clone()
+}
+
+fn validate_catalog_image(content: &[u8]) -> Result<(&'static str, u32, u32), ApiError> {
+    if content.is_empty() {
+        return Err(ApiError::bad_request("image upload cannot be empty"));
+    }
+    if content.len() > MAX_IMAGE_UPLOAD_BYTES {
+        return Err(ApiError::bad_request("image upload exceeds the byte limit"));
+    }
+
+    let mut reader = ImageReader::new(Cursor::new(content))
+        .with_guessed_format()
+        .map_err(|_| ApiError::bad_request("image bytes could not be read"))?;
+    let format = reader
+        .format()
+        .filter(is_supported_catalog_image_format)
+        .ok_or_else(|| {
+            ApiError::bad_request("image must be a supported PNG, JPEG, or WebP file")
+        })?;
+    reject_animated_catalog_image(format, content)?;
+    reader.limits(image_decode_limits());
+    let image = reader.decode().map_err(|_| {
+        ApiError::bad_request("image must be a valid supported image within the configured limits")
+    })?;
+    let width = image.width();
+    let height = image.height();
+    if u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS {
+        return Err(ApiError::bad_request(
+            "image exceeds the decoded pixel limit",
+        ));
+    }
+    Ok((format.to_mime_type(), width, height))
+}
+
+fn image_decode_limits() -> Limits {
+    let mut limits = Limits::default();
+    limits.max_image_width = Some(MAX_IMAGE_AXIS);
+    limits.max_image_height = Some(MAX_IMAGE_AXIS);
+    limits.max_alloc = Some(MAX_IMAGE_DECODE_BYTES);
+    limits
+}
+
+fn reject_animated_catalog_image(format: ImageFormat, content: &[u8]) -> Result<(), ApiError> {
+    match format {
+        ImageFormat::Png => {
+            let decoder = PngDecoder::with_limits(Cursor::new(content), image_decode_limits())
+                .map_err(|_| {
+                    ApiError::bad_request(
+                        "image must be a valid supported image within the configured limits",
+                    )
+                })?;
+            if decoder
+                .is_apng()
+                .map_err(|_| ApiError::bad_request("image could not be read"))?
+            {
+                return Err(ApiError::bad_request(
+                    "animated PNG files are not supported",
+                ));
+            }
+        }
+        ImageFormat::WebP => {
+            let decoder = WebPDecoder::new(Cursor::new(content)).map_err(|_| {
+                ApiError::bad_request(
+                    "image must be a valid supported image within the configured limits",
+                )
+            })?;
+            if decoder.has_animation() {
+                return Err(ApiError::bad_request(
+                    "animated WebP files are not supported",
+                ));
+            }
+        }
+        ImageFormat::Jpeg => {}
+        _ => return Err(ApiError::bad_request("image format is not supported")),
+    }
+    Ok(())
+}
+
+fn is_supported_catalog_image_format(format: &ImageFormat) -> bool {
+    matches!(
+        format,
+        ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP
+    )
 }
 
 fn validate_name(name: String) -> Result<String, ApiError> {
@@ -2069,6 +2337,7 @@ mod tests {
             name: "Project".to_owned(),
             project,
             shape_catalog: Vec::new(),
+            image_catalog: Vec::new(),
         };
         assert!(has_project_access(
             &store,
