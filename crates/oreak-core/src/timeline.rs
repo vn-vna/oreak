@@ -4,11 +4,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{
-    ActorId, BlindBrushOperation, BlindGuide, BlindGuidePatch, BlindTilePatch, CellKind,
+    ActorId, BlindBrushOperation, BlindGuide, BlindGuidePatch, BlindTilePatch, CellEdit, CellKind,
     CollectCapacity, CollectLayer, CommandEnvelope, CommandId, CommandMetadata, Decorator,
-    DecoratorId, DecoratorKind, DirectionMode, EntityError, EntityId, EntityMove, GridAnchor,
-    GridError, GridPoint, GridSize, HistoryChange, HistoryEvent, LevelCommand, LevelCommandKind,
-    LevelError, LevelHash, LevelSnapshot, LevelTarget, LevelValue, PlaceableEntity,
+    DecoratorId, DecoratorKind, DirectionMode, EntityError, EntityId, EntityMove, EntityTransform,
+    GridAnchor, GridError, GridPoint, GridSize, HistoryChange, HistoryEvent, ImagePlacement,
+    ImageProjector, IndexedImage, LevelCommand, LevelCommandKind, LevelError, LevelHash,
+    LevelSnapshot, LevelTarget, LevelValue, MAX_SHAPE_AREA, PaletteSettings, PlaceableEntity,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,12 +63,32 @@ impl LevelTimeline {
     }
 
     pub fn apply(&mut self, envelope: CommandEnvelope) -> Result<ApplyOutcome, TimelineError> {
-        self.apply_internal(envelope, None)
+        self.apply_validated(envelope, |_, _| Ok(()))
+    }
+
+    /// Checks a proposed event and snapshot before changing any timeline state.
+    /// The validator is not called for a no-op or an invalid command.
+    pub fn apply_validated(
+        &mut self,
+        envelope: CommandEnvelope,
+        validator: impl FnOnce(&HistoryEvent, &LevelSnapshot) -> Result<(), TimelineError>,
+    ) -> Result<ApplyOutcome, TimelineError> {
+        self.apply_internal(envelope, None, validator)
     }
 
     pub fn undo_latest(
         &mut self,
         metadata: CommandMetadata,
+    ) -> Result<HistoryEvent, TimelineError> {
+        self.undo_latest_validated(metadata, |_, _| Ok(()))
+    }
+
+    /// Rejects a compensating event without consuming its ID or marking the
+    /// authored event reverted when the precommit validator fails.
+    pub fn undo_latest_validated(
+        &mut self,
+        metadata: CommandMetadata,
+        validator: impl FnOnce(&HistoryEvent, &LevelSnapshot) -> Result<(), TimelineError>,
     ) -> Result<HistoryEvent, TimelineError> {
         if self.command_sequences.contains_key(&metadata.id) {
             return Err(TimelineError::DuplicateCommandId(metadata.id));
@@ -106,6 +127,7 @@ impl LevelTimeline {
         let outcome = self.apply_internal(
             CommandEnvelope::new(metadata, target_event.inverse.clone()),
             Some(target_event.sequence),
+            validator,
         )?;
         let ApplyOutcome::Applied(event) = outcome else {
             return Err(TimelineError::UndoBecameNoOp(target_event.sequence));
@@ -169,6 +191,7 @@ impl LevelTimeline {
         &mut self,
         envelope: CommandEnvelope,
         reverts_sequence: Option<u64>,
+        validator: impl FnOnce(&HistoryEvent, &LevelSnapshot) -> Result<(), TimelineError>,
     ) -> Result<ApplyOutcome, TimelineError> {
         if self.command_sequences.contains_key(&envelope.metadata.id) {
             return Err(TimelineError::DuplicateCommandId(envelope.metadata.id));
@@ -182,7 +205,7 @@ impl LevelTimeline {
         };
 
         let sequence = self.next_sequence;
-        self.next_sequence = self
+        let next_sequence = self
             .next_sequence
             .checked_add(1)
             .ok_or(TimelineError::SequenceExhausted)?;
@@ -197,6 +220,8 @@ impl LevelTimeline {
             after_hash: application.snapshot.content_hash(),
         };
 
+        validator(&event, &application.snapshot)?;
+        self.next_sequence = next_sequence;
         self.current = application.snapshot;
         for change in &event.changes {
             self.provenance.insert(change.target.clone(), sequence);
@@ -316,6 +341,7 @@ fn apply_command(
             apply_restore_snapshot(snapshot, restored)
         }
         LevelCommand::SetCell { point, kind } => apply_set_cell(snapshot, *point, *kind),
+        LevelCommand::SetCells { cells } => apply_set_cells(snapshot, cells),
         LevelCommand::PlaceEntity { entity } => apply_place_entity(snapshot, entity),
         LevelCommand::PlaceEntities { entities } => apply_place_entities(snapshot, entities),
         LevelCommand::MoveEntity { entity_id, origin } => {
@@ -333,8 +359,16 @@ fn apply_command(
             )
         }
         LevelCommand::MoveEntities { moves } => apply_move_entities(snapshot, moves),
-        LevelCommand::TransformEntities { entities } => {
-            apply_transform_entities(snapshot, entities)
+        LevelCommand::TransformEntities {
+            transforms,
+            entities,
+        } => {
+            if transforms.is_empty() {
+                // Compatibility path for history emitted before transforms became semantic.
+                apply_entity_snapshots(snapshot, entities)
+            } else {
+                apply_transform_entities(snapshot, transforms)
+            }
         }
         LevelCommand::RotateEntityClockwise { entity_id } => {
             let before = required_entity(snapshot, entity_id)?;
@@ -383,6 +417,33 @@ fn apply_command(
                 },
             )
         }
+        LevelCommand::SetBlindResolutions {
+            entity_ids,
+            pixels_per_cell,
+        } => apply_set_blind_resolutions(snapshot, entity_ids, *pixels_per_cell),
+        LevelCommand::ApplyImageToPools {
+            image,
+            settings,
+            placement,
+            targets,
+        } => apply_image_to_pools(snapshot, image, settings, placement, targets),
+        LevelCommand::SetPoolDistributionGroups {
+            entity_id,
+            expected,
+            groups,
+        } => {
+            if expected.id() != entity_id || snapshot.entity(entity_id) != Some(expected) {
+                return Err(TimelineError::StaleDistributionTarget(entity_id.clone()));
+            }
+            let after = expected
+                .with_pool_distribution_groups(groups.clone())
+                .map_err(LevelError::from)?;
+            apply_entity_snapshots(snapshot, &[after])
+        }
+        LevelCommand::ApplyDistribution {
+            request,
+            expected_entities,
+        } => apply_distribution(snapshot, request, expected_entities),
         LevelCommand::SetBlockCollectLayers { entity_id, layers } => {
             apply_set_block_collect_layers(snapshot, entity_id, layers)
         }
@@ -760,6 +821,57 @@ fn apply_set_cell(
     }))
 }
 
+fn apply_set_cells(
+    snapshot: &LevelSnapshot,
+    cells: &[CellEdit],
+) -> Result<Option<CommandApplication>, TimelineError> {
+    if cells.len() > usize::from(MAX_SHAPE_AREA) {
+        return Err(LevelError::CellEditLimitExceeded {
+            count: cells.len(),
+            max: usize::from(MAX_SHAPE_AREA),
+        }
+        .into());
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut next = snapshot.clone();
+    let mut inverse = Vec::with_capacity(cells.len());
+    let mut changes = Vec::with_capacity(cells.len());
+    for edit in cells {
+        if !seen.insert(edit.point) {
+            return Err(LevelError::DuplicateCellEdit { point: edit.point }.into());
+        }
+        let before = snapshot.cell(edit.point)?;
+        if before == edit.kind {
+            continue;
+        }
+        if edit.kind == CellKind::Wall
+            && let Some(entity) = snapshot.entity_at(edit.point)
+        {
+            return Err(LevelError::CellOccupiedByEntity {
+                point: edit.point,
+                entity_id: entity.id().clone(),
+            }
+            .into());
+        }
+        next.set_cell(edit.point, edit.kind)?;
+        inverse.push(CellEdit::new(edit.point, before));
+        changes.push(HistoryChange {
+            target: LevelTarget::Cell(edit.point),
+            before: LevelValue::Cell(before),
+            after: LevelValue::Cell(edit.kind),
+        });
+    }
+    if changes.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(CommandApplication {
+        snapshot: next,
+        inverse: LevelCommand::SetCells { cells: inverse },
+        changes,
+    }))
+}
+
 fn apply_place_entity(
     snapshot: &LevelSnapshot,
     entity: &PlaceableEntity,
@@ -811,6 +923,32 @@ fn apply_place_entities(
 
 fn apply_transform_entities(
     snapshot: &LevelSnapshot,
+    transforms: &[EntityTransform],
+) -> Result<Option<CommandApplication>, TimelineError> {
+    if transforms.is_empty() {
+        return Ok(None);
+    }
+    let mut replacements = Vec::with_capacity(transforms.len());
+    for transform in transforms {
+        let before = required_entity(snapshot, &transform.entity_id)?;
+        let mut after = before.clone();
+        for _ in 0..(transform.clockwise_turns % 4) {
+            after = after.rotated_clockwise();
+        }
+        if transform.flip_horizontal {
+            after = after.flipped_horizontal();
+        }
+        if let Some(origin) = transform.origin {
+            after = after.moved_to(origin);
+        }
+        replacements.push(after);
+    }
+    apply_entity_snapshots(snapshot, &replacements)
+}
+
+/// Replaces complete entities only for compensating history events and old event replay.
+fn apply_entity_snapshots(
+    snapshot: &LevelSnapshot,
     entities: &[PlaceableEntity],
 ) -> Result<Option<CommandApplication>, TimelineError> {
     if entities.is_empty() {
@@ -854,41 +992,7 @@ fn apply_restore_entities(
     snapshot: &LevelSnapshot,
     entities: &[PlaceableEntity],
 ) -> Result<Option<CommandApplication>, TimelineError> {
-    if entities.is_empty() {
-        return Ok(None);
-    }
-    let mut seen = BTreeSet::new();
-    let mut replacements = Vec::with_capacity(entities.len());
-    let mut before_entities = Vec::with_capacity(entities.len());
-    let mut changes = Vec::with_capacity(entities.len());
-    for after in entities {
-        if !seen.insert(after.id().clone()) {
-            return Err(LevelError::DuplicateEntityMove(after.id().clone()).into());
-        }
-        let before = required_entity(snapshot, after.id())?;
-        if before == after {
-            continue;
-        }
-        replacements.push(after.clone());
-        before_entities.push(before.clone());
-        changes.push(entity_change(
-            after.id().clone(),
-            Some(before.clone()),
-            Some(after.clone()),
-        ));
-    }
-    if replacements.is_empty() {
-        return Ok(None);
-    }
-    let mut next = snapshot.clone();
-    next.replace_entities(replacements)?;
-    Ok(Some(CommandApplication {
-        snapshot: next,
-        inverse: LevelCommand::TransformEntities {
-            entities: before_entities,
-        },
-        changes,
-    }))
+    apply_entity_snapshots(snapshot, entities)
 }
 
 fn apply_move_entities(
@@ -945,16 +1049,187 @@ fn apply_entity_replacement(
     }))
 }
 
+fn apply_set_blind_resolutions(
+    snapshot: &LevelSnapshot,
+    entity_ids: &[EntityId],
+    pixels_per_cell: u8,
+) -> Result<Option<CommandApplication>, TimelineError> {
+    if entity_ids.is_empty() {
+        return Ok(None);
+    }
+    let mut seen = BTreeSet::new();
+    let mut entities = Vec::with_capacity(entity_ids.len());
+    for entity_id in entity_ids {
+        if !seen.insert(entity_id.clone()) {
+            return Err(LevelError::DuplicateEntityMove(entity_id.clone()).into());
+        }
+        let before = required_entity(snapshot, entity_id)?;
+        entities.push(
+            before
+                .resampled_blind(pixels_per_cell)
+                .map_err(LevelError::from)?,
+        );
+    }
+    apply_entity_snapshots(snapshot, &entities)
+}
+
+fn apply_image_to_pools(
+    snapshot: &LevelSnapshot,
+    image: &IndexedImage,
+    settings: &PaletteSettings,
+    placement: &ImagePlacement,
+    targets: &[PlaceableEntity],
+) -> Result<Option<CommandApplication>, TimelineError> {
+    const MAX_POOLS: usize = 64;
+    const MAX_PIXELS: usize = 1_000_000;
+    if targets.is_empty() || targets.len() > MAX_POOLS {
+        return Err(TimelineError::InvalidImageApply(
+            "image apply requires between 1 and 64 Pools".to_owned(),
+        ));
+    }
+    let mut seen = BTreeSet::new();
+    let mut source_pixels = 0_usize;
+    let mut output_pixels = 0_usize;
+    for expected in targets {
+        if !seen.insert(expected.id().clone()) {
+            return Err(TimelineError::InvalidImageApply(format!(
+                "duplicate image target '{}'",
+                expected.id()
+            )));
+        }
+        let blind = expected.as_blind().ok_or_else(|| {
+            TimelineError::InvalidImageApply(format!(
+                "image target '{}' is not a Pool",
+                expected.id()
+            ))
+        })?;
+        if snapshot.entity(expected.id()) != Some(expected) {
+            return Err(TimelineError::StaleImageTarget(expected.id().clone()));
+        }
+        let resolution = placement.resolution.unwrap_or(blind.pixels_per_cell());
+        if !(1..=32).contains(&resolution) {
+            return Err(TimelineError::InvalidImageApply(
+                "image target resolution must be between 1 and 32".to_owned(),
+            ));
+        }
+        let cells = expected.shape().occupied_cells().count();
+        source_pixels += cells * usize::from(blind.pixels_per_cell()).pow(2);
+        output_pixels += cells * usize::from(resolution).pow(2);
+        if source_pixels > MAX_PIXELS || output_pixels > MAX_PIXELS {
+            return Err(TimelineError::InvalidImageApply(
+                "image apply exceeds the 1000000 source or target pixel budget".to_owned(),
+            ));
+        }
+    }
+    // Validate every expected target and resource bound before any projection. The
+    // application helper commits all replacements and their inverse in one event.
+    let projector = ImageProjector::new(image, settings, placement.sampling, placement.pixelation)
+        .map_err(|error| TimelineError::InvalidImageApply(error.to_string()))?;
+    let replacements = targets
+        .iter()
+        .map(|target| {
+            projector
+                .project(placement, target)
+                .map_err(|error| TimelineError::InvalidImageApply(error.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    apply_entity_snapshots(snapshot, &replacements)
+}
+
+fn apply_distribution(
+    snapshot: &LevelSnapshot,
+    request: &crate::DistributionRequest,
+    expected_entities: &[PlaceableEntity],
+) -> Result<Option<CommandApplication>, TimelineError> {
+    // Exact sources matter as much as targets: painting, group edits, layer
+    // reordering and lock changes all invalidate a previously displayed budget.
+    if expected_entities.len() > 320 {
+        return Err(TimelineError::InvalidDistribution(
+            "too many expected entities".into(),
+        ));
+    }
+    let required: BTreeSet<_> = request
+        .pools
+        .iter()
+        .map(|pool| &pool.entity_id)
+        .chain(request.layers.iter().map(|layer| &layer.entity_id))
+        .collect();
+    let mut provided = BTreeSet::new();
+    for expected in expected_entities {
+        if !provided.insert(expected.id()) {
+            return Err(TimelineError::InvalidDistribution(
+                "duplicate expected entity".into(),
+            ));
+        }
+        if snapshot.entity(expected.id()) != Some(expected) {
+            return Err(TimelineError::StaleDistributionTarget(
+                expected.id().clone(),
+            ));
+        }
+    }
+    if provided != required {
+        return Err(TimelineError::InvalidDistribution(
+            "expected snapshots must cover exactly the selected Pools and Blocks".into(),
+        ));
+    }
+    let plan = crate::distribution_plan(snapshot, request)
+        .map_err(|error| TimelineError::InvalidDistribution(error.to_string()))?;
+    let mut changed_layers: BTreeMap<EntityId, Vec<CollectLayer>> = BTreeMap::new();
+    for allocation in plan.layers {
+        if allocation.locked {
+            continue;
+        }
+        let entity = required_entity(snapshot, &allocation.entity_id)?;
+        let crate::PlaceableEntityKind::Block(block) = entity.kind() else {
+            return Err(LevelError::from(EntityError::NotBlock(allocation.entity_id)).into());
+        };
+        let layers = changed_layers
+            .entry(allocation.entity_id)
+            .or_insert_with(|| block.collect_layers().to_vec());
+        let previous = &layers[allocation.layer_index];
+        layers[allocation.layer_index] = CollectLayer::new(
+            previous.color_index(),
+            previous.radius(),
+            CollectCapacity::Finite(allocation.capacity),
+            previous.is_locked(),
+        );
+    }
+    let replacements = changed_layers
+        .into_iter()
+        .map(|(id, layers)| {
+            required_entity(snapshot, &id)?
+                .with_block_collect_layers(layers)
+                .map_err(|error| TimelineError::InvalidLevel(error.into()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    apply_entity_snapshots(snapshot, &replacements)
+}
+
 fn apply_set_block_collect_layers(
     snapshot: &LevelSnapshot,
     entity_id: &EntityId,
     layers: &[CollectLayer],
 ) -> Result<Option<CommandApplication>, TimelineError> {
     let before = required_entity(snapshot, entity_id)?;
+    let existing_layers = match before.kind() {
+        crate::PlaceableEntityKind::Block(block) => block.collect_layers(),
+        crate::PlaceableEntityKind::Blind(_) => {
+            return Err(LevelError::from(EntityError::NotBlock(entity_id.clone())).into());
+        }
+    };
+    for (layer_index, existing) in existing_layers.iter().enumerate() {
+        if existing.is_locked() && layers.get(layer_index) != Some(existing) {
+            return Err(LevelError::from(EntityError::CollectLayerLocked {
+                entity_id: entity_id.clone(),
+                layer_index,
+            })
+            .into());
+        }
+    }
     let after = before
         .with_block_collect_layers(layers.to_vec())
         .map_err(LevelError::from)?;
-    apply_transform_entities(snapshot, &[after])
+    apply_entity_snapshots(snapshot, &[after])
 }
 
 fn apply_set_block_layer_capacity(
@@ -986,6 +1261,13 @@ fn apply_set_block_layer_capacity(
             })
             .into());
         };
+        if layer.is_locked() {
+            return Err(LevelError::from(EntityError::CollectLayerLocked {
+                entity_id: entity_id.clone(),
+                layer_index,
+            })
+            .into());
+        }
         let mut next_layers = layers.to_vec();
         next_layers[layer_index] = CollectLayer::new(
             layer.color_index(),
@@ -999,7 +1281,7 @@ fn apply_set_block_layer_capacity(
                 .map_err(LevelError::from)?,
         );
     }
-    apply_transform_entities(snapshot, &entities)
+    apply_entity_snapshots(snapshot, &entities)
 }
 
 fn apply_delete_entity(
@@ -1405,6 +1687,18 @@ pub enum TimelineError {
 
     #[error(transparent)]
     InvalidLevel(#[from] LevelError),
+
+    #[error("image target '{0}' changed after the preview was prepared")]
+    StaleImageTarget(EntityId),
+
+    #[error("invalid image apply: {0}")]
+    InvalidImageApply(String),
+
+    #[error("distribution source or target '{0}' changed after the preview; refresh the selection")]
+    StaleDistributionTarget(EntityId),
+
+    #[error("invalid distribution: {0}")]
+    InvalidDistribution(String),
 
     #[error("command ID '{0}' was already accepted")]
     DuplicateCommandId(CommandId),

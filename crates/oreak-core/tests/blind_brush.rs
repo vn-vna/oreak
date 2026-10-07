@@ -182,9 +182,10 @@ fn flood_fill_is_four_neighbor_and_respects_guide_barriers() {
             },
         ))
         .unwrap();
-    assert!(matches!(painted_fill, ApplyOutcome::NoChange { .. }));
-    assert_eq!(timeline.events().len(), event_count);
-    assert_eq!(color(&timeline, "blind", BlindPixel::new(0, 0)), Some(4));
+    assert!(matches!(painted_fill, ApplyOutcome::Applied { .. }));
+    assert_eq!(timeline.events().len(), event_count + 1);
+    assert_eq!(color(&timeline, "blind", BlindPixel::new(0, 0)), Some(7));
+    assert_eq!(color(&timeline, "blind", BlindPixel::new(0, 1)), Some(7));
 
     let event_count = timeline.events().len();
     let outcome = timeline
@@ -193,7 +194,7 @@ fn flood_fill_is_four_neighbor_and_respects_guide_barriers() {
             LevelCommand::FloodFillBlind {
                 entity_id: EntityId::from("blind"),
                 start: BlindPixel::new(0, 0),
-                color_index: 4,
+                color_index: 7,
             },
         ))
         .unwrap();
@@ -201,7 +202,13 @@ fn flood_fill_is_four_neighbor_and_respects_guide_barriers() {
     assert_eq!(timeline.events().len(), event_count);
 
     timeline
-        .undo_latest(CommandMetadata::new("undo-fill", "artist", 200))
+        .undo_latest(CommandMetadata::new("undo-fill-override", "artist", 200))
+        .unwrap();
+    assert_eq!(color(&timeline, "blind", BlindPixel::new(0, 0)), Some(4));
+    assert_eq!(color(&timeline, "blind", BlindPixel::new(0, 1)), Some(4));
+
+    timeline
+        .undo_latest(CommandMetadata::new("undo-fill", "artist", 201))
         .unwrap();
     for y in 0..2 {
         for x in 0..2 {

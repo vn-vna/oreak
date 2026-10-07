@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use oreak_core::{
-    ActorId, ApplyOutcome, BlameEntry, Blind, BlindPixel, BlindStroke, BlindTile, Block, CellKind,
-    CollectCapacity, CollectLayer, CommandEnvelope, CommandMetadata, Decorator, DecoratorId,
-    DecoratorKind, DirectionMode, EntityId, EntityMove, GridAnchor, GridPoint, GridSize,
-    HistoryEvent, LevelCommand, LevelSnapshot, LevelTarget, LevelTimeline, PlaceableEntity,
-    PlaceableEntityKind, Shape, ShapeCell, ShapeError, TimelineError,
+    ActorId, ApplyOutcome, BlameEntry, Blind, BlindPixel, BlindStroke, BlindTile, Block, CellEdit,
+    CellKind, CollectCapacity, CollectLayer, CommandEnvelope, CommandMetadata, Decorator,
+    DecoratorId, DecoratorKind, DirectionMode, EntityId, EntityMove, EntityTransform, GridAnchor,
+    GridPoint, GridSize, HistoryEvent, LevelCommand, LevelSnapshot, LevelTarget, LevelTimeline,
+    PlaceableEntity, PlaceableEntityKind, Shape, ShapeCell, ShapeError, TimelineError,
 };
 use oreak_protocol::{LevelPresenceItem, PresenceId, PresenceParticipant, ProjectLevelTarget};
 
@@ -105,6 +105,7 @@ pub enum Mode {
     Select,
     Map,
     Brush,
+    Distribution,
     Sandbox,
 }
 
@@ -115,6 +116,7 @@ impl Mode {
             Self::Select => 'Q',
             Self::Map => 'W',
             Self::Brush => 'B',
+            Self::Distribution => 'D',
             Self::Sandbox => 'P',
         }
     }
@@ -124,6 +126,7 @@ impl Mode {
             Self::Select => "Select",
             Self::Map => "Map",
             Self::Brush => "Brush",
+            Self::Distribution => "Distribution",
             Self::Sandbox => "Sandbox",
         }
     }
@@ -396,6 +399,60 @@ pub fn shape_world_points(origin: GridPoint, shape: Shape) -> Option<Vec<GridPoi
         .collect()
 }
 
+/// Keeps the freshest visual projection visible until authoritative state catches up.
+pub fn resolved_entity_preview(
+    authoritative: &PlaceableEntity,
+    active_drag: Option<PlaceableEntity>,
+    pending: Option<&PlaceableEntity>,
+) -> PlaceableEntity {
+    active_drag
+        .or_else(|| pending.cloned())
+        .unwrap_or_else(|| authoritative.clone())
+}
+
+/// Produces a move-and-rotate preview that keeps the landing cell fixed as the pivot.
+pub fn dragged_entity_preview(
+    entity: &PlaceableEntity,
+    origin: GridPoint,
+    start: GridPoint,
+    landing: GridPoint,
+    rotation_steps: u8,
+) -> Option<PlaceableEntity> {
+    let translated_x =
+        i32::from(origin.x).checked_add(i32::from(landing.x) - i32::from(start.x))?;
+    let translated_y =
+        i32::from(origin.y).checked_add(i32::from(landing.y) - i32::from(start.y))?;
+    if !(0..=i32::from(u16::MAX)).contains(&translated_x)
+        || !(0..=i32::from(u16::MAX)).contains(&translated_y)
+    {
+        return None;
+    }
+    let mut preview = entity.moved_to(GridPoint::new(translated_x as u16, translated_y as u16));
+    let anchor_x = i32::from(landing.x);
+    let anchor_y = i32::from(landing.y);
+    for _ in 0..rotation_steps % 4 {
+        let current = preview.origin();
+        let relative_x = i32::from(current.x).checked_sub(anchor_x)?;
+        let relative_y = i32::from(current.y).checked_sub(anchor_y)?;
+        // `rotated_clockwise` rebases a shape from height H into a new local
+        // bounding box, so shift the origin by H - 1 to keep world cells fixed
+        // around the landing-cell pivot.
+        let next_x = anchor_x
+            .checked_sub(relative_y)?
+            .checked_sub(i32::from(preview.shape().height()) - 1)?;
+        let next_y = anchor_y.checked_add(relative_x)?;
+        if !(0..=i32::from(u16::MAX)).contains(&next_x)
+            || !(0..=i32::from(u16::MAX)).contains(&next_y)
+        {
+            return None;
+        }
+        preview = preview
+            .rotated_clockwise()
+            .moved_to(GridPoint::new(next_x as u16, next_y as u16));
+    }
+    Some(preview)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ViewportTransform {
     pub scale: f64,
@@ -501,6 +558,22 @@ pub fn blind_pixel_from_top_left_sample(
         u16::from(cell_x) * u16::from(resolution) + u16::from(pixel_x),
         u16::from(cell_y) * u16::from(resolution) + u16::from(resolution - 1 - pixel_y_from_top),
     ))
+}
+
+/// Interpolates only inside one Pool cell so skipped pointer events cannot bridge cell gaps.
+pub fn rasterize_blind_segment_in_tile(
+    start: BlindPixel,
+    end: BlindPixel,
+    pixels_per_cell: u8,
+) -> Vec<BlindPixel> {
+    let resolution = u16::from(pixels_per_cell);
+    if resolution == 0
+        || start.x / resolution != end.x / resolution
+        || start.y / resolution != end.y / resolution
+    {
+        return vec![end];
+    }
+    rasterize_blind_segment(start, end)
 }
 
 pub fn rasterize_blind_segment(start: BlindPixel, end: BlindPixel) -> Vec<BlindPixel> {
@@ -611,6 +684,7 @@ pub fn resolve_shortcut(
         "q" => Some(Shortcut::SelectMode(Mode::Select)),
         "w" => Some(Shortcut::SelectMode(Mode::Map)),
         "b" => Some(Shortcut::SelectMode(Mode::Brush)),
+        "d" => Some(Shortcut::SelectMode(Mode::Distribution)),
         "p" => Some(Shortcut::SelectMode(Mode::Sandbox)),
         "arrowup" => Some(Shortcut::MoveSelection(MoveDirection::Up)),
         "arrowright" => Some(Shortcut::MoveSelection(MoveDirection::Right)),
@@ -809,6 +883,7 @@ impl EditorModel {
         self.apply_envelope(envelope)
     }
 
+    #[cfg(test)]
     pub fn prepare_set_cell(
         &mut self,
         point: GridPoint,
@@ -818,6 +893,18 @@ impl EditorModel {
         self.prepare_command(
             "edit",
             LevelCommand::SetCell { point, kind },
+            occurred_at_ms,
+        )
+    }
+
+    pub fn prepare_set_cells(
+        &mut self,
+        cells: Vec<CellEdit>,
+        occurred_at_ms: i64,
+    ) -> CommandEnvelope {
+        self.prepare_command(
+            "stamp-cells",
+            LevelCommand::SetCells { cells },
             occurred_at_ms,
         )
     }
@@ -920,12 +1007,15 @@ impl EditorModel {
 
     pub fn prepare_transform_entities(
         &mut self,
-        entities: Vec<PlaceableEntity>,
+        transforms: Vec<EntityTransform>,
         occurred_at_ms: i64,
     ) -> CommandEnvelope {
         self.prepare_command(
             "transform-entities",
-            LevelCommand::TransformEntities { entities },
+            LevelCommand::TransformEntities {
+                transforms,
+                entities: Vec::new(),
+            },
             occurred_at_ms,
         )
     }
@@ -992,6 +1082,22 @@ impl EditorModel {
             "set-blind-resolution",
             LevelCommand::SetBlindResolution {
                 entity_id,
+                pixels_per_cell,
+            },
+            occurred_at_ms,
+        )
+    }
+
+    pub fn prepare_set_blind_resolutions(
+        &mut self,
+        entity_ids: Vec<EntityId>,
+        pixels_per_cell: u8,
+        occurred_at_ms: i64,
+    ) -> CommandEnvelope {
+        self.prepare_command(
+            "set-blind-resolutions",
+            LevelCommand::SetBlindResolutions {
+                entity_ids,
                 pixels_per_cell,
             },
             occurred_at_ms,
@@ -1249,6 +1355,33 @@ impl EditorModel {
         self.next_metadata("undo", occurred_at_ms)
     }
 
+    pub fn prepare_set_pool_distribution_groups(
+        &mut self,
+        entity_id: EntityId,
+        expected: PlaceableEntity,
+        groups: Vec<oreak_core::PoolDistributionGroup>,
+        occurred_at_ms: i64,
+    ) -> CommandEnvelope {
+        self.prepare_command("pool-distribution-groups", LevelCommand::SetPoolDistributionGroups {
+            entity_id, expected, groups,
+        }, occurred_at_ms)
+    }
+
+    pub fn prepare_apply_distribution(
+        &mut self,
+        request: oreak_core::DistributionRequest,
+        expected_entities: Vec<PlaceableEntity>,
+        occurred_at_ms: i64,
+    ) -> CommandEnvelope {
+        self.prepare_command("apply-distribution", LevelCommand::ApplyDistribution {
+            request, expected_entities,
+        }, occurred_at_ms)
+    }
+
+    pub fn prepare_image_metadata(&mut self, occurred_at_ms: i64) -> CommandMetadata {
+        self.next_metadata("apply-image", occurred_at_ms)
+    }
+
     pub fn apply_server_event(
         &mut self,
         event: &HistoryEvent,
@@ -1325,6 +1458,54 @@ impl EditorModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rotated_drag_keeps_the_grabbed_cell_at_the_landing_point() {
+        let entity = PlaceableEntity::block(
+            "vertical",
+            GridPoint::new(0, 0),
+            Shape::new(1, 2, 0b11).unwrap(),
+            Block::new(Vec::new()),
+        )
+        .unwrap();
+        let preview = dragged_entity_preview(
+            &entity,
+            entity.origin(),
+            GridPoint::new(0, 0),
+            GridPoint::new(3, 3),
+            1,
+        )
+        .unwrap();
+        let cells = shape_world_points(preview.origin(), preview.shape()).unwrap();
+        assert!(cells.contains(&GridPoint::new(3, 3)));
+        assert!(cells.contains(&GridPoint::new(2, 3)));
+    }
+
+    #[test]
+    fn released_drag_keeps_pending_preview_until_authority_catches_up() {
+        let authoritative = PlaceableEntity::block(
+            "block",
+            GridPoint::new(1, 1),
+            Shape::new(1, 1, 1).unwrap(),
+            Block::new(Vec::new()),
+        )
+        .unwrap();
+        let pending = authoritative.moved_to(GridPoint::new(4, 3));
+        let active = authoritative.moved_to(GridPoint::new(5, 3));
+
+        assert_eq!(
+            resolved_entity_preview(&authoritative, Some(active.clone()), Some(&pending)).origin(),
+            active.origin()
+        );
+        assert_eq!(
+            resolved_entity_preview(&authoritative, None, Some(&pending)).origin(),
+            pending.origin()
+        );
+        assert_eq!(
+            resolved_entity_preview(&authoritative, None, None).origin(),
+            authoritative.origin()
+        );
+    }
 
     #[test]
     fn presence_roster_tracks_tabs_but_counts_distinct_actors() {
@@ -1480,6 +1661,43 @@ mod tests {
         let after_resync = first.prepare_set_cell(point, CellKind::Wall, 101);
         assert_ne!(first_command.metadata.id, after_resync.metadata.id);
         assert_eq!(first_command.metadata.actor, after_resync.metadata.actor);
+        let image_metadata = first.prepare_image_metadata(102);
+        assert_ne!(image_metadata.id, after_resync.metadata.id);
+        assert_eq!(image_metadata.actor, after_resync.metadata.actor);
+        assert!(image_metadata.id.as_str().contains("apply-image"));
+    }
+
+    #[test]
+    fn distribution_submission_preserves_captured_guards_without_optimistic_mutation() {
+        assert_eq!(resolve_shortcut("d", false, false, ShortcutScope::Workspace), Some(Shortcut::SelectMode(Mode::Distribution)));
+        assert_eq!(resolve_shortcut("d", false, false, ShortcutScope::TextEntry), None);
+        let mut model = EditorModel::blank("designer", "distribution-session");
+        let placement = model.prepare_place_default_blind(GridPoint::new(0, 0), 1);
+        model.apply_envelope(placement).unwrap();
+        let expected = model.timeline().snapshot().entities()[0].clone();
+        let groups = vec![oreak_core::PoolDistributionGroup {
+            id: 1, name: "Future paint".into(), pixels: vec![BlindPixel::new(0, 0)],
+        }];
+        let save = model.prepare_set_pool_distribution_groups(
+            expected.id().clone(), expected.clone(), groups.clone(), 2,
+        );
+        assert_eq!(model.timeline().snapshot().entity(expected.id()), Some(&expected));
+        assert!(matches!(&save.command, LevelCommand::SetPoolDistributionGroups {
+            entity_id, expected: captured, groups: captured_groups,
+        } if entity_id == expected.id() && captured == &expected && captured_groups == &groups));
+        model.apply_envelope(save).unwrap();
+        model.undo(3).unwrap();
+        assert_eq!(model.timeline().snapshot().entity(expected.id()), Some(&expected));
+
+        let request = oreak_core::DistributionRequest {
+            pools: vec![oreak_core::DistributionPoolSelection { entity_id: expected.id().clone(), group_ids: vec![0] }],
+            layers: Vec::new(),
+        };
+        let distribute = model.prepare_apply_distribution(request.clone(), vec![expected.clone()], 4);
+        assert!(matches!(&distribute.command, LevelCommand::ApplyDistribution {
+            request: captured, expected_entities,
+        } if captured == &request && expected_entities == &vec![expected.clone()]));
+        assert_eq!(model.timeline().snapshot().entity(expected.id()), Some(&expected));
     }
 
     #[test]
@@ -1982,6 +2200,15 @@ mod tests {
             }
         ));
         assert!(matches!(
+            model
+                .prepare_set_blind_resolutions(vec![blind.id().clone()], 16, 105)
+                .command,
+            LevelCommand::SetBlindResolutions {
+                pixels_per_cell: 16,
+                ..
+            }
+        ));
+        assert!(matches!(
             model.prepare_delete_entity(block_id.clone(), 105).command,
             LevelCommand::DeleteEntity { .. }
         ));
@@ -2001,8 +2228,8 @@ mod tests {
         assert!(matches!(
             model
                 .prepare_transform_entities(
-                    vec![source.clone().moved_to(GridPoint::new(4, 4))],
-                    107
+                    vec![EntityTransform::new(source.id().clone()).moved_to(GridPoint::new(4, 4))],
+                    107,
                 )
                 .command,
             LevelCommand::TransformEntities { .. }
@@ -2162,6 +2389,18 @@ mod tests {
         assert_eq!(
             rasterize_blind_segment(BlindPixel::new(2, 2), BlindPixel::new(2, 2)),
             vec![BlindPixel::new(2, 2)]
+        );
+    }
+
+    #[test]
+    fn blind_segment_does_not_bridge_visual_gaps_between_pool_cells() {
+        assert_eq!(
+            rasterize_blind_segment_in_tile(BlindPixel::new(2, 1), BlindPixel::new(4, 2), 4,),
+            vec![BlindPixel::new(4, 2)]
+        );
+        assert_eq!(
+            rasterize_blind_segment_in_tile(BlindPixel::new(1, 1), BlindPixel::new(3, 2), 4,),
+            rasterize_blind_segment(BlindPixel::new(1, 1), BlindPixel::new(3, 2))
         );
     }
 
@@ -2344,5 +2583,23 @@ mod tests {
                 .as_str(),
             "wall"
         );
+    }
+
+    #[test]
+    fn prepared_cell_stamp_uses_one_command_with_explicit_cells() {
+        let mut model = EditorModel::blank("alice", "stamp-session");
+        let cells = vec![
+            CellEdit::new(GridPoint::new(2, 3), CellKind::Wall),
+            CellEdit::new(GridPoint::new(3, 3), CellKind::Wall),
+            CellEdit::new(GridPoint::new(2, 4), CellKind::Wall),
+        ];
+
+        let command = model.prepare_set_cells(cells.clone(), 100);
+
+        assert_eq!(
+            command.metadata.id.as_str(),
+            "web-stamp-session-stamp-cells-0000000000000001"
+        );
+        assert_eq!(command.command, LevelCommand::SetCells { cells });
     }
 }

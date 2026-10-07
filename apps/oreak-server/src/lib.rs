@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+#[cfg(test)]
+mod image_limits_tests;
 mod mvp;
 
 use std::{
@@ -36,13 +38,16 @@ use jsonrpsee::{
     },
     types::ErrorObjectOwned,
 };
-use oreak_core::{ActorId, ApplyOutcome, GridPoint, LevelSnapshot, LevelTimeline, TimelineError};
+use oreak_core::{
+    ActorId, ApplyOutcome, CommandEnvelope, GridPoint, LevelCommand, LevelSnapshot, LevelTimeline,
+    TimelineError,
+};
 use oreak_protocol::{
-    ApplyCommandRequest, ApplyCommandResponse, ApplyCommandResult, HealthResponse, HealthStatus,
-    LevelEvent, LevelHistoryRequest, LevelHistoryResponse, LevelPresenceItem,
-    LevelSnapshotResponse, LevelSubscriptionItem, MAX_LEVEL_HISTORY_PAGE_SIZE, OreakRpcServer,
-    PresenceId, PresenceParticipant, ProjectLevelTarget, RpcErrorCode, RpcErrorData,
-    RpcErrorDetails, UndoLatestRequest, UndoLatestResponse, UpdateLevelCursorRequest,
+    ApplyCommandRequest, ApplyCommandResponse, ApplyCommandResult, ApplyImageRequest,
+    HealthResponse, HealthStatus, LevelEvent, LevelHistoryRequest, LevelHistoryResponse,
+    LevelPresenceItem, LevelSnapshotResponse, LevelSubscriptionItem, MAX_LEVEL_HISTORY_PAGE_SIZE,
+    OreakRpcServer, PresenceId, PresenceParticipant, ProjectLevelTarget, RpcErrorCode,
+    RpcErrorData, RpcErrorDetails, UndoLatestRequest, UndoLatestResponse, UpdateLevelCursorRequest,
 };
 use tokio::sync::{Mutex, RwLock, broadcast};
 use tower::{Service, service_fn};
@@ -60,6 +65,9 @@ const MAX_LEVEL_PRESENCES: usize = 128;
 const CURSOR_BROADCAST_INTERVAL: Duration = Duration::from_millis(50);
 const PRESENCE_AUTHORIZATION_INTERVAL: Duration = Duration::from_secs(15);
 const DEFAULT_WEB_DIST: &str = "apps/oreak-web/dist";
+// Leave headroom below jsonrpsee's 10 MiB response limit, including its framing.
+const MAX_SAFE_RPC_PAYLOAD_BYTES: usize = 8 * 1024 * 1024;
+const RPC_FRAME_RESERVE_BYTES: usize = 1024;
 
 pub struct Application {
     router: Router,
@@ -166,6 +174,58 @@ impl OreakRpcService {
             .clone()
     }
 
+    /// Shared authoritative commit path; callers must authorize and stamp metadata.
+    async fn commit_command(
+        &self,
+        target: ProjectLevelTarget,
+        command: CommandEnvelope,
+    ) -> RpcResult<ApplyCommandResponse> {
+        let level = self.level(&target).await;
+        if command_requires_bounded_worker(&command.command) {
+            // Lock inside the worker: projection and precommit serialization are
+            // off the async executor and never clone the accumulated history.
+            return tokio::task::spawn_blocking(move || {
+                let mut timeline = level.timeline.blocking_lock();
+                let (response, update) = apply_command_update(&mut timeline, target, command)?;
+                if let Some(update) = update {
+                    let _ = level.events.send(update);
+                }
+                Ok(response)
+            })
+            .await
+            .map_err(|_| invalid_command_rpc_error("bounded command worker failed"))?;
+        }
+        let mut timeline = level.timeline.lock().await;
+        let (response, update) = apply_command_update(&mut timeline, target, command)?;
+        if let Some(update) = update {
+            let _ = level.events.send(update);
+        }
+        Ok(response)
+    }
+
+    async fn commit_undo(
+        &self,
+        target: ProjectLevelTarget,
+        metadata: oreak_core::CommandMetadata,
+    ) -> RpcResult<UndoLatestResponse> {
+        let level = self.level(&target).await;
+        let mut timeline = level.timeline.lock().await;
+        if actor_has_active_image_command(&timeline, &metadata.actor) {
+            drop(timeline);
+            return tokio::task::spawn_blocking(move || {
+                let mut timeline = level.timeline.blocking_lock();
+                let (response, update) = apply_undo_update(&mut timeline, target, metadata, true)?;
+                let _ = level.events.send(update);
+                Ok(response)
+            })
+            .await
+            .map_err(|_| invalid_command_rpc_error("bounded undo worker failed"))?;
+        }
+        let (response, update) = apply_undo_update(&mut timeline, target, metadata, false)?;
+        let _ = level.events.send(update);
+        Ok(response)
+    }
+
     async fn authorize(
         &self,
         extensions: &jsonrpsee::Extensions,
@@ -220,24 +280,7 @@ impl OreakRpcServer for OreakRpcService {
 
         let level = self.level(&request.target).await;
         let timeline = level.timeline.lock().await;
-        let limit = usize::from(request.limit.min(MAX_LEVEL_HISTORY_PAGE_SIZE));
-        let mut matching = timeline.events().iter().rev().filter(|event| {
-            request
-                .before_sequence
-                .is_none_or(|before| event.sequence < before)
-        });
-        let events: Vec<_> = matching.by_ref().take(limit).cloned().collect();
-        let has_more = matching.next().is_some();
-        let next_before_sequence = has_more
-            .then(|| events.last().map(|event| event.sequence))
-            .flatten();
-
-        Ok(LevelHistoryResponse {
-            target: request.target,
-            events,
-            next_before_sequence,
-            has_more,
-        })
+        bounded_history_response(&timeline, request)
     }
 
     async fn apply_command(
@@ -248,39 +291,47 @@ impl OreakRpcServer for OreakRpcService {
         let user_id = self
             .authorize(extensions, &request.target, mvp::RpcLevelAccess::Edit)
             .await?;
+        if matches!(
+            &request.command.command,
+            LevelCommand::ApplyImageToPools { .. }
+        ) {
+            return Err(invalid_command_rpc_error(
+                "image commands require apply_image with a prepared image asset",
+            ));
+        }
         request.command.metadata.actor = ActorId::new(user_id.as_str());
         request.command.metadata.occurred_at_ms = server_timestamp_ms();
-        let level = self.level(&request.target).await;
-        let mut timeline = level.timeline.lock().await;
-        let outcome = timeline
-            .apply(request.command)
-            .map_err(timeline_rpc_error)?;
+        self.commit_command(request.target, request.command).await
+    }
 
-        match outcome {
-            ApplyOutcome::Applied(event) => {
-                let update = LevelEvent {
-                    target: request.target.clone(),
-                    server_sequence: event.sequence,
-                    level_hash: event.after_hash.to_string(),
-                    event: event.clone(),
-                };
-                let _ = level.events.send(update);
-                Ok(ApplyCommandResponse {
-                    target: request.target,
-                    server_sequence: event.sequence,
-                    level_hash: event.after_hash.to_string(),
-                    result: ApplyCommandResult::Applied {
-                        event: Box::new(event),
-                    },
-                })
-            }
-            ApplyOutcome::NoChange { snapshot_hash } => Ok(ApplyCommandResponse {
-                target: request.target,
-                server_sequence: current_sequence(&timeline),
-                level_hash: snapshot_hash.to_string(),
-                result: ApplyCommandResult::NoChange,
-            }),
-        }
+    async fn apply_image(
+        &self,
+        extensions: &jsonrpsee::Extensions,
+        mut request: ApplyImageRequest,
+    ) -> RpcResult<ApplyCommandResponse> {
+        let user_id = self
+            .authorize(extensions, &request.target, mvp::RpcLevelAccess::Edit)
+            .await?;
+        let (image, settings) = self
+            .application
+            .load_prepared_image(
+                request.target.project_id.as_str(),
+                &request.prepared_image_id,
+            )
+            .await
+            .map_err(invalid_command_rpc_error)?;
+        request.metadata.actor = ActorId::new(user_id.as_str());
+        request.metadata.occurred_at_ms = server_timestamp_ms();
+        let command = CommandEnvelope::new(
+            request.metadata,
+            LevelCommand::ApplyImageToPools {
+                image,
+                settings,
+                placement: request.placement,
+                targets: request.targets,
+            },
+        );
+        self.commit_command(request.target, command).await
     }
 
     async fn undo_latest(
@@ -293,25 +344,7 @@ impl OreakRpcServer for OreakRpcService {
             .await?;
         request.metadata.actor = ActorId::new(user_id.as_str());
         request.metadata.occurred_at_ms = server_timestamp_ms();
-        let level = self.level(&request.target).await;
-        let mut timeline = level.timeline.lock().await;
-        let event = timeline
-            .undo_latest(request.metadata)
-            .map_err(timeline_rpc_error)?;
-        let update = LevelEvent {
-            target: request.target.clone(),
-            server_sequence: event.sequence,
-            level_hash: event.after_hash.to_string(),
-            event: event.clone(),
-        };
-        let _ = level.events.send(update);
-
-        Ok(UndoLatestResponse {
-            target: request.target,
-            server_sequence: event.sequence,
-            level_hash: event.after_hash.to_string(),
-            event,
-        })
+        self.commit_undo(request.target, request.metadata).await
     }
 
     async fn update_level_cursor(
@@ -678,6 +711,243 @@ fn current_sequence(timeline: &LevelTimeline) -> u64 {
     timeline.events().last().map_or(0, |event| event.sequence)
 }
 
+/// Commands whose projections and entity snapshots can produce large RPC payloads.
+fn command_requires_bounded_worker(command: &LevelCommand) -> bool {
+    matches!(
+        command,
+        LevelCommand::ApplyImageToPools { .. }
+            | LevelCommand::SetPoolDistributionGroups { .. }
+            | LevelCommand::ApplyDistribution { .. }
+    )
+}
+
+fn apply_command_update(
+    timeline: &mut LevelTimeline,
+    target: ProjectLevelTarget,
+    command: CommandEnvelope,
+) -> RpcResult<(ApplyCommandResponse, Option<LevelEvent>)> {
+    let outcome = if command_requires_bounded_worker(&command.command) {
+        let image_command = matches!(&command.command, LevelCommand::ApplyImageToPools { .. });
+        timeline.apply_validated(command, |event, snapshot| {
+            let update = LevelEvent {
+                target: target.clone(),
+                server_sequence: event.sequence,
+                level_hash: event.after_hash.to_string(),
+                event: event.clone(),
+            };
+            let response = ApplyCommandResponse {
+                target: target.clone(),
+                server_sequence: event.sequence,
+                level_hash: event.after_hash.to_string(),
+                result: ApplyCommandResult::Applied {
+                    event: Box::new(event.clone()),
+                },
+            };
+            ensure_rpc_payload_fits(&response)
+                .and_then(|()| ensure_bounded_event_fits(&update, snapshot))
+                .map_err(|error| {
+                    if image_command {
+                        TimelineError::InvalidImageApply(error.to_string())
+                    } else {
+                        TimelineError::InvalidDistribution(error.to_string())
+                    }
+                })
+        })
+    } else {
+        timeline.apply(command)
+    }
+    .map_err(timeline_rpc_error)?;
+    match outcome {
+        ApplyOutcome::Applied(event) => {
+            let update = LevelEvent {
+                target: target.clone(),
+                server_sequence: event.sequence,
+                level_hash: event.after_hash.to_string(),
+                event: event.clone(),
+            };
+            let response = ApplyCommandResponse {
+                target,
+                server_sequence: event.sequence,
+                level_hash: event.after_hash.to_string(),
+                result: ApplyCommandResult::Applied {
+                    event: Box::new(event),
+                },
+            };
+            Ok((response, Some(update)))
+        }
+        ApplyOutcome::NoChange { snapshot_hash } => Ok((
+            ApplyCommandResponse {
+                target,
+                server_sequence: current_sequence(timeline),
+                level_hash: snapshot_hash.to_string(),
+                result: ApplyCommandResult::NoChange,
+            },
+            None,
+        )),
+    }
+}
+
+fn apply_undo_update(
+    timeline: &mut LevelTimeline,
+    target: ProjectLevelTarget,
+    metadata: oreak_core::CommandMetadata,
+    validate_payload: bool,
+) -> RpcResult<(UndoLatestResponse, LevelEvent)> {
+    let event = if validate_payload {
+        timeline.undo_latest_validated(metadata, |event, snapshot| {
+            let update = LevelEvent {
+                target: target.clone(),
+                server_sequence: event.sequence,
+                level_hash: event.after_hash.to_string(),
+                event: event.clone(),
+            };
+            let response = UndoLatestResponse {
+                target: target.clone(),
+                server_sequence: event.sequence,
+                level_hash: event.after_hash.to_string(),
+                event: event.clone(),
+            };
+            ensure_rpc_payload_fits(&response)
+                .and_then(|()| ensure_bounded_event_fits(&update, snapshot))
+                .map_err(|error| TimelineError::InvalidImageApply(error.to_string()))
+        })
+    } else {
+        timeline.undo_latest(metadata)
+    }
+    .map_err(timeline_rpc_error)?;
+    let update = LevelEvent {
+        target: target.clone(),
+        server_sequence: event.sequence,
+        level_hash: event.after_hash.to_string(),
+        event: event.clone(),
+    };
+    Ok((
+        UndoLatestResponse {
+            target,
+            server_sequence: event.sequence,
+            level_hash: event.after_hash.to_string(),
+            event,
+        },
+        update,
+    ))
+}
+
+/// Count JSON bytes without allocating an unbounded serialized payload.
+fn rpc_json_size(value: &impl serde::Serialize) -> RpcResult<usize> {
+    struct Counter(usize);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > MAX_SAFE_RPC_PAYLOAD_BYTES.saturating_sub(self.0) {
+                return Err(std::io::Error::other("RPC payload exceeds byte budget"));
+            }
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value).map_err(|_| {
+        invalid_command_rpc_error(
+            "serialized command/history payload exceeds the 8 MiB RPC safety budget",
+        )
+    })?;
+    Ok(counter.0)
+}
+
+fn ensure_rpc_payload_fits(value: &impl serde::Serialize) -> RpcResult<()> {
+    if rpc_json_size(value)? + RPC_FRAME_RESERVE_BYTES > MAX_SAFE_RPC_PAYLOAD_BYTES {
+        return Err(invalid_command_rpc_error(
+            "serialized command/history payload exceeds the 8 MiB RPC safety budget",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_bounded_event_fits(update: &LevelEvent, snapshot: &LevelSnapshot) -> RpcResult<()> {
+    ensure_rpc_payload_fits(&LevelSubscriptionItem::Event {
+        event: Box::new(update.clone()),
+    })?;
+    ensure_rpc_payload_fits(&LevelSubscriptionItem::Snapshot {
+        snapshot: Box::new(LevelSnapshotResponse {
+            target: update.target.clone(),
+            server_sequence: update.server_sequence,
+            snapshot: snapshot.clone(),
+            level_hash: update.level_hash.clone(),
+        }),
+    })?;
+    // Reserve the longest cursor and boolean representations so this event can
+    // always be returned alone, even after later events have been appended.
+    ensure_rpc_payload_fits(&LevelHistoryResponse {
+        target: update.target.clone(),
+        events: vec![update.event.clone()],
+        next_before_sequence: Some(u64::MAX),
+        has_more: false,
+    })
+}
+
+// Retain the existing helper name for the image-limit regression tests. Distribution
+// history needs the same worker and precommit guards, including group-only changes.
+fn actor_has_active_image_command(timeline: &LevelTimeline, actor: &ActorId) -> bool {
+    let reverted: std::collections::BTreeSet<_> = timeline
+        .events()
+        .iter()
+        .filter_map(|event| event.reverts_sequence)
+        .collect();
+    timeline.events().iter().any(|event| {
+        &event.metadata.actor == actor
+            && event.reverts_sequence.is_none()
+            && !reverted.contains(&event.sequence)
+            && command_requires_bounded_worker(&event.command)
+    })
+}
+
+fn bounded_history_response(
+    timeline: &LevelTimeline,
+    request: LevelHistoryRequest,
+) -> RpcResult<LevelHistoryResponse> {
+    let limit = usize::from(request.limit.min(MAX_LEVEL_HISTORY_PAGE_SIZE));
+    let mut matching = timeline
+        .events()
+        .iter()
+        .rev()
+        .filter(|event| {
+            request
+                .before_sequence
+                .is_none_or(|before| event.sequence < before)
+        })
+        .peekable();
+    let mut response = LevelHistoryResponse {
+        target: request.target,
+        events: Vec::new(),
+        next_before_sequence: Some(u64::MAX),
+        has_more: false,
+    };
+    let mut bytes = rpc_json_size(&response)? + RPC_FRAME_RESERVE_BYTES;
+    while response.events.len() < limit {
+        let Some(event) = matching.peek() else { break };
+        let event_bytes = rpc_json_size(event)? + usize::from(!response.events.is_empty());
+        if bytes + event_bytes > MAX_SAFE_RPC_PAYLOAD_BYTES {
+            if response.events.is_empty() {
+                return Err(invalid_command_rpc_error(
+                    "historical event exceeds the RPC safety budget",
+                ));
+            }
+            break;
+        }
+        bytes += event_bytes;
+        response.events.push((*event).clone());
+        matching.next();
+    }
+    response.has_more = matching.peek().is_some();
+    response.next_before_sequence = response
+        .has_more
+        .then(|| response.events.last().map(|event| event.sequence))
+        .flatten();
+    Ok(response)
+}
+
 fn snapshot_response(
     target: ProjectLevelTarget,
     timeline: &LevelTimeline,
@@ -734,6 +1004,15 @@ fn timeline_rpc_error(error: TimelineError) -> ErrorObjectOwned {
         TimelineError::NothingToUndo(actor) => (
             RpcErrorCode::NothingToUndo,
             Some(RpcErrorDetails::NothingToUndo { actor }),
+        ),
+        error @ (TimelineError::StaleImageTarget(_)
+        | TimelineError::InvalidImageApply(_)
+        | TimelineError::StaleDistributionTarget(_)
+        | TimelineError::InvalidDistribution(_)) => (
+            RpcErrorCode::InvalidCommand,
+            Some(RpcErrorDetails::InvalidCommand {
+                reason: error.to_string(),
+            }),
         ),
         TimelineError::InvalidGrid(error) => (
             RpcErrorCode::InvalidCommand,

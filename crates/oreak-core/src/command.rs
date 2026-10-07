@@ -3,8 +3,9 @@ use serde::{Deserialize, Serialize};
 use crate::{
     ActorId, BlindGuide, BlindGuidePatch, BlindGuideSet, BlindPixel, BlindStroke, BlindTile,
     BlindTilePatch, CellKind, CollectCapacity, CollectLayer, CommandId, Decorator, DecoratorId,
-    DirectionMode, EntityId, GridPoint, GridSize, LevelHash, LevelSnapshot, PlaceableEntity,
-    ShapeCell,
+    DirectionMode, DistributionRequest, EntityId, GridPoint, GridSize, ImagePlacement,
+    IndexedImage, LevelHash, LevelSnapshot, PaletteSettings, PlaceableEntity,
+    PoolDistributionGroup, ShapeCell,
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +22,19 @@ pub enum GridAnchor {
     BottomRight,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellEdit {
+    pub point: GridPoint,
+    pub kind: CellKind,
+}
+
+impl CellEdit {
+    #[must_use]
+    pub const fn new(point: GridPoint, kind: CellKind) -> Self {
+        Self { point, kind }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EntityMove {
     pub entity_id: EntityId,
@@ -34,6 +48,51 @@ impl EntityMove {
             entity_id: entity_id.into(),
             origin,
         }
+    }
+}
+
+/// A semantic entity transformation applied to the entity's current server state.
+///
+/// Keeping the operation separate from an entity snapshot means concurrent paint
+/// and capacity edits are retained when a collaborator moves or rotates an entity.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityTransform {
+    pub entity_id: EntityId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<GridPoint>,
+    #[serde(default)]
+    pub clockwise_turns: u8,
+    #[serde(default)]
+    pub flip_horizontal: bool,
+}
+
+impl EntityTransform {
+    #[must_use]
+    pub fn new(entity_id: impl Into<EntityId>) -> Self {
+        Self {
+            entity_id: entity_id.into(),
+            origin: None,
+            clockwise_turns: 0,
+            flip_horizontal: false,
+        }
+    }
+
+    #[must_use]
+    pub fn moved_to(mut self, origin: GridPoint) -> Self {
+        self.origin = Some(origin);
+        self
+    }
+
+    #[must_use]
+    pub fn rotated_clockwise(mut self, turns: u8) -> Self {
+        self.clockwise_turns = turns;
+        self
+    }
+
+    #[must_use]
+    pub fn flipped_horizontal(mut self) -> Self {
+        self.flip_horizontal = true;
+        self
     }
 }
 
@@ -60,6 +119,7 @@ pub enum LevelCommandKind {
     ResizeGrid,
     RestoreSnapshot,
     SetCell,
+    SetCells,
     PlaceEntity,
     PlaceEntities,
     MoveEntity,
@@ -68,6 +128,10 @@ pub enum LevelCommandKind {
     RotateEntityClockwise,
     FlipEntityHorizontal,
     SetBlindResolution,
+    SetBlindResolutions,
+    ApplyImageToPools,
+    SetPoolDistributionGroups,
+    ApplyDistribution,
     SetBlockCollectLayers,
     SetBlockLayerCapacity,
     DeleteEntity,
@@ -108,6 +172,9 @@ pub enum LevelCommand {
         point: GridPoint,
         kind: CellKind,
     },
+    SetCells {
+        cells: Vec<CellEdit>,
+    },
     PlaceEntity {
         entity: PlaceableEntity,
     },
@@ -121,8 +188,15 @@ pub enum LevelCommand {
     MoveEntities {
         moves: Vec<EntityMove>,
     },
-    /// Atomically replaces existing entities with transformed versions of themselves.
+    /// Atomically applies movement/rotation/flip operations to the current entities.
+    ///
+    /// `entities` remains only to replay history emitted by older clients. New writers
+    /// must send `transforms`, so concurrent non-geometric edits are not overwritten.
     TransformEntities {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        transforms: Vec<EntityTransform>,
+        #[doc(hidden)]
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         entities: Vec<PlaceableEntity>,
     },
     RotateEntityClockwise {
@@ -134,6 +208,30 @@ pub enum LevelCommand {
     SetBlindResolution {
         entity_id: EntityId,
         pixels_per_cell: u8,
+    },
+    SetBlindResolutions {
+        entity_ids: Vec<EntityId>,
+        pixels_per_cell: u8,
+    },
+    /// Applies a prepared image atomically, only while every expected Pool is unchanged.
+    /// Image assets are resolved by the server's dedicated `apply_image` endpoint.
+    ApplyImageToPools {
+        image: IndexedImage,
+        settings: PaletteSettings,
+        placement: ImagePlacement,
+        targets: Vec<PlaceableEntity>,
+    },
+    /// Saves authoring-only Pool groups if the captured Pool is still unchanged.
+    SetPoolDistributionGroups {
+        entity_id: EntityId,
+        expected: PlaceableEntity,
+        groups: Vec<PoolDistributionGroup>,
+    },
+    /// Recomputes a deterministic weighted allocation from authoritative source pixels.
+    /// Every selected source and destination is guarded by an exact captured snapshot.
+    ApplyDistribution {
+        request: DistributionRequest,
+        expected_entities: Vec<PlaceableEntity>,
     },
     SetBlockCollectLayers {
         entity_id: EntityId,
@@ -248,6 +346,7 @@ impl LevelCommand {
             Self::ResizeGrid { .. } => LevelCommandKind::ResizeGrid,
             Self::RestoreSnapshot { .. } => LevelCommandKind::RestoreSnapshot,
             Self::SetCell { .. } => LevelCommandKind::SetCell,
+            Self::SetCells { .. } => LevelCommandKind::SetCells,
             Self::PlaceEntity { .. } => LevelCommandKind::PlaceEntity,
             Self::PlaceEntities { .. } => LevelCommandKind::PlaceEntities,
             Self::MoveEntity { .. } => LevelCommandKind::MoveEntity,
@@ -256,6 +355,10 @@ impl LevelCommand {
             Self::RotateEntityClockwise { .. } => LevelCommandKind::RotateEntityClockwise,
             Self::FlipEntityHorizontal { .. } => LevelCommandKind::FlipEntityHorizontal,
             Self::SetBlindResolution { .. } => LevelCommandKind::SetBlindResolution,
+            Self::SetBlindResolutions { .. } => LevelCommandKind::SetBlindResolutions,
+            Self::ApplyImageToPools { .. } => LevelCommandKind::ApplyImageToPools,
+            Self::SetPoolDistributionGroups { .. } => LevelCommandKind::SetPoolDistributionGroups,
+            Self::ApplyDistribution { .. } => LevelCommandKind::ApplyDistribution,
             Self::SetBlockCollectLayers { .. } => LevelCommandKind::SetBlockCollectLayers,
             Self::SetBlockLayerCapacity { .. } => LevelCommandKind::SetBlockLayerCapacity,
             Self::DeleteEntity { .. } => LevelCommandKind::DeleteEntity,

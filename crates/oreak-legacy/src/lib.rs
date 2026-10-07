@@ -14,7 +14,7 @@ use json::JsonNode;
 use oreak_core::{
     Blind, BlindTile, Block, CardinalDirection, CellKind, CollectCapacity, CollectLayer, Decorator,
     DecoratorId, DecoratorKind, EntityId, GridPoint, GridSize, LevelSnapshot, PlaceableEntity,
-    PlaceableEntityKind, Shape,
+    PlaceableEntityKind, PoolBoundary, Shape,
 };
 use thiserror::Error;
 
@@ -116,6 +116,7 @@ struct PendingBlind {
     origin: GridPoint,
     shape: Shape,
     canvas: CanvasDescriptor,
+    boundary: PoolBoundary,
 }
 
 #[derive(Clone, Debug)]
@@ -197,6 +198,7 @@ impl LegacyLevel {
                         origin,
                         shape,
                         canvas,
+                        boundary: parse_pool_boundary(payload, &path)?,
                     });
                     RecordKind::Blind {
                         metadata,
@@ -815,7 +817,7 @@ impl LegacyLevel {
                 false,
             )?;
         }
-        if blind != old_blind || shape_changed {
+        if blind.tiles() != old_blind.tiles() || resolution_changed || shape_changed {
             payload = patch_canvas(
                 &payload,
                 entity.shape(),
@@ -826,6 +828,7 @@ impl LegacyLevel {
                 &record.id,
             )?;
         }
+        payload = patch_pool_boundary(&payload, blind.boundary(), old_blind.boundary())?;
         Ok(envelope("pool", payload))
     }
 
@@ -903,6 +906,7 @@ impl LegacyLevel {
                     &[],
                     entity.id().as_str(),
                 )?;
+                payload = patch_pool_boundary(&payload, blind.boundary(), PoolBoundary::default())?;
                 Ok(envelope("pool", payload))
             }
         }
@@ -1373,6 +1377,28 @@ fn parse_collect_row(
     Ok(CollectLayer::new(color_index, radius, capacity, locked))
 }
 
+fn parse_pool_boundary(payload: &JsonNode, path: &str) -> Result<PoolBoundary, LegacyError> {
+    let stc = required(payload, "stc")?;
+    Ok(PoolBoundary {
+        padding_pixels: parse_boundary_pixels(stc.get("spp"), &format!("{path}[1].stc.spp"))?,
+        corner_radius_pixels: parse_boundary_pixels(
+            stc.get("spcr"),
+            &format!("{path}[1].stc.spcr"),
+        )?,
+    })
+}
+
+fn parse_boundary_pixels(node: Option<&JsonNode>, path: &str) -> Result<Option<u16>, LegacyError> {
+    let Some(node) = node.filter(|node| !node.is_null()) else {
+        return Ok(None);
+    };
+    node.as_i64()
+        .and_then(|value| u16::try_from(value).ok())
+        .filter(|value| *value <= 1024)
+        .map(Some)
+        .ok_or_else(|| invalid(path, "must be null or an integer in 0..=1024"))
+}
+
 fn parse_canvas(
     payload: &JsonNode,
     shape: Shape,
@@ -1490,7 +1516,10 @@ fn decode_blind(
             }
         }
     }
-    Ok((Blind::new(resolution_u8, tiles).map_err(domain)?, wire))
+    let blind = Blind::new(resolution_u8, tiles)
+        .and_then(|blind| blind.with_boundary(pending.boundary))
+        .map_err(domain)?;
+    Ok((blind, wire))
 }
 
 fn resolve_decorators(
@@ -1934,6 +1963,36 @@ fn build_collect_row(layer: &CollectLayer, candidate: Option<&JsonNode>) -> Json
 fn set_array_value(values: &mut Vec<JsonNode>, index: usize, value: JsonNode) {
     values.resize_with(index + 1, JsonNode::null);
     values[index] = value;
+}
+
+fn patch_pool_boundary(
+    payload: &JsonNode,
+    boundary: PoolBoundary,
+    baseline: PoolBoundary,
+) -> Result<JsonNode, LegacyError> {
+    if boundary == baseline {
+        return Ok(payload.clone());
+    }
+    let mut stc = payload
+        .get("stc")
+        .cloned()
+        .unwrap_or_else(|| JsonNode::object(Vec::new()));
+    for (field, value, old_value) in [
+        ("spp", boundary.padding_pixels, baseline.padding_pixels),
+        (
+            "spcr",
+            boundary.corner_radius_pixels,
+            baseline.corner_radius_pixels,
+        ),
+    ] {
+        // Leave unchanged absence, null, and explicit zero exactly as authored.
+        if value != old_value {
+            stc = stc
+                .set(field, value.map_or_else(JsonNode::null, JsonNode::number))
+                .map_err(json_internal)?;
+        }
+    }
+    payload.set("stc", stc).map_err(json_internal)
 }
 
 #[allow(clippy::too_many_arguments)]

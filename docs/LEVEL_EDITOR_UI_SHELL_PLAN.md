@@ -12,6 +12,15 @@ The shell deliberately preserves the current authoritative command/RPC path. It 
 
 Shape Studio is a focused modal with saved shapes, the editable grid, and properties/actions as separate regions. Image Studio imports bounded static PNG, JPEG, and WebP files into a project-scoped server catalog; a copied image can also be pasted while the studio is open. The server detects bytes rather than trusting client MIME data, verifies dimensions, rejects animated PNG/WebP, computes a BLAKE3 digest, and gates catalog/content reads behind project view access and imports behind `edit_timeline`. In the current MVP service those bytes remain process-memory only; they are shared among connected users but are not durable across a server restart.
 
+### Image-to-sand workflow
+
+1. Import or paste a static image (512 KiB maximum, up to 1024 pixels per axis). The original is retained unchanged. The palette converter compares server-decoded RGBA and palette-only output at the same dimensions; it offers enabled colors, alpha threshold, background, and optional Floyd–Steinberg dithering. Advanced palette mapping exposes up to 16 dominant source-color clusters (5-bit RGB buckets): drag chips into enabled game-color groups or use their keyboard-accessible dropdowns. Unassigned buckets keep automatic matching; explicit mappings use original RGB even when a background is selected, and never recolor transparent pixels. Saving creates a new immutable prepared variant, recomputed by the server. Prepared cards show authenticated, max-256-pixel PNG thumbnails generated from the converted indices, not the original image.
+2. Choose a prepared variant and enter Apply Image. A temporary **Apply Image** left-sidebar tab and **Select Pool / Adjust Image / Cancel / Apply** secondary tools replace normal editing until exit. Select Pools by click, Shift-click, or marquee; drag/resize the image or use numeric placement and Fit/Cover controls.
+3. Choose nearest or area sampling, source-pixel block size, transparency preserve/erase, and existing or 1–32 pixels-per-cell resolution. Placement spans the selected Pools in shared grid coordinates and clips to their occupied cells. Palette changes return to the converter and save another variant. Resolution changes resample the selected Pools, including their existing pixels and guides.
+4. Apply submits one server-authoritative command with the prepared asset ID and captured Pool states. The server rejects stale targets atomically; a successful operation creates one undo step. Cancel before submission writes no level data; closing a submitted operation cannot retract its in-flight command.
+
+Prepared images share the MVP's **in-memory-only** lifetime. Bounds are 64 prepared images / 16 MiB indexed pixels per project and 64 selected Pools / 1,000,000 source and destination Pool pixels per application. Image edits are also checked against an 8 MiB serialized response/history budget before commit; reduce the selected coverage or resolution if an edit exceeds it. History pages honor both event count and byte limits. The browser previews with the shared converter/projector; it does not upload authoritative transformed pixels. Raw encoded source dimensions are preserved; EXIF orientation and embedded color profiles are not applied by the converter.
+
 ## Current limitations, kept explicit
 
 - The rendering backend is still **Canvas 2D**, not WebGL. It continues to redraw real-time editing and collaboration state through the existing canvas pipeline.
@@ -32,7 +41,7 @@ Extract a renderer-neutral scene projection from `EditorModel`/the snapshot and 
 
 ### 3. Complete durable image artifacts and Image Studio operations
 
-The MVP now has a narrow project-scoped static PNG/JPEG/WebP catalog with upload/download permissions, server-derived dimensions, BLAKE3 content hashes, and immutable template metadata. Replace its in-memory bytes with a durable metadata/blob store before treating it as persistent across restarts. Then add server-produced pixelation derivatives and explicit level-asset commands; do not persist browser-only image transformations or attach image bytes to the timeline.
+The MVP now includes original and prepared palette-image catalogs, full-resolution conversion, and an atomic image-to-Pool command. Replace its in-memory catalogs with a durable metadata/blob store before treating assets as persistent across restarts. Encoded original image bytes stay outside the timeline; current replayable image commands contain server-resolved indexed pixels and settings. A future content-addressed artifact store can replace repeated indexed payloads with durable references without trusting browser-only transformations.
 
 ### 4. Define the Unity/native integration contract
 

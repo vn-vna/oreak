@@ -1,5 +1,8 @@
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
+use std::collections::BTreeMap;
+
+use oreak_core::{IndexedImage, PaletteSettings};
 use serde::{Deserialize, Serialize};
 
 pub const EDIT_TIMELINE_CAPABILITY: &str = "edit_timeline";
@@ -60,6 +63,46 @@ pub struct CatalogSnapshot {
 pub struct CatalogProject {
     pub project: ProjectSummary,
     pub levels: Vec<LevelSummary>,
+}
+
+/// Chooses an initial editor target, preferring the user's current workspace.
+pub fn initial_catalog_level(
+    projects: &[ProjectSummary],
+    levels_by_project: &BTreeMap<String, Vec<LevelSummary>>,
+    preferred_workspace_id: &str,
+) -> Option<(ProjectSummary, LevelSummary)> {
+    projects
+        .iter()
+        .filter(|project| project.workspace_id == preferred_workspace_id)
+        .chain(
+            projects
+                .iter()
+                .filter(|project| project.workspace_id != preferred_workspace_id),
+        )
+        .find_map(|project| {
+            levels_by_project
+                .get(&project.id)
+                .and_then(|levels| levels.first())
+                .map(|level| (project.clone(), level.clone()))
+        })
+}
+
+/// Selects a project only within the active workspace, unless none is active.
+pub fn catalog_project_for_workspace(
+    projects: &[ProjectSummary],
+    workspace_id: &str,
+    current_project_id: Option<&str>,
+) -> Option<ProjectSummary> {
+    let in_workspace =
+        |project: &&ProjectSummary| workspace_id.is_empty() || project.workspace_id == workspace_id;
+    current_project_id
+        .and_then(|project_id| {
+            projects
+                .iter()
+                .find(|project| project.id == project_id && in_workspace(project))
+                .cloned()
+        })
+        .or_else(|| projects.iter().find(in_workspace).cloned())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
@@ -146,10 +189,46 @@ struct ImageCatalogList {
     images: Vec<ImageCatalogEntry>,
 }
 
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct PreparedImageEntry {
+    pub id: String,
+    pub source_image_id: String,
+    pub name: String,
+    pub settings: PaletteSettings,
+    pub width: u32,
+    pub height: u32,
+    pub palette_version: u32,
+    pub created_by: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct PreparedImage {
+    pub entry: PreparedImageEntry,
+    pub image: IndexedImage,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+pub struct ImagePixels {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+#[derive(Deserialize)]
+struct PreparedImageList {
+    images: Vec<PreparedImageEntry>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct CredentialsRequest<'a> {
     pub email: &'a str,
     pub password: &'a str,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CreateWorkspaceRequest<'a> {
+    pub name: &'a str,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -272,6 +351,11 @@ impl RestClient {
         self.get("/api/catalog").await
     }
 
+    pub async fn create_workspace(self, name: &str) -> Result<WorkspaceSummary, ApiError> {
+        self.post("/api/workspaces", &CreateWorkspaceRequest { name })
+            .await
+    }
+
     pub async fn create_project(
         self,
         workspace_id: &str,
@@ -282,6 +366,11 @@ impl RestClient {
             &CreateProjectRequest { workspace_id, name },
         )
         .await
+    }
+
+    pub async fn delete_project(self, project_id: &str) -> Result<(), ApiError> {
+        self.request_empty("DELETE", &format!("/api/projects/{project_id}"), None)
+            .await
     }
 
     pub async fn create_level(
@@ -296,6 +385,15 @@ impl RestClient {
                 name,
                 duration_seconds,
             },
+        )
+        .await
+    }
+
+    pub async fn delete_level(self, project_id: &str, level_id: &str) -> Result<(), ApiError> {
+        self.request_empty(
+            "DELETE",
+            &format!("/api/projects/{project_id}/levels/{level_id}"),
+            None,
         )
         .await
     }
@@ -456,6 +554,56 @@ impl RestClient {
             &format!("/api/projects/{project_id}/images?name={name}"),
             file.into(),
             media_type,
+        )
+        .await
+    }
+
+    pub async fn image_pixels(
+        self,
+        project_id: &str,
+        image_id: &str,
+    ) -> Result<ImagePixels, ApiError> {
+        self.get(&format!(
+            "/api/projects/{project_id}/images/{image_id}/pixels"
+        ))
+        .await
+    }
+
+    pub async fn list_prepared_images(
+        self,
+        project_id: &str,
+    ) -> Result<Vec<PreparedImageEntry>, ApiError> {
+        self.get::<PreparedImageList>(&format!("/api/projects/{project_id}/prepared-images"))
+            .await
+            .map(|response| response.images)
+    }
+
+    pub async fn prepared_image(
+        self,
+        project_id: &str,
+        image_id: &str,
+    ) -> Result<PreparedImage, ApiError> {
+        self.get(&format!(
+            "/api/projects/{project_id}/prepared-images/{image_id}"
+        ))
+        .await
+    }
+
+    pub async fn prepare_image(
+        self,
+        project_id: &str,
+        image_id: &str,
+        name: &str,
+        settings: &PaletteSettings,
+    ) -> Result<PreparedImage, ApiError> {
+        #[derive(Serialize)]
+        struct PrepareImageBody<'a> {
+            name: &'a str,
+            settings: &'a PaletteSettings,
+        }
+        self.post(
+            &format!("/api/projects/{project_id}/images/{image_id}/prepare"),
+            &PrepareImageBody { name, settings },
         )
         .await
     }
@@ -685,6 +833,63 @@ mod tests {
         assert_eq!(catalog.projects[0].levels[0].duration_seconds, 90.0);
         assert_eq!(shapes.shapes[0].shape.occupied_mask, 7);
         assert_eq!(images.images[0].content_hash, "blake3:abc");
+    }
+
+    #[test]
+    fn initial_catalog_level_prefers_the_current_workspace() {
+        let other = project("other", &["edit_timeline"]);
+        let preferred = project("preferred", &["edit_timeline"]);
+        let mut levels = BTreeMap::new();
+        levels.insert(
+            other.id.clone(),
+            vec![LevelSummary {
+                id: "level-other".to_owned(),
+                name: "Other".to_owned(),
+                duration_seconds: 0.0,
+                revision_count: 0,
+            }],
+        );
+        levels.insert(
+            preferred.id.clone(),
+            vec![LevelSummary {
+                id: "level-preferred".to_owned(),
+                name: "Preferred".to_owned(),
+                duration_seconds: 0.0,
+                revision_count: 0,
+            }],
+        );
+
+        let (selected_project, selected_level) =
+            initial_catalog_level(&[other, preferred], &levels, "preferred").unwrap();
+        assert_eq!(selected_project.workspace_id, "preferred");
+        assert_eq!(selected_level.id, "level-preferred");
+    }
+
+    #[test]
+    fn catalog_project_never_crosses_the_active_workspace() {
+        let foreign = project("foreign", &["edit_timeline"]);
+        assert!(
+            catalog_project_for_workspace(std::slice::from_ref(&foreign), "empty", None).is_none()
+        );
+        assert_eq!(
+            catalog_project_for_workspace(
+                std::slice::from_ref(&foreign),
+                "foreign",
+                Some(&foreign.id)
+            )
+            .unwrap()
+            .id,
+            foreign.id
+        );
+    }
+
+    #[test]
+    fn create_workspace_request_serializes_the_server_shape() {
+        let request = CreateWorkspaceRequest { name: "Studio" };
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            serde_json::json!({"name": "Studio"})
+        );
     }
 
     #[test]

@@ -732,6 +732,30 @@ impl Project {
         Ok(())
     }
 
+    pub fn delete_level(
+        &mut self,
+        level_id: &LevelId,
+        context: AuditContext,
+    ) -> Result<(), ProjectError> {
+        self.ensure_fresh_audit(&context.event_id)?;
+        self.require(&context.actor, Capability::EditTimeline)?;
+        let timeline = self
+            .timelines
+            .get(level_id)
+            .ok_or_else(|| ProjectError::LevelNotFound(level_id.clone()))?;
+        if !timeline.revisions.is_empty() {
+            return Err(ProjectError::LevelHasHistory(level_id.clone()));
+        }
+        self.timelines.remove(level_id);
+        self.append_audit(
+            context,
+            AuditAction::LevelDeleted {
+                level_id: level_id.clone(),
+            },
+        );
+        Ok(())
+    }
+
     pub fn set_level_configuration(
         &mut self,
         level_id: &LevelId,
@@ -1425,6 +1449,8 @@ pub enum ProjectError {
     DuplicateLevel(LevelId),
     #[error("level '{0}' was not found")]
     LevelNotFound(LevelId),
+    #[error("level '{0}' cannot be deleted after revisions exist")]
+    LevelHasHistory(LevelId),
     #[error("level duration must be finite and nonnegative")]
     InvalidLevelDuration,
     #[error("revision '{0}' already exists")]
@@ -1639,6 +1665,69 @@ mod tests {
                 audit("admin-level-b", "admin", 5),
             )
             .unwrap();
+    }
+
+    #[test]
+    fn deleting_a_level_requires_edit_access_and_is_audited() {
+        let mut project = project();
+        let level_id = LevelId::new("level-to-delete").unwrap();
+        project
+            .create_level(
+                level_id.clone(),
+                level_configuration("Temporary"),
+                audit("level-created-for-delete", "owner", 1),
+            )
+            .unwrap();
+
+        assert!(matches!(
+            project.delete_level(
+                &level_id,
+                audit("level-delete-denied", "organization-admin", 2)
+            ),
+            Err(ProjectError::PermissionDenied { .. })
+        ));
+        assert!(project.timelines().contains_key(&level_id));
+
+        project
+            .delete_level(&level_id, audit("level-deleted", "owner", 3))
+            .unwrap();
+        assert!(!project.timelines().contains_key(&level_id));
+        assert_eq!(
+            project.audit_events().last().unwrap().action(),
+            &AuditAction::LevelDeleted {
+                level_id: level_id.clone()
+            }
+        );
+        let audit_count = project.audit_events().len();
+        assert_eq!(
+            project.delete_level(&level_id, audit("level-delete-missing", "owner", 4)),
+            Err(ProjectError::LevelNotFound(level_id))
+        );
+        assert_eq!(project.audit_events().len(), audit_count);
+
+        let protected_level = LevelId::new("level-with-history").unwrap();
+        project
+            .create_level(
+                protected_level.clone(),
+                level_configuration("Published work"),
+                audit("protected-level-created", "owner", 5),
+            )
+            .unwrap();
+        project
+            .append_timeline_revision(
+                &protected_level,
+                RevisionId::new("protected-revision").unwrap(),
+                contribution("protected-revision-created", "owner", 6),
+            )
+            .unwrap();
+        assert_eq!(
+            project.delete_level(
+                &protected_level,
+                audit("protected-level-delete", "owner", 7)
+            ),
+            Err(ProjectError::LevelHasHistory(protected_level.clone()))
+        );
+        assert!(project.timelines().contains_key(&protected_level));
     }
 
     #[test]

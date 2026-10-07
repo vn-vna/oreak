@@ -3,15 +3,15 @@ use std::collections::{BTreeMap, BTreeSet};
 use gloo_timers::callback::Timeout;
 use js_sys::Date;
 use lucide_yew::{
-    Eraser, FolderTree, GitCommitHorizontal, Image, Map, Maximize, MessageSquare, MousePointer2,
-    PanelLeft, PanelLeftClose, PanelRight, PanelRightClose, Settings, Shapes, SlidersHorizontal,
-    Square, Users, ZoomIn, ZoomOut,
+    ChevronDown, ChevronRight, Eraser, FolderTree, GitCommitHorizontal, Image, Map, Maximize,
+    MessageSquare, MousePointer2, PanelLeft, PanelLeftClose, PanelRight, PanelRightClose, Plus,
+    Settings, Shapes, SlidersHorizontal, Square, Trash, Users, ZoomIn, ZoomOut,
 };
 use oreak_core::{
-    BlameEntry, BlindPixel, BlindStroke, CellKind, CollectCapacity, CollectLayer, CommandEnvelope,
-    DecoratorKind, DirectionMode, EntityId, EntityMove, GridAnchor, GridPoint, GridSize,
-    HistoryEvent, LevelCommand, LevelSnapshot, LevelTarget, PlaceableEntity, PlaceableEntityKind,
-    Shape, ShapeCell,
+    BlameEntry, BlindPixel, BlindStroke, CellEdit, CellKind, CollectCapacity, CollectLayer,
+    CommandEnvelope, DecoratorKind, DirectionMode, EntityId, EntityMove, EntityTransform,
+    GridAnchor, GridPoint, GridSize, HistoryEvent, LevelCommand, LevelSnapshot, LevelTarget,
+    PlaceableEntity, PlaceableEntityKind, Shape, ShapeCell,
 };
 use oreak_protocol::{
     ApplyCommandRequest, ApplyCommandResponse, ApplyCommandResult, LevelEvent, LevelPresenceItem,
@@ -29,17 +29,27 @@ use yew::prelude::*;
 use crate::api::{
     ApiError, CatalogSnapshot, ImageCatalogEntry, LevelConfiguration, LevelSummary,
     MembershipSummary, ProjectConfiguration, ProjectInvitationSummary, ProjectSummary, RestClient,
-    ShapeCatalogEntry, ShapeDefinition, UserSummary, WorkspaceSummary, draft_storage_key,
+    ShapeCatalogEntry, ShapeDefinition, UserSummary, WorkspaceSummary,
+    catalog_project_for_workspace, draft_storage_key, initial_catalog_level,
 };
 use crate::model::{
     EditorModel, MapResizeEdge, Mode, ModelChange, MoveDirection, PresenceRoster, Selection,
     ShapeBoundaryEdges, Shortcut, ShortcutScope, ViewportTransform,
-    blind_pixel_from_top_left_sample, designer_mask_from_shape, entity_ids_in_rect,
-    hydrate_history, key_locker_for_key, key_locker_for_lock, plan_content_aware_edge_resize,
-    pool_tile_geometry, rasterize_blind_segment, reconnect_delay_ms, resolve_shortcut,
-    select_entity, shape_boundary_edges, shape_from_designer_mask, shape_world_points,
+    blind_pixel_from_top_left_sample, designer_mask_from_shape, dragged_entity_preview,
+    entity_ids_in_rect, hydrate_history, key_locker_for_key, key_locker_for_lock,
+    plan_content_aware_edge_resize, pool_tile_geometry, rasterize_blind_segment_in_tile,
+    reconnect_delay_ms, resolve_shortcut, resolved_entity_preview, select_entity,
+    shape_boundary_edges, shape_from_designer_mask, shape_world_points,
 };
 use crate::rpc::{RpcClient, RpcUpdate};
+
+#[path = "image_studio.rs"]
+mod image_studio;
+use image_studio::{ImageMsg, ImageStudioState};
+
+#[path = "distribution_studio.rs"]
+mod distribution_studio;
+use distribution_studio::{DistributionMsg, DistributionState};
 
 const CANVAS_WIDTH: u32 = 1280;
 const CANVAS_HEIGHT: u32 = 720;
@@ -47,13 +57,14 @@ const BOARD_ORIGIN: f64 = 44.0;
 const CELL_SIZE: f64 = 85.0;
 const BLIND_INSET: f64 = 6.0;
 const THEME_STORAGE_KEY: &str = "oreak.theme.override";
+const UI_FONT_SIZE_STORAGE_KEY: &str = "oreak.ui.font-size.v1";
+const UI_SCALE_STORAGE_KEY: &str = "oreak.ui.scale.v1";
 const INSPECTOR_COLLAPSE_STORAGE_PREFIX: &str = "oreak.inspector.collapsed.v1.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
     Bootstrapping,
     Authentication,
-    Catalog,
     Editor,
 }
 
@@ -145,6 +156,131 @@ impl ThemeSettings {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct UiSettings {
+    font_size_offset: i8,
+    scale_percent: u16,
+}
+
+impl UiSettings {
+    const FONT_SIZE_OPTIONS: [(i8, &'static str); 4] = [
+        (-1, "Compact"),
+        (0, "Default"),
+        (1, "Large"),
+        (2, "Extra large"),
+    ];
+    const SCALE_OPTIONS: [(u16, &'static str); 4] =
+        [(90, "90%"), (100, "100%"), (110, "110%"), (125, "125%")];
+
+    fn load() -> Self {
+        let store = storage();
+        let font_size_offset = store
+            .as_ref()
+            .and_then(|store| store.get_item(UI_FONT_SIZE_STORAGE_KEY).ok().flatten())
+            .and_then(|value| value.parse::<i8>().ok())
+            .filter(|value| {
+                Self::FONT_SIZE_OPTIONS
+                    .iter()
+                    .any(|(option, _)| option == value)
+            })
+            .unwrap_or(0);
+        let scale_percent = store
+            .as_ref()
+            .and_then(|store| store.get_item(UI_SCALE_STORAGE_KEY).ok().flatten())
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|value| {
+                Self::SCALE_OPTIONS
+                    .iter()
+                    .any(|(option, _)| option == value)
+            })
+            .unwrap_or(100);
+        Self {
+            font_size_offset,
+            scale_percent,
+        }
+    }
+
+    fn set_font_size(&mut self, value: &str) -> bool {
+        let Ok(value) = value.parse::<i8>() else {
+            return false;
+        };
+        if !Self::FONT_SIZE_OPTIONS
+            .iter()
+            .any(|(option, _)| *option == value)
+            || self.font_size_offset == value
+        {
+            return false;
+        }
+        self.font_size_offset = value;
+        if let Some(store) = storage() {
+            let _ = store.set_item(UI_FONT_SIZE_STORAGE_KEY, &value.to_string());
+        }
+        true
+    }
+
+    fn set_scale(&mut self, value: &str) -> bool {
+        let Ok(value) = value.parse::<u16>() else {
+            return false;
+        };
+        if !Self::SCALE_OPTIONS
+            .iter()
+            .any(|(option, _)| *option == value)
+            || self.scale_percent == value
+        {
+            return false;
+        }
+        self.scale_percent = value;
+        if let Some(store) = storage() {
+            let _ = store.set_item(UI_SCALE_STORAGE_KEY, &value.to_string());
+        }
+        true
+    }
+
+    fn reset(&mut self) -> bool {
+        if *self == Self::default() {
+            return false;
+        }
+        *self = Self::default();
+        if let Some(store) = storage() {
+            let _ = store.remove_item(UI_FONT_SIZE_STORAGE_KEY);
+            let _ = store.remove_item(UI_SCALE_STORAGE_KEY);
+        }
+        true
+    }
+
+    fn canvas_font(self, base_size: u8, bold: bool) -> String {
+        let size = i16::from(base_size) + i16::from(self.font_size_offset);
+        format!(
+            "{}{size}px ui-monospace, SFMono-Regular, Consolas, monospace",
+            if bold { "bold " } else { "" }
+        )
+    }
+
+    fn shell_style(self, left_sidebar_width: f64, right_sidebar_width: f64) -> String {
+        let ui_scale = f64::from(self.scale_percent) / 100.0;
+        let inverse_scale = 100.0 / ui_scale;
+        let layout_left_width = left_sidebar_width / ui_scale;
+        let layout_right_width = right_sidebar_width / ui_scale;
+        let canvas_min_width = 480.0 / ui_scale;
+        let compact_canvas_min_width = 440.0 / ui_scale;
+        let narrow_sidebar_width = 220.0 / ui_scale;
+        let narrow_canvas_min_width = 460.0 / ui_scale;
+        format!(
+            "--left-sidebar-width: {layout_left_width:.2}px; --right-sidebar-width: {layout_right_width:.2}px; --canvas-min-width: {canvas_min_width:.2}px; --compact-canvas-min-width: {compact_canvas_min_width:.2}px; --narrow-sidebar-width: {narrow_sidebar_width:.2}px; --narrow-canvas-min-width: {narrow_canvas_min_width:.2}px; --ui-font-offset: {}px; --ui-scale: {ui_scale:.2}; width: {inverse_scale:.4}vw; height: {inverse_scale:.4}vh; zoom: var(--ui-scale);",
+            self.font_size_offset,
+        )
+    }
+}
+
+impl Default for UiSettings {
+    fn default() -> Self {
+        Self {
+            font_size_offset: 0,
+            scale_percent: 100,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TopMenu {
     File,
     History,
@@ -204,24 +340,30 @@ fn ui_icon(icon: UiIcon, size: usize) -> Html {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RightTab {
     Inspector,
+    Blame,
     LevelStructure,
     LevelConfiguration,
+    AdvancedDistribution,
 }
 
 impl RightTab {
     const fn label(self) -> &'static str {
         match self {
             Self::Inspector => "Inspector",
+            Self::Blame => "Blame",
             Self::LevelStructure => "Level structure",
             Self::LevelConfiguration => "Level configuration",
+            Self::AdvancedDistribution => "Advanced Distribution",
         }
     }
 
     const fn icon(self) -> UiIcon {
         match self {
             Self::Inspector => UiIcon::Inspector,
+            Self::Blame => UiIcon::Blame,
             Self::LevelStructure => UiIcon::Explorer,
             Self::LevelConfiguration => UiIcon::LevelConfiguration,
+            Self::AdvancedDistribution => UiIcon::Inspector,
         }
     }
 }
@@ -230,7 +372,8 @@ impl RightTab {
 pub(crate) enum LeftTab {
     #[default]
     ShapeTemplates,
-    Blame,
+    SandStudio,
+    ApplyImage,
     Explorer,
     Comments,
     Collaboration,
@@ -247,7 +390,8 @@ impl LeftTab {
     const fn label(self) -> &'static str {
         match self {
             Self::ShapeTemplates => "Shape templates",
-            Self::Blame => "Blame",
+            Self::SandStudio => "Sand Studio",
+            Self::ApplyImage => "Apply Image",
             Self::Explorer => "Project explorer",
             Self::Comments => "Comments",
             Self::Collaboration => "Collaboration session",
@@ -257,7 +401,8 @@ impl LeftTab {
     const fn icon(self) -> UiIcon {
         match self {
             Self::ShapeTemplates => UiIcon::ShapeTemplates,
-            Self::Blame => UiIcon::Blame,
+            Self::SandStudio => UiIcon::ImageStudio,
+            Self::ApplyImage => UiIcon::ImageStudio,
             Self::Explorer => UiIcon::Explorer,
             Self::Comments => UiIcon::Comments,
             Self::Collaboration => UiIcon::Collaboration,
@@ -309,8 +454,8 @@ impl InspectorSection {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum WorkspaceTool {
-    #[default]
     Place,
+    #[default]
     Transform,
     Decorate,
     Cells,
@@ -323,18 +468,20 @@ pub(crate) enum WorkspaceTool {
 impl WorkspaceTool {
     const fn for_mode(mode: Mode) -> &'static [Self] {
         match mode {
-            Mode::Select => &[Self::Place, Self::Transform, Self::Decorate],
+            Mode::Select => &[Self::Transform, Self::Place, Self::Decorate],
             Mode::Map => &[Self::Cells, Self::Resize],
             Mode::Brush => &[Self::Paint, Self::Fill],
+            Mode::Distribution => &[],
             Mode::Sandbox => &[Self::SandboxMove],
         }
     }
 
     const fn default_for(mode: Mode) -> Self {
         match mode {
-            Mode::Select => Self::Place,
+            Mode::Select => Self::Transform,
             Mode::Map => Self::Cells,
             Mode::Brush => Self::Paint,
+            Mode::Distribution => Self::Transform,
             Mode::Sandbox => Self::SandboxMove,
         }
     }
@@ -418,6 +565,12 @@ struct PendingCell {
     command_id: String,
 }
 
+#[derive(Clone, Debug)]
+struct PendingEntity {
+    command_id: String,
+    preview: Option<PlaceableEntity>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PlacementKind {
     Block,
@@ -484,6 +637,13 @@ struct EntityDrag {
     start_canvas_x: f64,
     start_canvas_y: f64,
     active: bool,
+    pointer_on_grid: bool,
+}
+
+#[derive(Debug)]
+struct EntityDragPreview {
+    entities: Vec<PlaceableEntity>,
+    valid: bool,
 }
 
 #[derive(Debug)]
@@ -554,6 +714,24 @@ impl StudioModal {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ExplorerAction {
+    CreateWorkspace,
+    CreateProject {
+        workspace_id: String,
+    },
+    CreateLevel {
+        project_id: String,
+    },
+    DeleteProject {
+        project_id: String,
+    },
+    DeleteLevel {
+        project_id: String,
+        level_id: String,
+    },
+}
+
 #[derive(Debug)]
 struct SidebarResize {
     side: SidebarSide,
@@ -595,11 +773,15 @@ pub struct App {
     projects: Vec<ProjectSummary>,
     selected_workspace_id: String,
     catalog_project: Option<ProjectSummary>,
-    levels: Vec<LevelSummary>,
     catalog_levels: BTreeMap<String, Vec<LevelSummary>>,
     catalog_invitations: Vec<ProjectInvitationSummary>,
-    catalog_query: String,
+    workspace_draft_name: String,
+    explorer_action: Option<ExplorerAction>,
     expanded_workspaces: BTreeSet<String>,
+    expanded_projects: BTreeSet<String>,
+    auto_open_initial_level: bool,
+    catalog_request_generation: u64,
+    level_intent_generation: u64,
     project_configuration: Option<ProjectConfiguration>,
     configuration_project: Option<ProjectSummary>,
     configuration_pending: bool,
@@ -640,6 +822,7 @@ pub struct App {
     left_sidebar_width: f64,
     right_sidebar_width: f64,
     left_panel_layout: PanelLayout,
+    left_panel_layout_before_sand_studio: Option<PanelLayout>,
     right_panel_layout: PanelLayout,
     resize_width: String,
     resize_height: String,
@@ -650,6 +833,9 @@ pub struct App {
     shape_draft_name: String,
     shape_draft_mask: u64,
     selected_shape_id: Option<String>,
+    active_shape_template_id: Option<String>,
+    image_studio: ImageStudioState,
+    distribution: DistributionState,
     image_catalog: Vec<ImageCatalogEntry>,
     image_catalog_pending: bool,
     image_draft_name: String,
@@ -663,9 +849,11 @@ pub struct App {
     image_file_input_ref: NodeRef,
     canvas_dirty: bool,
     theme: ThemeSettings,
+    ui_settings: UiSettings,
     inspector_collapsed: BTreeSet<InspectorSection>,
     open_menu: Option<TopMenu>,
     left_tab: LeftTab,
+    left_tab_before_sand_studio: Option<LeftTab>,
     right_tab: RightTab,
     studio_modal: Option<StudioModal>,
     workspace_tool: WorkspaceTool,
@@ -685,6 +873,7 @@ pub struct App {
     level_configuration_duration: String,
     level_configuration_pending: bool,
     level_configuration_error: Option<String>,
+    level_configuration_generation: u64,
     can_edit_timeline: bool,
     rpc: Option<RpcClient>,
     rpc_state: RpcState,
@@ -704,40 +893,81 @@ pub struct App {
     seen_commands: BTreeSet<String>,
     pending_commands: BTreeSet<String>,
     pending_cells: BTreeMap<GridPoint, PendingCell>,
-    pending_entities: BTreeMap<EntityId, String>,
+    pending_entities: BTreeMap<EntityId, PendingEntity>,
     pending_placements: BTreeMap<GridPoint, String>,
     pending_grid: Option<String>,
 }
 
 pub enum Msg {
+    ImageStudio(ImageMsg),
+    Distribution(DistributionMsg),
     BootstrapFinished(Result<UserSummary, ApiError>),
     SetAuthMode(AuthMode),
     AuthEmail(String),
     AuthPassword(String),
     SubmitAuth,
     AuthFinished(Result<UserSummary, ApiError>),
-    CatalogLoaded(Result<CatalogSnapshot, ApiError>),
-    CatalogQuery(String),
-    ToggleCatalogWorkspace(String),
+    CatalogLoaded {
+        generation: u64,
+        result: Result<CatalogSnapshot, ApiError>,
+    },
+    ReloadCatalog,
+    BeginExplorerAction(ExplorerAction),
+    CancelExplorerAction,
+    ToggleWorkspace(String),
+    ToggleProject(String),
+    WorkspaceName(String),
+    CreateWorkspace,
+    WorkspaceCreated {
+        intent_generation: u64,
+        result: Result<WorkspaceSummary, ApiError>,
+    },
+    SelectWorkspace(String),
     SelectProject(ProjectSummary),
     ProjectName(String),
     CreateProject,
-    ProjectCreated(Result<ProjectSummary, ApiError>),
+    ProjectCreated {
+        intent_generation: u64,
+        result: Result<ProjectSummary, ApiError>,
+    },
+    DeleteProject(String),
+    ProjectDeleted {
+        project_id: String,
+        result: Result<(), ApiError>,
+    },
     LevelName(String),
     LevelDuration(String),
     CreateLevel,
     LevelCreated {
         project: ProjectSummary,
+        intent_generation: u64,
         result: Result<LevelSummary, ApiError>,
     },
-    OpenCatalogLevel(ProjectSummary, LevelSummary),
+    DeleteLevel {
+        project_id: String,
+        level_id: String,
+    },
+    LevelDeleted {
+        project_id: String,
+        level_id: String,
+        result: Result<(), ApiError>,
+    },
+    OpenLevel(ProjectSummary, LevelSummary),
     OpenLevelConfiguration,
     CloseLevelConfiguration,
     LevelConfigurationName(String),
     LevelConfigurationDuration(String),
     SaveLevelConfiguration,
-    LevelConfigurationLoaded(Result<LevelConfiguration, ApiError>),
-    LevelConfigurationUpdated(Result<LevelConfiguration, ApiError>),
+    LevelConfigurationLoaded {
+        target: ProjectLevelTarget,
+        generation: u64,
+        result: Result<LevelConfiguration, ApiError>,
+    },
+    LevelConfigurationUpdated {
+        target: ProjectLevelTarget,
+        generation: u64,
+        result: Result<LevelConfiguration, ApiError>,
+    },
     OpenProjectConfiguration(ProjectSummary),
     ProjectConfigurationLoaded {
         project_id: String,
@@ -763,12 +993,13 @@ pub enum Msg {
         project_id: String,
         result: Result<ProjectSummary, ApiError>,
     },
-    ShowCatalog,
     Logout,
     LogoutFinished(Result<(), ApiError>),
     SetMode(Mode),
     SetMapPaintKind(CellKind),
     SetPlacementContext(PlacementKind),
+    OpenSandStudio,
+    SetBlindColor(u8),
     OpenStudio(StudioModal),
     CloseStudio,
     FocusExplorerEntity(EntityId),
@@ -797,6 +1028,7 @@ pub enum Msg {
     ToggleShapeCell(u8, u8),
     NewShapeDraft,
     SelectShape(String),
+    SelectShapeTemplate(String),
     SaveShapeDraft,
     UpdateShapeDraft,
     ShapeSaved {
@@ -810,6 +1042,7 @@ pub enum Msg {
         result: Result<(), ApiError>,
     },
     ImageCatalogLoaded {
+        scope: u64,
         project_id: String,
         result: Result<Vec<ImageCatalogEntry>, ApiError>,
     },
@@ -818,6 +1051,8 @@ pub enum Msg {
     ImagePasted(ClipboardEvent),
     ImportImage,
     ImageImported {
+        scope: u64,
+        generation: u64,
         project_id: String,
         result: Result<ImageCatalogEntry, ApiError>,
     },
@@ -831,10 +1066,12 @@ pub enum Msg {
     CanvasUp(PointerEvent),
     CanvasCancel(PointerEvent),
     CanvasLeave,
-    ClearSelection,
     KeyDown(KeyboardEvent),
     ToggleTheme,
     UseProjectTheme,
+    SetUiFontSize(String),
+    SetUiScale(String),
+    ResetUiSettings,
     Undo,
     ToggleMenu(TopMenu),
     SetLeftTab(LeftTab),
@@ -899,11 +1136,15 @@ impl Component for App {
             projects: Vec::new(),
             selected_workspace_id: String::new(),
             catalog_project: None,
-            levels: Vec::new(),
             catalog_levels: BTreeMap::new(),
             catalog_invitations: Vec::new(),
-            catalog_query: String::new(),
+            workspace_draft_name: String::new(),
+            explorer_action: None,
             expanded_workspaces: BTreeSet::new(),
+            expanded_projects: BTreeSet::new(),
+            auto_open_initial_level: false,
+            catalog_request_generation: 0,
+            level_intent_generation: 0,
             project_configuration: None,
             configuration_project: None,
             configuration_pending: false,
@@ -950,6 +1191,7 @@ impl Component for App {
             left_sidebar_width: 252.0,
             right_sidebar_width: 296.0,
             left_panel_layout: PanelLayout::Docked,
+            left_panel_layout_before_sand_studio: None,
             right_panel_layout: PanelLayout::Docked,
             resize_width: "8".to_owned(),
             resize_height: "8".to_owned(),
@@ -960,6 +1202,9 @@ impl Component for App {
             shape_draft_name: String::new(),
             shape_draft_mask: 1,
             selected_shape_id: None,
+            active_shape_template_id: None,
+            image_studio: ImageStudioState::default(),
+            distribution: DistributionState::default(),
             image_catalog: Vec::new(),
             image_catalog_pending: false,
             image_draft_name: String::new(),
@@ -973,12 +1218,14 @@ impl Component for App {
             image_file_input_ref: NodeRef::default(),
             canvas_dirty: true,
             theme: ThemeSettings::load(),
+            ui_settings: UiSettings::load(),
             inspector_collapsed: BTreeSet::new(),
             open_menu: None,
             left_tab: LeftTab::ShapeTemplates,
+            left_tab_before_sand_studio: None,
             right_tab: RightTab::Inspector,
             studio_modal: None,
-            workspace_tool: WorkspaceTool::Place,
+            workspace_tool: WorkspaceTool::Transform,
             palette_open: false,
             palette_query: String::new(),
             toasts: Vec::new(),
@@ -995,6 +1242,7 @@ impl Component for App {
             level_configuration_duration: String::new(),
             level_configuration_pending: false,
             level_configuration_error: None,
+            level_configuration_generation: 0,
             can_edit_timeline: false,
             rpc: None,
             rpc_state: RpcState::Offline,
@@ -1021,10 +1269,38 @@ impl Component for App {
     }
 
     fn update(&mut self, ctx: &Context<Self>, msg: Self::Message) -> bool {
+        // Leaving the workspace or resetting the timeline discards uncommitted previews.
+        if matches!(&msg, Msg::ResetDraft | Msg::Undo | Msg::SelectProject(_) | Msg::SelectWorkspace(_)
+            | Msg::OpenLevel(..) | Msg::Logout | Msg::ImageStudio(ImageMsg::Start(_))) {
+            self.distribution = DistributionState::default();
+        }
+        if self.distribution_modal_open() && matches!(&msg,
+            Msg::EditEntity(_) | Msg::EditDecorator(_) | Msg::SetIceCount(_) | Msg::SetGlassCount(_)
+            | Msg::SetPoolResolution(_) | Msg::SetBlockLayerCapacity(..) | Msg::AddBlockCollectLayer
+            | Msg::RemoveBlockCollectLayer(_) | Msg::ResizeGrid | Msg::BeginPlacementDrag(..)
+            | Msg::CanvasDrop(_) | Msg::RunPalette(_)) { return false; }
+        // The image overlay is preview-only: no unrelated workspace edit may leak through.
+        if self.image_studio.apply.is_some() {
+            if matches!(&msg, Msg::EditEntity(_) | Msg::EditDecorator(_) | Msg::SetIceCount(_)
+                | Msg::SetGlassCount(_) | Msg::SetPoolResolution(_) | Msg::SetBlockLayerCapacity(..)
+                | Msg::AddBlockCollectLayer | Msg::RemoveBlockCollectLayer(_) | Msg::ResizeGrid
+                | Msg::Undo | Msg::ResetDraft | Msg::BeginPlacementDrag(..) | Msg::CanvasDrop(_)
+                | Msg::SetWorkspaceTool(_) | Msg::FocusExplorerEntity(_) | Msg::RunPalette(_)) {
+                return false;
+            }
+            if matches!(&msg, Msg::SetMode(_) | Msg::SetMapPaintKind(_) | Msg::SetPlacementContext(_)
+                | Msg::OpenSandStudio | Msg::SelectProject(_) | Msg::SelectWorkspace(_) | Msg::OpenLevel(..)
+                | Msg::Logout) {
+                self.cancel_apply_image();
+                self.cancel_conversion();
+            }
+        }
         match msg {
+            Msg::ImageStudio(msg) => self.image_studio_message(ctx, msg),
+            Msg::Distribution(msg) => self.distribution_message(ctx, msg),
             Msg::BootstrapFinished(result) => {
                 match result {
-                    Ok(user) => self.enter_catalog(ctx, user),
+                    Ok(user) => self.enter_editor(ctx, user),
                     Err(error) if error.is_unauthorized() => {
                         self.phase = Phase::Authentication;
                         self.form_error = None;
@@ -1077,7 +1353,7 @@ impl Component for App {
                 match result {
                     Ok(user) => {
                         self.auth_password.clear();
-                        self.enter_catalog(ctx, user);
+                        self.enter_editor(ctx, user);
                     }
                     Err(error) => {
                         self.form_error = Some(api_error_message(&error));
@@ -1085,10 +1361,19 @@ impl Component for App {
                 }
                 true
             }
-            Msg::CatalogLoaded(result) => {
+            Msg::CatalogLoaded { generation, result } => {
+                if generation != self.catalog_request_generation
+                    || self.phase != Phase::Editor
+                    || self.user.is_none()
+                {
+                    return false;
+                }
                 self.request_pending = false;
                 match result {
                     Ok(snapshot) => {
+                        let should_open_initial_level =
+                            std::mem::take(&mut self.auto_open_initial_level);
+                        let initialize_expansion = self.workspaces.is_empty();
                         self.workspaces = snapshot.workspaces;
                         self.catalog_levels = snapshot
                             .projects
@@ -1101,8 +1386,6 @@ impl Component for App {
                             .map(|node| node.project)
                             .collect();
                         self.catalog_invitations = snapshot.invitations;
-                        self.expanded_workspaces
-                            .extend(self.workspaces.iter().map(|workspace| workspace.id.clone()));
                         if self.selected_workspace_id.is_empty()
                             || !self
                                 .workspaces
@@ -1123,78 +1406,260 @@ impl Component for App {
                                 })
                                 .unwrap_or_default();
                         }
-                        if let Some(selected_id) = self
+                        if initialize_expansion && !self.selected_workspace_id.is_empty() {
+                            self.expanded_workspaces
+                                .insert(self.selected_workspace_id.clone());
+                        }
+                        let current_project_id = self
                             .catalog_project
                             .as_ref()
-                            .map(|project| project.id.clone())
-                        {
-                            self.catalog_project = self
-                                .projects
-                                .iter()
-                                .find(|project| project.id == selected_id)
-                                .cloned();
-                            self.levels = self
-                                .catalog_levels
-                                .get(&selected_id)
-                                .cloned()
-                                .unwrap_or_default();
-                        }
+                            .map(|project| project.id.clone());
+                        self.catalog_project = catalog_project_for_workspace(
+                            &self.projects,
+                            &self.selected_workspace_id,
+                            current_project_id.as_deref(),
+                        );
+                        let initial_level = should_open_initial_level
+                            .then(|| {
+                                initial_catalog_level(
+                                    &self.projects,
+                                    &self.catalog_levels,
+                                    &self.selected_workspace_id,
+                                )
+                            })
+                            .flatten();
                         self.form_error = None;
+                        if let Some((project, level)) = initial_level {
+                            self.open_level(ctx, project, level);
+                        }
                     }
                     Err(error) => return self.handle_authenticated_api_error(error),
                 }
                 true
             }
-            Msg::CatalogQuery(query) => {
-                self.catalog_query = query;
+            Msg::ReloadCatalog => {
+                if self.request_pending || self.phase != Phase::Editor {
+                    return false;
+                }
+                self.form_error = None;
+                self.load_catalog(ctx);
                 true
             }
-            Msg::ToggleCatalogWorkspace(workspace_id) => {
-                self.selected_workspace_id = workspace_id.clone();
+            Msg::BeginExplorerAction(action) => {
+                if self.request_pending
+                    && matches!(
+                        self.explorer_action,
+                        Some(ExplorerAction::DeleteProject { .. })
+                            | Some(ExplorerAction::DeleteLevel { .. })
+                    )
+                {
+                    return false;
+                }
+                self.advance_level_intent();
+                self.form_error = None;
+                self.open_menu = None;
+                self.palette_open = false;
+                match &action {
+                    ExplorerAction::CreateWorkspace => self.workspace_draft_name.clear(),
+                    ExplorerAction::CreateProject { workspace_id } => {
+                        self.selected_workspace_id.clone_from(workspace_id);
+                        self.catalog_project = None;
+                        self.project_name.clear();
+                        self.expanded_workspaces.insert(workspace_id.clone());
+                    }
+                    ExplorerAction::CreateLevel { project_id } => {
+                        if let Some(project) = self
+                            .projects
+                            .iter()
+                            .find(|project| project.id == *project_id)
+                            .cloned()
+                        {
+                            self.selected_workspace_id = project.workspace_id.clone();
+                            self.catalog_project = Some(project);
+                        }
+                        self.level_name.clear();
+                        self.level_duration = "0".to_owned();
+                        self.expanded_projects.insert(project_id.clone());
+                    }
+                    ExplorerAction::DeleteProject { .. } | ExplorerAction::DeleteLevel { .. } => {}
+                }
+                self.explorer_action = Some(action);
+                true
+            }
+            Msg::CancelExplorerAction => {
+                self.explorer_action = None;
+                self.form_error = None;
+                self.advance_level_intent();
+                true
+            }
+            Msg::ToggleWorkspace(workspace_id) => {
                 if !self.expanded_workspaces.remove(&workspace_id) {
                     self.expanded_workspaces.insert(workspace_id);
                 }
                 true
             }
+            Msg::ToggleProject(project_id) => {
+                if !self.expanded_projects.remove(&project_id) {
+                    self.expanded_projects.insert(project_id);
+                }
+                true
+            }
+            Msg::WorkspaceName(value) => {
+                self.workspace_draft_name = value;
+                self.form_error = None;
+                true
+            }
+            Msg::CreateWorkspace => {
+                if self.request_pending || self.workspace_draft_name.trim().is_empty() {
+                    return false;
+                }
+                self.request_pending = true;
+                self.form_error = None;
+                let name = self.workspace_draft_name.trim().to_owned();
+                let intent_generation = self.level_intent_generation;
+                let link = ctx.link().clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    link.send_message(Msg::WorkspaceCreated {
+                        intent_generation,
+                        result: RestClient.create_workspace(&name).await,
+                    });
+                });
+                true
+            }
+            Msg::WorkspaceCreated {
+                intent_generation,
+                result,
+            } => {
+                self.request_pending = false;
+                match result {
+                    Ok(workspace) => {
+                        self.workspace_draft_name.clear();
+                        if self.level_intent_generation == intent_generation {
+                            self.selected_workspace_id = workspace.id.clone();
+                            self.expanded_workspaces.insert(workspace.id);
+                            self.catalog_project = None;
+                            self.explorer_action = None;
+                        }
+                        self.push_toast("Workspace created".to_owned(), "success");
+                        self.load_catalog(ctx);
+                    }
+                    Err(error) => return self.handle_authenticated_api_error(error),
+                }
+                true
+            }
+            Msg::SelectWorkspace(workspace_id) => {
+                self.advance_level_intent();
+                self.expanded_workspaces.insert(workspace_id.clone());
+                self.selected_workspace_id = workspace_id;
+                self.catalog_project = self
+                    .projects
+                    .iter()
+                    .find(|project| project.workspace_id == self.selected_workspace_id)
+                    .cloned();
+                self.form_error = None;
+                true
+            }
             Msg::SelectProject(project) => {
+                self.advance_level_intent();
+                self.expanded_workspaces
+                    .insert(project.workspace_id.clone());
+                self.expanded_projects.insert(project.id.clone());
                 self.selected_workspace_id = project.workspace_id.clone();
-                self.catalog_project = Some(project.clone());
-                self.levels = self
-                    .catalog_levels
-                    .get(&project.id)
-                    .cloned()
-                    .unwrap_or_default();
+                self.catalog_project = Some(project);
                 self.form_error = None;
                 true
             }
             Msg::ProjectName(value) => {
                 self.project_name = value;
+                self.form_error = None;
                 true
             }
             Msg::CreateProject => {
-                if self.request_pending || self.project_name.trim().is_empty() {
+                let can_create_project = self.workspaces.iter().any(|workspace| {
+                    workspace.id == self.selected_workspace_id
+                        && matches!(workspace.role.as_str(), "owner" | "admin")
+                });
+                if self.request_pending
+                    || self.project_name.trim().is_empty()
+                    || !can_create_project
+                {
                     return false;
                 }
                 self.request_pending = true;
                 self.form_error = None;
                 let workspace_id = self.selected_workspace_id.clone();
                 let name = self.project_name.trim().to_owned();
+                let intent_generation = self.level_intent_generation;
                 let link = ctx.link().clone();
                 wasm_bindgen_futures::spawn_local(async move {
-                    link.send_message(Msg::ProjectCreated(
-                        RestClient.create_project(&workspace_id, &name).await,
-                    ));
+                    link.send_message(Msg::ProjectCreated {
+                        intent_generation,
+                        result: RestClient.create_project(&workspace_id, &name).await,
+                    });
                 });
                 true
             }
-            Msg::ProjectCreated(result) => {
+            Msg::ProjectCreated {
+                intent_generation,
+                result,
+            } => {
                 self.request_pending = false;
                 match result {
                     Ok(project) => {
                         self.project_name.clear();
+                        if self.level_intent_generation == intent_generation {
+                            self.selected_workspace_id = project.workspace_id.clone();
+                            self.expanded_workspaces
+                                .insert(project.workspace_id.clone());
+                            self.expanded_projects.insert(project.id.clone());
+                            self.catalog_project = Some(project.clone());
+                            self.explorer_action = None;
+                        }
                         self.projects.push(project.clone());
-                        self.catalog_project = Some(project);
-                        self.levels.clear();
+                        self.catalog_levels.entry(project.id).or_default();
+                        self.push_toast("Project created".to_owned(), "success");
+                        self.load_catalog(ctx);
+                    }
+                    Err(error) => return self.handle_authenticated_api_error(error),
+                }
+                true
+            }
+            Msg::DeleteProject(project_id) => {
+                if self.request_pending {
+                    return false;
+                }
+                self.request_pending = true;
+                self.form_error = None;
+                let request_project_id = project_id.clone();
+                let link = ctx.link().clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    link.send_message(Msg::ProjectDeleted {
+                        project_id: request_project_id.clone(),
+                        result: RestClient.delete_project(&request_project_id).await,
+                    });
+                });
+                true
+            }
+            Msg::ProjectDeleted { project_id, result } => {
+                self.request_pending = false;
+                match result {
+                    Ok(()) => {
+                        let deleted_active = self.target.project_id.as_str() == project_id;
+                        self.projects.retain(|project| project.id != project_id);
+                        self.catalog_levels.remove(&project_id);
+                        self.expanded_projects.remove(&project_id);
+                        if self
+                            .catalog_project
+                            .as_ref()
+                            .is_some_and(|project| project.id == project_id)
+                        {
+                            self.catalog_project = None;
+                        }
+                        self.explorer_action = None;
+                        if deleted_active {
+                            self.unbind_level();
+                        }
+                        self.push_toast("Project deleted".to_owned(), "success");
                         self.load_catalog(ctx);
                     }
                     Err(error) => return self.handle_authenticated_api_error(error),
@@ -1203,10 +1668,12 @@ impl Component for App {
             }
             Msg::LevelName(value) => {
                 self.level_name = value;
+                self.form_error = None;
                 true
             }
             Msg::LevelDuration(value) => {
                 self.level_duration = value;
+                self.form_error = None;
                 true
             }
             Msg::CreateLevel => {
@@ -1229,10 +1696,12 @@ impl Component for App {
                 self.form_error = None;
                 let name = self.level_name.trim().to_owned();
                 let project_id = project.id.clone();
+                let intent_generation = self.level_intent_generation;
                 let link = ctx.link().clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     link.send_message(Msg::LevelCreated {
                         project,
+                        intent_generation,
                         result: RestClient
                             .create_level(&project_id, &name, duration_seconds)
                             .await,
@@ -1240,25 +1709,92 @@ impl Component for App {
                 });
                 true
             }
-            Msg::LevelCreated { project, result } => {
+            Msg::LevelCreated {
+                project,
+                intent_generation,
+                result,
+            } => {
                 self.request_pending = false;
                 match result {
                     Ok(level) => {
                         self.level_name.clear();
                         self.level_duration = "0".to_owned();
-                        self.levels.push(level.clone());
-                        self.open_level(ctx, project, level);
+                        self.catalog_levels
+                            .entry(project.id.clone())
+                            .or_default()
+                            .push(level.clone());
+                        if self.phase == Phase::Editor
+                            && self.level_intent_generation == intent_generation
+                        {
+                            self.explorer_action = None;
+                            self.open_level(ctx, project, level);
+                        } else {
+                            self.push_toast(
+                                "Level created. Select it from the Explorer.".to_owned(),
+                                "success",
+                            );
+                            if self.phase == Phase::Editor {
+                                self.load_catalog(ctx);
+                            }
+                        }
                     }
                     Err(error) => return self.handle_authenticated_api_error(error),
                 }
                 true
             }
-            Msg::OpenCatalogLevel(project, level) => {
+            Msg::DeleteLevel {
+                project_id,
+                level_id,
+            } => {
+                if self.request_pending {
+                    return false;
+                }
+                self.request_pending = true;
+                self.form_error = None;
+                let request_project_id = project_id.clone();
+                let request_level_id = level_id.clone();
+                let link = ctx.link().clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    link.send_message(Msg::LevelDeleted {
+                        project_id: request_project_id.clone(),
+                        level_id: request_level_id.clone(),
+                        result: RestClient
+                            .delete_level(&request_project_id, &request_level_id)
+                            .await,
+                    });
+                });
+                true
+            }
+            Msg::LevelDeleted {
+                project_id,
+                level_id,
+                result,
+            } => {
+                self.request_pending = false;
+                match result {
+                    Ok(()) => {
+                        let deleted_active = self.target.project_id.as_str() == project_id
+                            && self.target.level_id.as_str() == level_id;
+                        if let Some(levels) = self.catalog_levels.get_mut(&project_id) {
+                            levels.retain(|level| level.id != level_id);
+                        }
+                        self.explorer_action = None;
+                        if deleted_active {
+                            self.unbind_level();
+                        }
+                        self.push_toast("Level deleted".to_owned(), "success");
+                        self.load_catalog(ctx);
+                    }
+                    Err(error) => return self.handle_authenticated_api_error(error),
+                }
+                true
+            }
+            Msg::OpenLevel(project, level) => {
                 self.open_level(ctx, project, level);
                 true
             }
             Msg::OpenLevelConfiguration => {
-                if self.phase != Phase::Editor {
+                if self.phase != Phase::Editor || self.target.project_id.as_str().is_empty() {
                     return false;
                 }
                 self.right_tab = RightTab::LevelConfiguration;
@@ -1267,20 +1803,24 @@ impl Component for App {
                 self.level_configuration_error = None;
                 self.level_configuration_name = self.level_display_name.clone();
                 self.level_configuration_duration = self.level_duration_seconds.to_string();
-                let project_id = self.target.project_id.to_string();
-                let level_id = self.target.level_id.to_string();
+                self.level_configuration_generation =
+                    self.level_configuration_generation.wrapping_add(1);
+                let generation = self.level_configuration_generation;
+                let target = self.target.clone();
+                let project_id = target.project_id.to_string();
+                let level_id = target.level_id.to_string();
                 let link = ctx.link().clone();
                 wasm_bindgen_futures::spawn_local(async move {
-                    link.send_message(Msg::LevelConfigurationLoaded(
-                        RestClient.level_configuration(&project_id, &level_id).await,
-                    ));
+                    link.send_message(Msg::LevelConfigurationLoaded {
+                        target,
+                        generation,
+                        result: RestClient.level_configuration(&project_id, &level_id).await,
+                    });
                 });
                 true
             }
             Msg::CloseLevelConfiguration => {
-                self.level_configuration_open = false;
-                self.level_configuration_error = None;
-                self.right_tab = RightTab::Inspector;
+                self.reset_level_configuration();
                 true
             }
             Msg::LevelConfigurationName(value) => {
@@ -1292,7 +1832,17 @@ impl Component for App {
                 true
             }
             Msg::SaveLevelConfiguration => self.save_level_configuration(ctx),
-            Msg::LevelConfigurationLoaded(result) => {
+            Msg::LevelConfigurationLoaded {
+                target,
+                generation,
+                result,
+            } => {
+                if !self.level_configuration_open
+                    || target != self.target
+                    || generation != self.level_configuration_generation
+                {
+                    return false;
+                }
                 self.level_configuration_pending = false;
                 match result {
                     Ok(configuration) => self.accept_level_configuration(configuration),
@@ -1305,7 +1855,17 @@ impl Component for App {
                 }
                 true
             }
-            Msg::LevelConfigurationUpdated(result) => {
+            Msg::LevelConfigurationUpdated {
+                target,
+                generation,
+                result,
+            } => {
+                if !self.level_configuration_open
+                    || target != self.target
+                    || generation != self.level_configuration_generation
+                {
+                    return false;
+                }
                 self.level_configuration_pending = false;
                 match result {
                     Ok(configuration) => {
@@ -1322,6 +1882,8 @@ impl Component for App {
                 true
             }
             Msg::OpenProjectConfiguration(project) => {
+                self.explorer_action = None;
+                self.advance_level_intent();
                 self.configuration_project = Some(project.clone());
                 self.project_configuration = None;
                 self.configuration_pending = true;
@@ -1560,15 +2122,6 @@ impl Component for App {
                 }
                 true
             }
-            Msg::ShowCatalog => {
-                self.invalidate_rpc();
-                self.disconnect_canvas_resize_observer();
-                self.phase = Phase::Catalog;
-                self.open_menu = None;
-                self.palette_open = false;
-                self.load_catalog(ctx);
-                true
-            }
             Msg::Logout => {
                 if self.request_pending {
                     return false;
@@ -1624,14 +2177,28 @@ impl Component for App {
                 }
                 changed
             }
+            Msg::OpenSandStudio => self.open_sand_studio(),
+            Msg::SetBlindColor(color_index) => {
+                if self.mode != Mode::Brush
+                    || !(1..=10).contains(&color_index)
+                    || self.blind_color_index == color_index
+                {
+                    false
+                } else {
+                    self.blind_color_index = color_index;
+                    true
+                }
+            }
             Msg::OpenStudio(studio) => {
                 self.studio_modal = Some(studio);
                 if studio == StudioModal::Image {
                     self.load_image_catalog(ctx);
+                    self.load_prepared_catalog(ctx);
                 }
                 true
             }
             Msg::CloseStudio => {
+                self.cancel_conversion();
                 self.studio_modal = None;
                 true
             }
@@ -1689,7 +2256,17 @@ impl Component for App {
                 }
                 self.shape_catalog_pending = false;
                 match result {
-                    Ok(shapes) => self.shape_catalog = shapes,
+                    Ok(shapes) => {
+                        self.shape_catalog = shapes;
+                        let active_is_available =
+                            self.active_shape_template_id.as_ref().is_some_and(|id| {
+                                self.shape_catalog.iter().any(|entry| &entry.id == id)
+                            });
+                        if !active_is_available {
+                            self.active_shape_template_id =
+                                self.shape_catalog.first().map(|entry| entry.id.clone());
+                        }
+                    }
                     Err(error) => return self.handle_authenticated_api_error(error),
                 }
                 true
@@ -1713,6 +2290,14 @@ impl Component for App {
                 true
             }
             Msg::SelectShape(shape_id) => self.select_shape_draft(&shape_id),
+            Msg::SelectShapeTemplate(shape_id) => {
+                if !self.shape_catalog.iter().any(|entry| entry.id == shape_id) {
+                    return false;
+                }
+                self.active_shape_template_id = Some(shape_id);
+                self.canvas_dirty = true;
+                true
+            }
             Msg::SaveShapeDraft => self.save_shape_draft(ctx, false),
             Msg::UpdateShapeDraft => self.save_shape_draft(ctx, true),
             Msg::ShapeSaved { project_id, result } => {
@@ -1731,7 +2316,8 @@ impl Component for App {
                         } else {
                             self.shape_catalog.push(saved.clone());
                         }
-                        self.selected_shape_id = Some(saved.id);
+                        self.selected_shape_id = Some(saved.id.clone());
+                        self.active_shape_template_id = Some(saved.id);
                         self.push_toast("Project shape saved".to_owned(), "success");
                     }
                     Err(error) => return self.handle_authenticated_api_error(error),
@@ -1752,6 +2338,10 @@ impl Component for App {
                     Ok(()) => {
                         self.shape_catalog.retain(|entry| entry.id != shape_id);
                         self.selected_shape_id = None;
+                        if self.active_shape_template_id.as_ref() == Some(&shape_id) {
+                            self.active_shape_template_id =
+                                self.shape_catalog.first().map(|entry| entry.id.clone());
+                        }
                         self.shape_draft_name.clear();
                         self.shape_draft_mask = 1;
                         self.push_toast("Project shape deleted".to_owned(), "success");
@@ -1760,8 +2350,8 @@ impl Component for App {
                 }
                 true
             }
-            Msg::ImageCatalogLoaded { project_id, result } => {
-                if self.target.project_id.as_str() != project_id {
+            Msg::ImageCatalogLoaded { scope, project_id, result } => {
+                if self.target.project_id.as_str() != project_id || scope != self.image_scope().0 {
                     return false;
                 }
                 self.image_catalog_pending = false;
@@ -1779,17 +2369,29 @@ impl Component for App {
                 self.image_import_error = None;
                 true
             }
-            Msg::ImageFileSelected(file) => self.select_image_file(file),
-            Msg::ImagePasted(event) => self.select_pasted_image(event),
+            Msg::ImageFileSelected(file) => {
+                let changed = self.select_image_file(file);
+                if self.image_file.is_some() { self.import_image(ctx); }
+                changed
+            }
+            Msg::ImagePasted(event) => {
+                let changed = self.select_pasted_image(event);
+                if changed && self.image_file.is_some() { self.import_image(ctx); }
+                changed
+            }
             Msg::ImportImage => self.import_image(ctx),
-            Msg::ImageImported { project_id, result } => {
-                if self.target.project_id.as_str() != project_id {
+            Msg::ImageImported { scope, generation, project_id, result } => {
+                if self.target.project_id.as_str() != project_id || scope != self.image_scope().0 {
                     return false;
                 }
                 self.image_catalog_pending = false;
                 match result {
                     Ok(image) => {
+                        let source_id = image.id.clone();
                         self.image_catalog.push(image);
+                        if generation == self.image_scope().1 && self.studio_modal == Some(StudioModal::Image) {
+                            self.image_studio_message(ctx, ImageMsg::Convert(source_id));
+                        }
                         self.image_file = None;
                         if let Some(input) = self.image_file_input_ref.cast::<HtmlInputElement>() {
                             input.set_value("");
@@ -1815,13 +2417,6 @@ impl Component for App {
             Msg::CanvasUp(event) => self.canvas_up(ctx, event),
             Msg::CanvasCancel(event) => self.canvas_cancel(event),
             Msg::CanvasLeave => self.queue_cursor(ctx, None),
-            Msg::ClearSelection => {
-                self.blind_gesture = None;
-                self.key_locker_assignment = None;
-                self.selection = None;
-                self.canvas_dirty = true;
-                true
-            }
             Msg::KeyDown(event) => self.key_down(ctx, event),
             Msg::ToggleTheme => {
                 self.theme.toggle();
@@ -1843,6 +2438,21 @@ impl Component for App {
                 self.push_toast("Using project-default theme".to_owned(), "info");
                 true
             }
+            Msg::SetUiFontSize(value) => {
+                let changed = self.ui_settings.set_font_size(&value);
+                self.canvas_dirty |= changed;
+                changed
+            }
+            Msg::SetUiScale(value) => {
+                let changed = self.ui_settings.set_scale(&value);
+                self.canvas_dirty |= changed;
+                changed
+            }
+            Msg::ResetUiSettings => {
+                let changed = self.ui_settings.reset();
+                self.canvas_dirty |= changed;
+                changed
+            }
             Msg::Undo => self.undo(ctx),
             Msg::ToggleMenu(menu) => {
                 self.open_menu = (self.open_menu != Some(menu)).then_some(menu);
@@ -1850,8 +2460,14 @@ impl Component for App {
                 true
             }
             Msg::SetLeftTab(tab) => {
-                self.left_tab = tab;
-                true
+                if (tab == LeftTab::SandStudio && self.mode != Mode::Brush)
+                    || (tab == LeftTab::ApplyImage && self.image_studio.apply.is_none()) || self.left_tab == tab
+                {
+                    false
+                } else {
+                    self.left_tab = tab;
+                    true
+                }
             }
             Msg::SetRightTab(tab) => {
                 let changed = self.right_tab != tab;
@@ -2024,6 +2640,7 @@ impl Component for App {
             }
         }
         if self.phase == Phase::Editor {
+            self.draw_division_canvas();
             self.ensure_canvas_resize_observer(ctx);
             if let Some(canvas) = self.canvas_ref.cast::<HtmlCanvasElement>() {
                 self.canvas_resized(
@@ -2047,17 +2664,15 @@ impl Component for App {
                         match self.phase {
                             Phase::Bootstrapping => self.view_bootstrapping(),
                             Phase::Authentication => self.view_authentication(ctx),
-                            Phase::Catalog => self.view_catalog(ctx),
                             Phase::Editor => Html::default(),
                         }
                     }
                 </div>
             };
         }
-        let shell_style = format!(
-            "--left-sidebar-width: {:.0}px; --right-sidebar-width: {:.0}px;",
-            self.left_sidebar_width, self.right_sidebar_width
-        );
+        let shell_style = self
+            .ui_settings
+            .shell_style(self.left_sidebar_width, self.right_sidebar_width);
         html! {
             <div
                 class={classes!(
@@ -2077,13 +2692,6 @@ impl Component for App {
                 onpointercancel={ctx.link().callback(Msg::EndSidebarResize)}
             >
                 { self.view_header(ctx) }
-                {
-                    if self.open_menu.is_some() {
-                        html! { <div class="menu-dismiss-layer" aria-hidden="true" onclick={ctx.link().callback(|_| Msg::CloseOverlays)}></div> }
-                    } else {
-                        Html::default()
-                    }
-                }
                 { if self.left_panel_layout == PanelLayout::Hidden { Html::default() } else { self.view_left_sidebar(ctx) } }
                 { if self.left_panel_layout == PanelLayout::Docked { html! { <div class="sidebar-resizer left-resizer" title="Resize left sidebar" onpointerdown={ctx.link().callback(|event| Msg::BeginSidebarResize(SidebarSide::Left, event))}></div> } } else { Html::default() } }
                 { self.view_canvas(ctx) }
@@ -2094,6 +2702,8 @@ impl Component for App {
                 { self.view_toasts(ctx) }
                 { self.view_notifications(ctx) }
                 { self.view_studio_modal(ctx) }
+                { self.view_pool_division(ctx) }
+                { self.view_project_configuration(ctx) }
             </div>
         }
     }
@@ -2150,112 +2760,6 @@ impl App {
         }
     }
 
-    fn view_catalog(&self, ctx: &Context<Self>) -> Html {
-        let query = self.catalog_query.trim().to_ascii_lowercase();
-        let email = self
-            .user
-            .as_ref()
-            .map(|user| user.email.as_str())
-            .unwrap_or_default();
-        let can_create_project = self.workspaces.iter().any(|workspace| {
-            workspace.id == self.selected_workspace_id
-                && matches!(workspace.role.as_str(), "owner" | "admin")
-        });
-        html! {
-            <>
-                <main class="catalog-stage hierarchy-catalog">
-                    <header class="catalog-header">
-                        <div class="access-brand"><span class="mark-glyph">{"OR"}</span><strong>{"OREAK"}</strong><small>{"PROJECT HIERARCHY"}</small></div>
-                        <label class="catalog-search"><span>{"SEARCH"}</span><input type="search" placeholder="Workspace, project, level, or ID" value={self.catalog_query.clone()} oninput={ctx.link().callback(|event: InputEvent| Msg::CatalogQuery(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
-                        <div class="catalog-account"><span>{email}</span><button disabled={self.request_pending} onclick={ctx.link().callback(|_| Msg::Logout)}>{"Logout"}</button></div>
-                    </header>
-                    <section class="catalog-tree">
-                        <div class="catalog-label"><span>{"WORKSPACE / PROJECT / LEVEL"}</span><code>{format!("{:02}", self.projects.len())}</code></div>
-                        { if !self.catalog_invitations.is_empty() { html! {
-                            <section class="catalog-invitations">
-                                <div class="tree-section-label"><span>{"PENDING INVITATIONS"}</span><code>{self.catalog_invitations.len()}</code></div>
-                                { for self.catalog_invitations.iter().map(|invitation| {
-                                    let invitation_message = invitation.clone();
-                                    html! { <article><div><strong>{invitation.project_name.clone()}</strong><small>{format!("{} / {}", invitation.roles.join(" + "), invitation.project_id)}</small></div><button disabled={self.request_pending} onclick={ctx.link().callback(move |_| Msg::AcceptProjectInvitation(invitation_message.clone()))}>{"Accept"}</button></article> }
-                                }) }
-                            </section>
-                        } } else { Html::default() } }
-                        <div class="hierarchy-tree">
-                            { for self.workspaces.iter().filter_map(|workspace| {
-                                let workspace_matches = catalog_text_matches(&query, [&workspace.name, &workspace.id]);
-                                let projects = self.projects.iter().filter(|project| project.workspace_id == workspace.id).filter(|project| {
-                                    workspace_matches || catalog_project_matches(project, self.catalog_levels.get(&project.id).map(Vec::as_slice).unwrap_or_default(), &query)
-                                }).collect::<Vec<_>>();
-                                if !query.is_empty() && !workspace_matches && projects.is_empty() { return None; }
-                                let workspace_id = workspace.id.clone();
-                                let expanded = !query.is_empty() || self.expanded_workspaces.contains(&workspace.id);
-                                Some(html! {
-                                    <section class="workspace-branch" key={workspace.id.clone()}>
-                                        <button class="workspace-node" onclick={ctx.link().callback(move |_| Msg::ToggleCatalogWorkspace(workspace_id.clone()))}><span class="tree-toggle">{if expanded { "-" } else { "+" }}</span><span><strong>{workspace.name.clone()}</strong><small>{format!("{} / {} / {} visible", workspace.kind, workspace.role, projects.len())}</small></span><code title={workspace.id.clone()}>{workspace.id.clone()}</code></button>
-                                        { if expanded { html! { <div class="project-branches">{ for projects.into_iter().map(|project| self.view_catalog_project_node(ctx, project, &query)) }</div> } } else { Html::default() } }
-                                    </section>
-                                })
-                            }) }
-                        </div>
-                    </section>
-                    <aside class="catalog-detail">
-                        { if let Some(project) = &self.catalog_project { html! {
-                            <>
-                                <div class="catalog-label"><span>{"PROJECT TARGET"}</span><code>{format!("{:02}", self.levels.len())}</code></div>
-                                <div class="level-project"><small>{"PROJECT"}</small><strong>{project.name.clone()}</strong><code title={project.id.clone()}>{project.id.clone()}</code></div>
-                                <div class="project-detail-actions"><button onclick={{ let project = project.clone(); ctx.link().callback(move |_| Msg::OpenProjectConfiguration(project.clone())) }}>{"Configuration"}</button><span class={if project.can_edit_timeline() { "capability edit" } else { "capability view" }}>{if project.can_edit_timeline() { "EDIT TIMELINE" } else { "VIEW ONLY" }}</span></div>
-                                <div class="level-create">
-                                    <label class="technical-field"><span>{"NEW LEVEL"}</span><input value={self.level_name.clone()} placeholder="Level name" disabled={!project.can_edit_timeline()} oninput={ctx.link().callback(|event: InputEvent| Msg::LevelName(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
-                                    <label class="technical-field duration-field"><span>{"DURATION / SEC"}</span><input type="number" min="0" step="0.1" value={self.level_duration.clone()} disabled={!project.can_edit_timeline()} oninput={ctx.link().callback(|event: InputEvent| Msg::LevelDuration(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
-                                    <button class="primary-action compact" disabled={self.request_pending || !project.can_edit_timeline() || self.level_name.trim().is_empty()} onclick={ctx.link().callback(|_| Msg::CreateLevel)}><span>{"Create and open"}</span><code>{"+L"}</code></button>
-                                </div>
-                            </>
-                        } } else { html! { <div class="catalog-empty"><span>{"NO PROJECT TARGET"}</span><p>{"Choose a project in the hierarchy to inspect it."}</p></div> } } }
-                        <div class="catalog-create">
-                            <label class="technical-field"><span>{"NEW PROJECT / SELECTED WORKSPACE"}</span><input value={self.project_name.clone()} placeholder="Project name" oninput={ctx.link().callback(|event: InputEvent| Msg::ProjectName(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
-                            <button class="primary-action compact" disabled={self.request_pending || !can_create_project || self.project_name.trim().is_empty()} onclick={ctx.link().callback(|_| Msg::CreateProject)}><span>{"Create project"}</span><code>{"+P"}</code></button>
-                        </div>
-                        { self.form_error.as_ref().map(|error| html! { <div class="access-error catalog-error"><strong>{"API ERROR"}</strong><span>{error}</span></div> }).unwrap_or_default() }
-                    </aside>
-                </main>
-                { self.view_project_configuration(ctx) }
-            </>
-        }
-    }
-
-    fn view_catalog_project_node(
-        &self,
-        ctx: &Context<Self>,
-        project: &ProjectSummary,
-        query: &str,
-    ) -> Html {
-        let selected = self
-            .catalog_project
-            .as_ref()
-            .is_some_and(|current| current.id == project.id);
-        let levels = self
-            .catalog_levels
-            .get(&project.id)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        let visible_levels = levels
-            .iter()
-            .filter(|level| query.is_empty() || catalog_level_matches(level, query))
-            .collect::<Vec<_>>();
-        let select_project = project.clone();
-        let configure_project = project.clone();
-        html! {
-            <article class={classes!("project-branch", selected.then_some("active"))} key={project.id.clone()}>
-                <div class="project-node"><button class="project-select" onclick={ctx.link().callback(move |_| Msg::SelectProject(select_project.clone()))}><span class="tree-icon">{"P"}</span><span><strong>{project.name.clone()}</strong><small>{format!("{} levels / {}", levels.len(), if project.can_edit_timeline() { "edit" } else { "view" })}</small></span><code title={project.id.clone()}>{project.id.clone()}</code></button><button class="project-config-trigger" title="Project configuration" onclick={ctx.link().callback(move |_| Msg::OpenProjectConfiguration(configure_project.clone()))}>{"CFG"}</button></div>
-                <div class="level-branches">{ for visible_levels.into_iter().map(|level| {
-                    let project = project.clone();
-                    let level_message = level.clone();
-                    html! { <button class="level-node" onclick={ctx.link().callback(move |_| Msg::OpenCatalogLevel(project.clone(), level_message.clone()))}><span class="tree-icon">{"L"}</span><span><strong>{level.name.clone()}</strong><small>{format!("{} revisions", level.revision_count)}</small></span><code title={level.id.clone()}>{level.id.clone()}</code></button> }
-                }) }</div>
-            </article>
-        }
-    }
-
     fn view_project_configuration(&self, ctx: &Context<Self>) -> Html {
         let Some(project) = self.configuration_project.as_ref() else {
             return Html::default();
@@ -2282,6 +2786,15 @@ impl App {
     }
 
     fn view_level_configuration_panel(&self, ctx: &Context<Self>) -> Html {
+        if self.target.project_id.as_str().is_empty() {
+            return html! {
+                <div class="empty-selection panel-placeholder">
+                    <span>{"NO LEVEL SELECTED"}</span>
+                    <p>{"Open the workspace explorer to select or create a level."}</p>
+                    <button onclick={ctx.link().callback(|_| Msg::SetLeftTab(LeftTab::Explorer))}>{"Open explorer"}</button>
+                </div>
+            };
+        }
         if !self.level_configuration_open {
             return html! {
                 <div class="empty-selection panel-placeholder">
@@ -2343,7 +2856,7 @@ impl App {
                         } else {
                             html! { <>{ for self.shape_catalog.iter().map(|sample| {
                                 let id = sample.id.clone();
-                                html! { <button class={classes!((self.selected_shape_id.as_ref() == Some(&sample.id)).then_some("active"))} title={format!("{} x {}", sample.shape.width, sample.shape.height)} onclick={ctx.link().callback(move |_| Msg::SelectShape(id.clone()))}><strong>{sample.name.clone()}</strong><code>{format!("{}x{}", sample.shape.width, sample.shape.height)}</code></button> }
+                                html! { <button class={classes!((self.selected_shape_id.as_ref() == Some(&sample.id)).then_some("active"))} title={format!("{} x {}", sample.shape.width, sample.shape.height)} onclick={ctx.link().callback(move |_| Msg::SelectShape(id.clone()))}>{shape_template_thumbnail(sample)}<span><strong>{sample.name.clone()}</strong><code>{format!("{}x{} · {} cells", sample.shape.width, sample.shape.height, shape_occupied_count(sample))}</code></span></button> }
                             }) }</> }
                         } }
                     </div>
@@ -2380,6 +2893,7 @@ impl App {
     }
 
     fn view_image_studio(&self, ctx: &Context<Self>) -> Html {
+        if let Some(converter) = self.view_image_converter(ctx) { return converter; }
         let selected_file = self.image_file.as_ref();
         let selected_file_label = selected_file
             .map(|file| format!("{} · {} bytes", file.name(), file.size() as u64))
@@ -2391,7 +2905,7 @@ impl App {
         html! {
             <div class="image-studio-layout">
                 <section class="image-studio-import">
-                    <div class="studio-section-heading"><span>{"IMPORT IMAGE"}</span><code>{"SHARED TEMPLATE"}</code></div>
+                    <div class="studio-section-heading"><span>{"UPLOAD ORIGINAL"}</span><code>{"IMMUTABLE SOURCE"}</code></div>
                     <label class="image-file-picker">
                         <span>{"Choose image"}</span>
                         <input ref={self.image_file_input_ref.clone()} type="file" accept="image/png,image/jpeg,image/webp" disabled={self.image_catalog_pending || !self.can_edit_timeline} onchange={ctx.link().callback(|event: Event| {
@@ -2402,7 +2916,7 @@ impl App {
                     <p class="image-file-status">{selected_file_label}</p>
                     <label class="image-template-name"><span>{"Template name"}</span><input value={self.image_draft_name.clone()} placeholder="Portal texture" disabled={self.image_catalog_pending || !self.can_edit_timeline} oninput={ctx.link().callback(|event: InputEvent| Msg::ImageDraftName(event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
                     { self.image_import_error.as_ref().map(|error| html! { <p class="image-import-error">{error}</p> }).unwrap_or_default() }
-                    <button class="primary-action" disabled={import_disabled} onclick={ctx.link().callback(|_| Msg::ImportImage)}>{if self.image_catalog_pending { "Importing..." } else { "Import shared template" }}</button>
+                    <button class="primary-action" disabled={import_disabled} onclick={ctx.link().callback(|_| Msg::ImportImage)}>{if self.image_catalog_pending { "Importing..." } else { "Upload and convert" }}</button>
                     <p class="image-studio-note">{"Static PNG, JPEG, and WebP · 512 KiB maximum · up to 1024px per side. Paste a copied image here or choose a file; the server verifies its bytes, dimensions, and digest."}</p>
                 </section>
                 <section class="image-studio-library">
@@ -2414,15 +2928,17 @@ impl App {
                     } else {
                         html! { <div class="image-catalog">{ for self.image_catalog.iter().map(|image| {
                             let source = format!("/api/projects/{}/images/{}/content", self.target.project_id, image.id);
+                            let source_id = image.id.clone();
                             html! {
                                 <article key={image.id.clone()} class="image-catalog-card">
                                     <img src={source} alt={image.name.clone()} loading="lazy" decoding="async" />
-                                    <div><strong>{image.name.clone()}</strong><code>{format!("{} × {}", image.width, image.height)}</code><small>{format!("{} · {} bytes", image.media_type, image.byte_size)}</small></div>
+                                    <div><strong>{image.name.clone()}</strong><code>{format!("{} × {}", image.width, image.height)}</code><small>{format!("{} · {} bytes", image.media_type, image.byte_size)}</small><button disabled={!self.can_edit_timeline} onclick={ctx.link().callback(move |_| Msg::ImageStudio(ImageMsg::Convert(source_id.clone())))}>{"Convert palette"}</button></div>
                                 </article>
                             }
                         }) }</div> }
                     } }
-                    <p class="image-studio-note">{"Imported files are immutable shared assets. Pixelation and canvas placement remain disabled until a server-backed derived-image and level-asset command exist."}</p>
+                    <p class="image-studio-note">{"Choosing or pasting uploads the original and opens the converter. Canceling conversion keeps the original. Prepared images never replace their source."}</p>
+                    {self.view_prepared_images(ctx)}
                 </section>
             </div>
         }
@@ -2441,11 +2957,11 @@ impl App {
                     { self.view_menu_button(ctx, TopMenu::View, "View") }
                 </nav>
                 <div class="context-switcher" aria-label="Current editing context">
-                    <button class="context-part" title="Browse workspace catalog" onclick={ctx.link().callback(|_| Msg::ShowCatalog)}>
+                    <button class="context-part" title="Open workspace explorer" onclick={ctx.link().callback(|_| Msg::SetLeftTab(LeftTab::Explorer))}>
                         <small>{"WORKSPACE"}</small><span>{self.workspace_name.clone()}</span>
                     </button>
                     <span class="context-slash">{"/"}</span>
-                    <button class="context-part" title="Browse project catalog" onclick={ctx.link().callback(|_| Msg::ShowCatalog)}>
+                    <button class="context-part" title="Open project explorer" onclick={ctx.link().callback(|_| Msg::SetLeftTab(LeftTab::Explorer))}>
                         <small>{"PROJECT"}</small><span>{self.project_display_name.clone()}</span>
                     </button>
                     <span class="context-slash">{"/"}</span>
@@ -2454,7 +2970,7 @@ impl App {
                     </button>
                 </div>
                 <div class="header-tools">
-                    <button class="header-nav" onclick={ctx.link().callback(|_| Msg::ShowCatalog)}>{"Catalog"}</button>
+                    <button class="header-nav" onclick={ctx.link().callback(|_| Msg::SetLeftTab(LeftTab::Explorer))}>{"Explorer"}</button>
                     <button
                         class="icon-button command-trigger"
                         onclick={ctx.link().callback(|_| Msg::TogglePalette)}
@@ -2484,6 +3000,13 @@ impl App {
                     <button class="header-nav" onclick={ctx.link().callback(|_| Msg::Logout)}>{"Logout"}</button>
                 </div>
                 { self.view_open_menu(ctx) }
+                {
+                    if self.open_menu.is_some() {
+                        html! { <div class="menu-dismiss-layer" aria-hidden="true" onclick={ctx.link().callback(|_| Msg::CloseOverlays)}></div> }
+                    } else {
+                        Html::default()
+                    }
+                }
             </header>
         }
     }
@@ -2530,6 +3053,9 @@ impl App {
                     <>
                         <button onclick={ctx.link().callback(|_| Msg::ToggleTheme)}><span>{"Toggle theme"}</span><kbd>{self.theme.active().label()}</kbd></button>
                         <button onclick={ctx.link().callback(|_| Msg::UseProjectTheme)}><span>{"Use project default"}</span><kbd>{self.theme.project_default.label()}</kbd></button>
+                        <label class="menu-setting"><span>{"Font size"}</span><select value={self.ui_settings.font_size_offset.to_string()} onchange={ctx.link().callback(|event: Event| Msg::SetUiFontSize(event.target_unchecked_into::<HtmlSelectElement>().value()))}>{ for UiSettings::FONT_SIZE_OPTIONS.into_iter().map(|(value, label)| html! { <option value={value.to_string()}>{label}</option> }) }</select></label>
+                        <label class="menu-setting"><span>{"UI scale"}</span><select value={self.ui_settings.scale_percent.to_string()} onchange={ctx.link().callback(|event: Event| Msg::SetUiScale(event.target_unchecked_into::<HtmlSelectElement>().value()))}>{ for UiSettings::SCALE_OPTIONS.into_iter().map(|(value, label)| html! { <option value={value.to_string()}>{label}</option> }) }</select></label>
+                        <button onclick={ctx.link().callback(|_| Msg::ResetUiSettings)}><span>{"Reset UI sizing"}</span><kbd>{"100%"}</kbd></button>
                         <button onclick={ctx.link().callback(|_| Msg::TogglePanelLayout(SidebarSide::Left))}><span>{format!("{} left sidebar", self.left_panel_layout.toggle_label())}</span><kbd>{self.left_panel_layout.label()}</kbd></button>
                         <button onclick={ctx.link().callback(|_| Msg::SetPanelLayout(SidebarSide::Left, PanelLayout::Hidden))}><span>{"Hide left sidebar"}</span><kbd>{"LEFT"}</kbd></button>
                         <button onclick={ctx.link().callback(|_| Msg::TogglePanelLayout(SidebarSide::Right))}><span>{format!("{} inspector panel", self.right_panel_layout.toggle_label())}</span><kbd>{self.right_panel_layout.label()}</kbd></button>
@@ -2542,11 +3068,13 @@ impl App {
     }
 
     fn view_primary_toolbox(&self, ctx: &Context<Self>) -> Html {
-        let placing = self.mode == Mode::Select && self.workspace_tool == WorkspaceTool::Place;
+        let entity_mode = self.mode == Mode::Select;
         let mapping = self.mode == Mode::Map;
+        let distribution = self.mode == Mode::Distribution;
         html! {
             <nav class="canvas-toolbox primary-canvas-tools" aria-label="Primary editor tools">
-                <button class={classes!(placing.then_some("active"))} aria-pressed={placing.to_string()} onclick={ctx.link().callback(|_| Msg::SetMode(Mode::Select))}>{ui_icon(UiIcon::PlaceEntity, 15)}<span>{"Place Entity"}</span></button>
+                <button class={classes!(entity_mode.then_some("active"))} aria-pressed={entity_mode.to_string()} onclick={ctx.link().callback(|_| Msg::SetMode(Mode::Select))}>{ui_icon(UiIcon::PlaceEntity, 15)}<span>{"Entity Placement"}</span></button>
+                <button class={classes!(distribution.then_some("active"))} aria-pressed={distribution.to_string()} onclick={ctx.link().callback(|_| Msg::SetMode(Mode::Distribution))}>{ui_icon(UiIcon::Inspector, 15)}<span>{"Distribution"}</span></button>
                 <button class={classes!(mapping.then_some("active"))} aria-pressed={mapping.to_string()} onclick={ctx.link().callback(|_| Msg::SetMode(Mode::Map))}>{ui_icon(UiIcon::MapDesign, 15)}<span>{"Map Design"}</span></button>
                 <button title="Open Shape Studio" onclick={ctx.link().callback(|_| Msg::OpenStudio(StudioModal::Shape))}>{ui_icon(UiIcon::ShapeTemplates, 15)}<span>{"Shape Studio"}</span></button>
                 <button title="Open Image Studio" onclick={ctx.link().callback(|_| Msg::OpenStudio(StudioModal::Image))}>{ui_icon(UiIcon::ImageStudio, 15)}<span>{"Image Studio"}</span></button>
@@ -2555,13 +3083,12 @@ impl App {
     }
 
     fn view_left_sidebar(&self, ctx: &Context<Self>) -> Html {
-        let tabs = [
-            LeftTab::ShapeTemplates,
-            LeftTab::Blame,
-            LeftTab::Explorer,
-            LeftTab::Comments,
-            LeftTab::Collaboration,
-        ];
+        let mut tabs = vec![LeftTab::ShapeTemplates];
+        if self.image_studio.apply.is_some() { tabs.push(LeftTab::ApplyImage); }
+        if self.mode == Mode::Brush {
+            tabs.push(LeftTab::SandStudio);
+        }
+        tabs.extend([LeftTab::Explorer, LeftTab::Comments, LeftTab::Collaboration]);
         let toggle_layout_label = self.left_panel_layout.toggle_label();
         let toggle_layout_icon = if self.left_panel_layout == PanelLayout::Docked {
             UiIcon::Float
@@ -2588,7 +3115,8 @@ impl App {
                     {
                         match self.left_tab {
                             LeftTab::ShapeTemplates => self.view_shape_template_library(ctx),
-                            LeftTab::Blame => self.view_blame_panel(self.blame_for_selection()),
+                            LeftTab::SandStudio => self.view_sand_studio_panel(ctx),
+                            LeftTab::ApplyImage => self.view_apply_image_panel(ctx),
                             LeftTab::Explorer => self.view_project_explorer(ctx),
                             LeftTab::Comments => self.view_comments_panel(),
                             LeftTab::Collaboration => self.view_collaboration_session(),
@@ -2599,58 +3127,217 @@ impl App {
         }
     }
 
+    fn view_sand_studio_panel(&self, ctx: &Context<Self>) -> Html {
+        let pool = self.selected_entity().and_then(|entity| {
+            entity.as_blind().map(|blind| {
+                (
+                    entity.id().clone(),
+                    blind.pixels_per_cell(),
+                    entity.shape().occupied_count(),
+                )
+            })
+        });
+        let online = matches!(self.rpc_state, RpcState::Online);
+        let busy = pool
+            .as_ref()
+            .is_some_and(|(entity_id, _, _)| self.pending_entities.contains_key(entity_id));
+        let disabled = pool.is_none() || !self.can_edit_timeline || !online || busy;
+        let status = if !online {
+            "OFFLINE"
+        } else if busy {
+            "BUSY"
+        } else {
+            "BRUSH"
+        };
+        let painting = self.workspace_tool == WorkspaceTool::Paint;
+        let filling = self.workspace_tool == WorkspaceTool::Fill;
+        html! {
+            <div class="shape-template-content sand-studio-panel">
+                <div class="panel-heading">
+                    <div><small>{"POOL PIXEL EDITOR"}</small><strong>{"Sand Studio"}</strong></div>
+                    <span class="panel-code">{status}</span>
+                </div>
+                {
+                    if let Some((entity_id, resolution, cells)) = pool {
+                        html! {
+                            <div class="sand-studio-target">
+                                <small>{"ISOLATED POOL"}</small>
+                                <strong title={entity_id.to_string()}>{truncate_entity_id(&entity_id)}</strong>
+                                <span>{format!("{cells} cells · {resolution}×{resolution} pixels per cell")}</span>
+                            </div>
+                        }
+                    } else {
+                        html! { <div class="shape-template-empty"><strong>{"Select one Pool"}</strong><span>{"Sand Studio tools activate for a single selected Pool."}</span></div> }
+                    }
+                }
+                <section class="sand-studio-section">
+                    <div class="section-title"><span>{"BRUSH STYLE"}</span><code>{if painting { "PAINT" } else { "FILL" }}</code></div>
+                    <div class="brush-tool-row">
+                        <button class={classes!(painting.then_some("active"))} disabled={disabled} onclick={ctx.link().callback(|_| Msg::SetWorkspaceTool(WorkspaceTool::Paint))}><span>{"Paint"}</span><kbd>{"B"}</kbd></button>
+                        <button class={classes!(filling.then_some("active"))} disabled={disabled} onclick={ctx.link().callback(|_| Msg::SetWorkspaceTool(WorkspaceTool::Fill))}><span>{"Fill"}</span><kbd>{"F"}</kbd></button>
+                    </div>
+                    <p class="shape-template-note">{if painting { "Drag inside one Pool cell to paint. Hold Shift while dragging to erase." } else { "Click any sand region to replace its current color." }}</p>
+                </section>
+                <section class="sand-studio-section">
+                    <div class="section-title"><span>{"SAND COLOR"}</span><code>{format!("{:02}", self.blind_color_index)}</code></div>
+                    <div class="brush-color-grid">
+                        { for (1_u8..=10).map(|color_index| {
+                            let active = self.blind_color_index == color_index;
+                            html! {
+                                <button class={classes!(active.then_some("active"))} style={format!("--brush-color: {};", blind_color(color_index))} disabled={disabled} aria-label={format!("Sand color {color_index}")} aria-pressed={active.to_string()} onclick={ctx.link().callback(move |_| Msg::SetBlindColor(color_index))}>
+                                    <span></span><kbd>{if color_index == 10 { "0".to_owned() } else { color_index.to_string() }}</kbd>
+                                </button>
+                            }
+                        }) }
+                    </div>
+                </section>
+                <button class="blind-isolation active" onclick={ctx.link().callback(|_| Msg::SetMode(Mode::Select))}>{"Exit Sand Studio"}</button>
+            </div>
+        }
+    }
+
     fn view_project_explorer(&self, ctx: &Context<Self>) -> Html {
         let snapshot = self.model.timeline().snapshot();
+        let current_level_name = if self.level_display_name.is_empty() {
+            "No level selected".to_owned()
+        } else {
+            self.level_display_name.clone()
+        };
+        let creating_workspace =
+            matches!(self.explorer_action, Some(ExplorerAction::CreateWorkspace));
         html! {
             <div class="explorer-content">
-                <div class="panel-heading"><div><small>{"CURRENT LEVEL"}</small><strong>{self.level_display_name.clone()}</strong></div><span class="panel-code">{format!("{} ENT", snapshot.entities().len())}</span></div>
-                <section class="explorer-section explorer-projects">
-                    <div class="section-title"><span>{"PROJECTS"}</span><code>{self.projects.len()}</code></div>
-                    <div class="explorer-tree">
-                        { for self.projects.iter().map(|project| {
-                            let levels = self.catalog_levels.get(&project.id).cloned().unwrap_or_default();
-                            let current_project = self.target.project_id.as_str() == project.id;
+                <div class="panel-heading"><div><small>{"CURRENT LEVEL"}</small><strong>{current_level_name}</strong></div><span class="panel-code">{format!("{} ENT", snapshot.entities().len())}</span></div>
+                <section class="explorer-section explorer-projects-section">
+                    <div class="section-title explorer-section-title">
+                        <span>{"WORKSPACES"}</span>
+                        <button class="explorer-title-action" title="New workspace" aria-label="New workspace" onclick={ctx.link().callback(|_| Msg::BeginExplorerAction(ExplorerAction::CreateWorkspace))}><Plus size={12} /></button>
+                    </div>
+                    <div class="explorer-tree vscode-tree" role="tree" aria-label="Workspace hierarchy">
+                        { if creating_workspace { html! {
+                            <form class="explorer-inline-form depth-0" onsubmit={ctx.link().callback(|event: SubmitEvent| { event.prevent_default(); Msg::CreateWorkspace })}>
+                                <input autofocus=true aria-label="Workspace name" value={self.workspace_draft_name.clone()} placeholder="Workspace name" disabled={self.request_pending} oninput={ctx.link().callback(|event: InputEvent| Msg::WorkspaceName(event.target_unchecked_into::<HtmlInputElement>().value()))} />
+                                <button type="submit" disabled={self.request_pending || self.workspace_draft_name.trim().is_empty()}>{"Create"}</button>
+                                <button type="button" disabled={self.request_pending} onclick={ctx.link().callback(|_| Msg::CancelExplorerAction)}>{"Cancel"}</button>
+                            </form>
+                        } } else { Html::default() } }
+                        { for self.workspaces.iter().map(|workspace| {
+                            let workspace_id = workspace.id.clone();
+                            let workspace_id_for_toggle = workspace.id.clone();
+                            let workspace_id_for_add = workspace.id.clone();
+                            let selected_workspace = workspace.id == self.selected_workspace_id;
+                            let expanded = self.expanded_workspaces.contains(&workspace.id);
+                            let can_manage = matches!(workspace.role.as_str(), "owner" | "admin");
+                            let creating_project = matches!(&self.explorer_action, Some(ExplorerAction::CreateProject { workspace_id }) if workspace_id == &workspace.id);
+                            let projects = self.projects.iter().filter(|project| project.workspace_id == workspace.id).collect::<Vec<_>>();
                             html! {
-                                <div class="explorer-project">
-                                    <div class={classes!("explorer-entity", current_project.then_some("active"))}>
-                                        <span class="tree-icon">{"P"}</span><span><strong>{project.name.clone()}</strong><small>{format!("{} levels", levels.len())}</small></span>
+                                <div class={classes!("explorer-branch", "workspace-branch-row", selected_workspace.then_some("selected-context"))} key={workspace.id.clone()} role="treeitem" aria-level="1" aria-expanded={expanded.to_string()} aria-selected={selected_workspace.to_string()}>
+                                    <div class="explorer-row depth-0">
+                                        <button class="explorer-chevron" title={if expanded { "Collapse workspace" } else { "Expand workspace" }} aria-label={if expanded { "Collapse workspace" } else { "Expand workspace" }} aria-expanded={expanded.to_string()} onclick={ctx.link().callback(move |_| Msg::ToggleWorkspace(workspace_id_for_toggle.clone()))}>{ if expanded { html! { <ChevronDown size={12} /> } } else { html! { <ChevronRight size={12} /> } } }</button>
+                                        <button class="explorer-row-label" onclick={ctx.link().callback(move |_| Msg::SelectWorkspace(workspace_id.clone()))}><span class="tree-icon">{"W"}</span><span>{workspace.name.clone()}</span></button>
+                                        <div class="explorer-row-actions">{ if can_manage { html! {
+                                            <button title="New project" aria-label={format!("New project in {}", workspace.name)} onclick={ctx.link().callback(move |_| Msg::BeginExplorerAction(ExplorerAction::CreateProject { workspace_id: workspace_id_for_add.clone() }))}><Plus size={12} /></button>
+                                        } } else { Html::default() } }</div>
                                     </div>
-                                    <div class="explorer-levels">{ for levels.iter().map(|level| {
-                                        let project = project.clone();
-                                        let level_message = level.clone();
-                                        let current_level = self.target.level_id.as_str() == level.id;
-                                        html! { <button class={classes!("explorer-level", current_level.then_some("active"))} onclick={ctx.link().callback(move |_| Msg::OpenCatalogLevel(project.clone(), level_message.clone()))}><span>{"L"}</span><span>{level.name.clone()}</span></button> }
-                                    }) }</div>
+                                    { if expanded { html! {
+                                        <div class="explorer-branch-children" role="group">
+                                            { if creating_project { html! {
+                                                <form class="explorer-inline-form depth-1" onsubmit={ctx.link().callback(|event: SubmitEvent| { event.prevent_default(); Msg::CreateProject })}>
+                                                    <input autofocus=true aria-label="Project name" value={self.project_name.clone()} placeholder="Project name" disabled={self.request_pending} oninput={ctx.link().callback(|event: InputEvent| Msg::ProjectName(event.target_unchecked_into::<HtmlInputElement>().value()))} />
+                                                    <button type="submit" disabled={self.request_pending || self.project_name.trim().is_empty()}>{"Create"}</button>
+                                                    <button type="button" disabled={self.request_pending} onclick={ctx.link().callback(|_| Msg::CancelExplorerAction)}>{"Cancel"}</button>
+                                                </form>
+                                            } } else { Html::default() } }
+                                            { for projects.into_iter().map(|project| {
+                                                let project_id_for_toggle = project.id.clone();
+                                                let project_id_for_select = project.id.clone();
+                                                let project_id_for_add = project.id.clone();
+                                                let project_id_for_delete = project.id.clone();
+                                                let project_for_select = project.clone();
+                                                let project_for_configuration = project.clone();
+                                                let levels = self.catalog_levels.get(&project.id).cloned().unwrap_or_default();
+                                                let current_project = self.target.project_id.as_str() == project.id;
+                                                let selected_project = self.catalog_project.as_ref().is_some_and(|selected| selected.id == project.id);
+                                                let project_expanded = self.expanded_projects.contains(&project.id);
+                                                let creating_level = matches!(&self.explorer_action, Some(ExplorerAction::CreateLevel { project_id }) if project_id == &project.id);
+                                                let deleting_project = matches!(&self.explorer_action, Some(ExplorerAction::DeleteProject { project_id }) if project_id == &project.id);
+                                                let can_delete_project = can_manage;
+                                                html! {
+                                                    <div class={classes!("explorer-branch", "project-branch-row", current_project.then_some("active"), selected_project.then_some("selected-context"))} key={project.id.clone()} role="treeitem" aria-level="2" aria-expanded={project_expanded.to_string()} aria-selected={selected_project.to_string()}>
+                                                        <div class="explorer-row depth-1">
+                                                            <button class="explorer-chevron" title={if project_expanded { "Collapse project" } else { "Expand project" }} aria-label={if project_expanded { "Collapse project" } else { "Expand project" }} aria-expanded={project_expanded.to_string()} onclick={ctx.link().callback(move |_| Msg::ToggleProject(project_id_for_toggle.clone()))}>{ if project_expanded { html! { <ChevronDown size={12} /> } } else { html! { <ChevronRight size={12} /> } } }</button>
+                                                            <button class="explorer-row-label" onclick={ctx.link().callback(move |_| Msg::SelectProject(project_for_select.clone()))}><span class="tree-icon">{"P"}</span><span>{project.name.clone()}</span></button>
+                                                            <div class="explorer-row-actions">
+                                                                { if project.can_edit_timeline() { html! { <button title="New level" aria-label={format!("New level in {}", project.name)} onclick={ctx.link().callback(move |_| Msg::BeginExplorerAction(ExplorerAction::CreateLevel { project_id: project_id_for_add.clone() }))}><Plus size={12} /></button> } } else { Html::default() } }
+                                                                { if project.can_manage_members() { html! { <button title="Project settings" aria-label={format!("Project settings for {}", project.name)} onclick={ctx.link().callback(move |_| Msg::OpenProjectConfiguration(project_for_configuration.clone()))}><Settings size={11} /></button> } } else { Html::default() } }
+                                                                { if can_delete_project { html! { <button class="danger" title="Delete project" aria-label={format!("Delete project {}", project.name)} onclick={ctx.link().callback(move |_| Msg::BeginExplorerAction(ExplorerAction::DeleteProject { project_id: project_id_for_delete.clone() }))}><Trash size={11} /></button> } } else { Html::default() } }
+                                                            </div>
+                                                        </div>
+                                                        { if deleting_project { html! {
+                                                            <div class="explorer-inline-confirm depth-2"><span>{format!("Delete {} and all levels?", project.name)}</span><button class="danger" disabled={self.request_pending} onclick={{ let project_id = project.id.clone(); ctx.link().callback(move |_| Msg::DeleteProject(project_id.clone())) }}>{"Delete"}</button><button disabled={self.request_pending} onclick={ctx.link().callback(|_| Msg::CancelExplorerAction)}>{"Cancel"}</button></div>
+                                                        } } else { Html::default() } }
+                                                        { if project_expanded { html! {
+                                                            <div class="explorer-branch-children" role="group">
+                                                                { if creating_level { html! {
+                                                                    <form class="explorer-inline-form depth-2 level-form" onsubmit={ctx.link().callback(|event: SubmitEvent| { event.prevent_default(); Msg::CreateLevel })}>
+                                                                        <input autofocus=true aria-label="Level name" value={self.level_name.clone()} placeholder="Level name" disabled={self.request_pending} oninput={ctx.link().callback(|event: InputEvent| Msg::LevelName(event.target_unchecked_into::<HtmlInputElement>().value()))} />
+                                                                        <input class="duration" type="number" min="0" step="0.1" title="Duration in seconds" aria-label="Level duration in seconds" value={self.level_duration.clone()} disabled={self.request_pending} oninput={ctx.link().callback(|event: InputEvent| Msg::LevelDuration(event.target_unchecked_into::<HtmlInputElement>().value()))} />
+                                                                        <button type="submit" disabled={self.request_pending || self.level_name.trim().is_empty()}>{"Create"}</button>
+                                                                        <button type="button" disabled={self.request_pending} onclick={ctx.link().callback(|_| Msg::CancelExplorerAction)}>{"Cancel"}</button>
+                                                                    </form>
+                                                                } } else { Html::default() } }
+                                                                { for levels.into_iter().map(|level| {
+                                                                    let project_for_open = project.clone();
+                                                                    let level_for_open = level.clone();
+                                                                    let project_id_for_level_delete = project_id_for_select.clone();
+                                                                    let level_id_for_delete = level.id.clone();
+                                                                    let current_level = current_project && self.target.level_id.as_str() == level.id;
+                                                                    let deleting_level = matches!(&self.explorer_action, Some(ExplorerAction::DeleteLevel { project_id, level_id }) if project_id == &project.id && level_id == &level.id);
+                                                                    html! {
+                                                                        <div class="explorer-level-wrap" key={level.id.clone()} role="treeitem" aria-level="3" aria-selected={current_level.to_string()}>
+                                                                            <div class={classes!("explorer-row", "depth-2", current_level.then_some("active"))}>
+                                                                                <span class="explorer-spacer"></span>
+                                                                                <button class="explorer-row-label" onclick={ctx.link().callback(move |_| Msg::OpenLevel(project_for_open.clone(), level_for_open.clone()))}><span class="tree-icon">{"L"}</span><span>{level.name.clone()}</span></button>
+                                                                                <div class="explorer-row-actions">{ if project.can_edit_timeline() { html! { <button class="danger" title="Delete level" aria-label={format!("Delete level {}", level.name)} onclick={ctx.link().callback(move |_| Msg::BeginExplorerAction(ExplorerAction::DeleteLevel { project_id: project_id_for_level_delete.clone(), level_id: level_id_for_delete.clone() }))}><Trash size={11} /></button> } } else { Html::default() } }</div>
+                                                                            </div>
+                                                                            { if deleting_level { html! {
+                                                                                <div class="explorer-inline-confirm depth-3"><span>{format!("Delete {}?", level.name)}</span><button class="danger" disabled={self.request_pending} onclick={{ let project_id = project.id.clone(); let level_id = level.id.clone(); ctx.link().callback(move |_| Msg::DeleteLevel { project_id: project_id.clone(), level_id: level_id.clone() }) }}>{"Delete"}</button><button disabled={self.request_pending} onclick={ctx.link().callback(|_| Msg::CancelExplorerAction)}>{"Cancel"}</button></div>
+                                                                            } } else { Html::default() } }
+                                                                        </div>
+                                                                    }
+                                                                }) }
+                                                            </div>
+                                                        } } else { Html::default() } }
+                                                    </div>
+                                                }
+                                            }) }
+                                        </div>
+                                    } } else { Html::default() } }
                                 </div>
                             }
                         }) }
-                        { if self.projects.is_empty() { html! { <div class="empty-selection"><span>{"NO PROJECTS"}</span><p>{"Open the catalog to load a workspace project tree."}</p></div> } } else { Html::default() } }
+                        { if self.workspaces.is_empty() && !creating_workspace { html! { <div class="empty-selection"><span>{"NO WORKSPACES"}</span><p>{"Use + to create your first workspace."}</p></div> } } else { Html::default() } }
+                        { self.form_error.as_ref().map(|error| html! { <div class="explorer-catalog-error"><strong>{"REQUEST FAILED"}</strong><p>{error}</p><button disabled={self.request_pending} onclick={ctx.link().callback(|_| Msg::ReloadCatalog)}>{"Retry catalog"}</button></div> }).unwrap_or_default() }
                     </div>
                 </section>
+                { if !self.catalog_invitations.is_empty() { html! {
+                    <section class="explorer-section explorer-invitations"><div class="section-title"><span>{"INVITATIONS"}</span><code>{self.catalog_invitations.len()}</code></div>{ for self.catalog_invitations.iter().map(|invitation| { let invitation_message = invitation.clone(); html! { <div class="explorer-invitation"><span>{invitation.project_name.clone()}</span><button disabled={self.request_pending} onclick={ctx.link().callback(move |_| Msg::AcceptProjectInvitation(invitation_message.clone()))}>{"Accept"}</button></div> } }) }</section>
+                } } else { Html::default() } }
                 <section class="explorer-section">
                     <div class="section-title"><span>{"ENTITIES"}</span><code>{snapshot.entities().len()}</code></div>
                     <div class="explorer-tree">
                         { for snapshot.entities().iter().map(|entity| {
                             let entity_id = entity.id().clone();
                             let selected = matches!(&self.selection, Some(Selection::Entities(ids)) if ids.contains(entity.id()));
-                            let kind = match entity.kind() {
-                                PlaceableEntityKind::Block(_) => "Sand Block",
-                                PlaceableEntityKind::Blind(_) => "Sand Pool",
-                            };
-                            html! {
-                                <button class={classes!("explorer-entity", selected.then_some("active"))} onclick={ctx.link().callback(move |_| Msg::FocusExplorerEntity(entity_id.clone()))}>
-                                    <span class="tree-icon">{if matches!(entity.kind(), PlaceableEntityKind::Block(_)) { "B" } else { "P" }}</span>
-                                    <span><strong>{kind}</strong><small>{format!("{} / {:02}:{:02}", entity.id(), entity.origin().x, entity.origin().y)}</small></span>
-                                </button>
-                            }
+                            let kind = match entity.kind() { PlaceableEntityKind::Block(_) => "Sand Block", PlaceableEntityKind::Blind(_) => "Sand Pool" };
+                            html! { <button class={classes!("explorer-entity", selected.then_some("active"))} onclick={ctx.link().callback(move |_| Msg::FocusExplorerEntity(entity_id.clone()))}><span class="tree-icon">{if matches!(entity.kind(), PlaceableEntityKind::Block(_)) { "B" } else { "P" }}</span><span><strong>{kind}</strong><small>{format!("{} / {:02}:{:02}", entity.id(), entity.origin().x, entity.origin().y)}</small></span></button> }
                         }) }
-                        { if snapshot.entities().is_empty() { html! { <div class="empty-selection"><span>{"NO ENTITIES"}</span><p>{"Place a Sand Block or Sand Pool to populate this level."}</p></div> } } else { Html::default() } }
+                        { if snapshot.entities().is_empty() { html! { <div class="empty-selection"><span>{"NO ENTITIES"}</span><p>{"Open or create a level to begin editing."}</p></div> } } else { Html::default() } }
                     </div>
                 </section>
             </div>
         }
     }
-
     fn view_comments_panel(&self) -> Html {
         html! {
             <div class="empty-selection panel-placeholder">
@@ -2907,15 +3594,17 @@ impl App {
                                         let color = first_layer.map(|layer| layer.color_index()).filter(|color| layers.iter().all(|layer| layer.is_some_and(|item| item.color_index() == *color)));
                                         let radius = first_layer.map(|layer| layer.radius()).filter(|radius| layers.iter().all(|layer| layer.is_some_and(|item| item.radius() == *radius)));
                                         let locked = first_layer.map(|layer| layer.is_locked()).filter(|locked| layers.iter().all(|layer| layer.is_some_and(|item| item.is_locked() == *locked)));
+                                        let any_locked = layers.iter().any(|layer| layer.is_some_and(CollectLayer::is_locked));
+                                        let capacity_editable = all_have_layer && !any_locked;
                                         let capacity_value = capacity.map_or_else(|| "<different>".to_owned(), collect_capacity_label);
                                         let color_value = color.map_or_else(|| "<different>".to_owned(), |color| format!("Color {color}"));
                                         let radius_value = radius.map_or_else(|| "<different>".to_owned(), |radius| radius.map_or_else(|| "Default radius".to_owned(), |radius| format!("Radius {radius}")));
                                         let locked_value = locked.map_or_else(|| "<different>".to_owned(), |locked| if locked { "Locked".to_owned() } else { "Unlocked".to_owned() });
                                         html! {
                                             <div class="capacity-layer" key={layer_index}>
-                                                <div class="capacity-layer-heading"><strong>{format!("Layer {}", layer_index + 1)}</strong>{if single_selection { html! { <button class="layer-remove" disabled={disabled} onclick={ctx.link().callback(move |_| Msg::RemoveBlockCollectLayer(layer_index))}>{"Remove"}</button> } } else { Html::default() }}</div>
+                                                <div class="capacity-layer-heading"><strong>{format!("Layer {}", layer_index + 1)}</strong>{if single_selection { html! { <button class="layer-remove" disabled={disabled || any_locked} title={if any_locked { "Locked capacity layers cannot be removed" } else { "Remove capacity layer" }} onclick={ctx.link().callback(move |_| Msg::RemoveBlockCollectLayer(layer_index))}>{"Remove"}</button> } } else { Html::default() }}</div>
                                                 <div class="capacity-layer-meta"><span>{color_value}</span><span>{radius_value}</span><span>{locked_value}</span></div>
-                                                <label><span>{"Capacity"}</span><input type="text" value={capacity_value} disabled={disabled || !all_have_layer} title={if all_have_layer { "Enter a number or unlimited" } else { "Every selected Block must have this layer" }} onchange={ctx.link().callback(move |event: Event| Msg::SetBlockLayerCapacity(layer_index, event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
+                                                <label><span>{"Capacity"}</span><input type="text" value={capacity_value} disabled={disabled || !capacity_editable} title={if !all_have_layer { "Every selected Block must have this layer" } else if any_locked { "Locked capacity layers cannot be edited" } else { "Enter a number or unlimited" }} onchange={ctx.link().callback(move |event: Event| Msg::SetBlockLayerCapacity(layer_index, event.target_unchecked_into::<HtmlInputElement>().value()))} /></label>
                                             </div>
                                         }
                                     }) }
@@ -3024,6 +3713,7 @@ impl App {
     fn view_shape_template_library(&self, ctx: &Context<Self>) -> Html {
         let grid_view = self.shape_template_view == ShapeTemplateView::Grid;
         let can_drag = self.mode == Mode::Select
+            && self.workspace_tool == WorkspaceTool::Place
             && self.can_edit_timeline
             && matches!(self.rpc_state, RpcState::Online);
         let placement_kind = self.selected_placement_kind;
@@ -3043,38 +3733,42 @@ impl App {
                         html! { <p class="shape-template-empty">{"No project shapes saved."}</p> }
                     } else if grid_view {
                         html! {
-                            <div class="shape-template-grid" role="list">
+                            <div class="shape-template-grid" aria-label="Shape template grid">
                                 { for self.shape_catalog.iter().map(|sample| {
                                     let shape = Shape::new(sample.shape.width, sample.shape.height, sample.shape.occupied_mask);
                                     let draggable = can_drag && shape.is_ok();
                                     let drag_shape = shape.unwrap_or_else(|_| Shape::new(1, 1, 1).expect("fallback shape is valid"));
+                                    let shape_id = sample.id.clone();
+                                    let selected = self.active_shape_template_id.as_ref() == Some(&sample.id);
                                     html! {
-                                        <article key={sample.id.clone()} class="shape-template-card grid" role="listitem" title={sample.name.clone()} aria-label={format!("{} — {} by {} shape", sample.name, sample.shape.width, sample.shape.height)} draggable={draggable.to_string()} ondragstart={template_drag_callback(ctx, placement_kind, drag_shape)} ondragend={ctx.link().callback(|_| Msg::EndPlacementDrag)}>
+                                        <button type="button" key={sample.id.clone()} class={classes!("shape-template-card", "grid", selected.then_some("active"))} title={sample.name.clone()} aria-label={format!("{} — {} by {} shape", sample.name, sample.shape.width, sample.shape.height)} aria-pressed={selected.to_string()} draggable={draggable.to_string()} onclick={ctx.link().callback(move |_| Msg::SelectShapeTemplate(shape_id.clone()))} ondragstart={template_drag_callback(ctx, placement_kind, drag_shape)} ondragend={ctx.link().callback(|_| Msg::EndPlacementDrag)}>
                                             { shape_template_thumbnail(sample) }
-                                        </article>
+                                        </button>
                                     }
                                 }) }
                             </div>
                         }
                     } else {
                         html! {
-                            <div class="shape-template-list" role="list">
+                            <div class="shape-template-list" aria-label="Shape template list">
                                 { for self.shape_catalog.iter().map(|sample| {
                                     let shape = Shape::new(sample.shape.width, sample.shape.height, sample.shape.occupied_mask);
                                     let draggable = can_drag && shape.is_ok();
                                     let drag_shape = shape.unwrap_or_else(|_| Shape::new(1, 1, 1).expect("fallback shape is valid"));
+                                    let shape_id = sample.id.clone();
+                                    let selected = self.active_shape_template_id.as_ref() == Some(&sample.id);
                                     html! {
-                                        <article key={sample.id.clone()} class="shape-template-card list" role="listitem" draggable={draggable.to_string()} ondragstart={template_drag_callback(ctx, placement_kind, drag_shape)} ondragend={ctx.link().callback(|_| Msg::EndPlacementDrag)}>
+                                        <button type="button" key={sample.id.clone()} class={classes!("shape-template-card", "list", selected.then_some("active"))} aria-pressed={selected.to_string()} draggable={draggable.to_string()} onclick={ctx.link().callback(move |_| Msg::SelectShapeTemplate(shape_id.clone()))} ondragstart={template_drag_callback(ctx, placement_kind, drag_shape)} ondragend={ctx.link().callback(|_| Msg::EndPlacementDrag)}>
                                             { shape_template_thumbnail(sample) }
                                             <div><strong>{sample.name.clone()}</strong><small>{format!("{} × {} · {} cells", sample.shape.width, sample.shape.height, shape_occupied_count(sample))}</small></div>
-                                        </article>
+                                        </button>
                                     }
                                 }) }
                             </div>
                         }
                     }
                 }
-                <p class="shape-template-note">{format!("Browse-only library. Drag a template onto the canvas as the current {} placement; create and edit shapes in Shape Studio.", placement_kind.label().to_ascii_lowercase())}</p>
+                <p class="shape-template-note">{format!("Select a shape to use it as the {} entity and map-cell brush footprint. Choose Place Block or Place Pool, then drag the template onto the canvas.", placement_kind.label().to_ascii_lowercase())}</p>
             </section>
         }
     }
@@ -3187,7 +3881,6 @@ impl App {
     }
 
     fn view_canvas(&self, ctx: &Context<Self>) -> Html {
-        let blame = self.blame_for_selection();
         let size = self.model.timeline().snapshot().size();
         let connection_label = match self.rpc_state {
             RpcState::Online => "SERVER LIVE",
@@ -3203,7 +3896,7 @@ impl App {
                     </div>
                     <div class="canvas-secondary-tool-dock">
                         { self.view_tool_selector(ctx) }
-                        <div class="canvas-viewport-controls" aria-label="Level zoom controls">
+                        { if self.image_studio.apply.is_none() { html! { <div class="canvas-viewport-controls" aria-label="Level zoom controls">
                             <div class="viewport-tools">
                                 <button class="tool-button" aria-label="Zoom out" title="Zoom out" onclick={ctx.link().callback(|_| Msg::ZoomOut)}>{ui_icon(UiIcon::ZoomOut, 14)}</button>
                                 <button class="tool-button" aria-label="Frame the full grid" title="Frame the full grid" onclick={ctx.link().callback(|_| Msg::FrameGrid)}>{ui_icon(UiIcon::Frame, 14)}</button>
@@ -3215,7 +3908,7 @@ impl App {
                                 <code>{format!("{} PENDING", self.pending_commands.len())}</code>
                                 <span>{format!("{:.0}%", self.viewport.scale * 100.0)}</span>
                             </div>
-                        </div>
+                        </div> } } else { Html::default() } }
                     </div>
                     <div class="axis-label axis-y">{"Y / ROW"}</div>
                     <canvas
@@ -3236,19 +3929,51 @@ impl App {
                     ></canvas>
                     <div class="axis-label axis-x">{"X / COLUMN"}</div>
                     {
-                        if self.mode.is_parity_gated() {
+                        if self.mode.is_parity_gated() && self.image_studio.apply.is_none() {
                             html! { <div class="parity-banner"><strong>{format!("{} PARITY GATED", self.mode.label().to_ascii_uppercase())}</strong><span>{"Visible for source-editor mode parity; commands are disabled in this MVP."}</span></div> }
                         } else {
                             Html::default()
                         }
                     }
-                    { self.view_blame_popover(ctx, blame) }
                 </div>
             </main>
         }
     }
 
     fn view_tool_selector(&self, ctx: &Context<Self>) -> Html {
+        if self.image_studio.apply.is_some() { return self.view_apply_image_dock(ctx); }
+        if self.mode == Mode::Distribution { return self.view_distribution_tools(ctx); }
+        if self.mode == Mode::Select {
+            let placing_block = self.workspace_tool == WorkspaceTool::Place
+                && self.selected_placement_kind == PlacementKind::Block;
+            let placing_pool = self.workspace_tool == WorkspaceTool::Place
+                && self.selected_placement_kind == PlacementKind::Blind;
+            let sand_studio_available = self.selected_entity_id().is_some_and(|entity_id| {
+                self.model
+                    .timeline()
+                    .snapshot()
+                    .entity(entity_id)
+                    .is_some_and(|entity| entity.as_blind().is_some())
+            });
+            return html! {
+                <nav class="canvas-toolbox contextual-canvas-tools" aria-label="Entity Placement context tools">
+                    <button class={classes!(placing_block.then_some("active"))} aria-pressed={placing_block.to_string()} onclick={ctx.link().callback(|_| Msg::SetPlacementContext(PlacementKind::Block))}><Square size={14} /><span>{"Place Block"}</span></button>
+                    <button class={classes!(placing_pool.then_some("active"))} aria-pressed={placing_pool.to_string()} onclick={ctx.link().callback(|_| Msg::SetPlacementContext(PlacementKind::Blind))}><Shapes size={14} /><span>{"Place Pool"}</span></button>
+                    { if sand_studio_available { html! { <button onclick={ctx.link().callback(|_| Msg::OpenSandStudio)}>{ui_icon(UiIcon::ImageStudio, 14)}<span>{"Sand Studio"}</span></button> } } else { Html::default() } }
+                </nav>
+            };
+        }
+        if self.mode == Mode::Brush {
+            let painting = self.workspace_tool == WorkspaceTool::Paint;
+            let filling = self.workspace_tool == WorkspaceTool::Fill;
+            return html! {
+                <nav class="canvas-toolbox contextual-canvas-tools sand-studio-toolbox" aria-label="Sand Studio tools">
+                    <button class={classes!(painting.then_some("active"))} aria-pressed={painting.to_string()} onclick={ctx.link().callback(|_| Msg::SetWorkspaceTool(WorkspaceTool::Paint))}><Square size={14} /><span>{"Paint"}</span></button>
+                    <button class={classes!(filling.then_some("active"))} aria-pressed={filling.to_string()} onclick={ctx.link().callback(|_| Msg::SetWorkspaceTool(WorkspaceTool::Fill))}>{ui_icon(UiIcon::MapDesign, 14)}<span>{"Fill"}</span></button>
+                    <button onclick={ctx.link().callback(|_| Msg::SetMode(Mode::Select))}><MousePointer2 size={14} /><span>{"Exit Sand Studio"}</span></button>
+                </nav>
+            };
+        }
         if self.mode == Mode::Map {
             let drawing_walls = self.workspace_tool == WorkspaceTool::Cells
                 && self.map_paint_kind == Some(CellKind::Wall);
@@ -3268,69 +3993,13 @@ impl App {
         Html::default()
     }
 
-    fn view_blame_popover(&self, ctx: &Context<Self>, blame: Option<BlameEntry>) -> Html {
-        let Some(selection) = self.selection.as_ref() else {
-            return Html::default();
-        };
-        let (target_label, target_code, empty_detail) = match selection {
-            Selection::Cell(point) => (
-                "CELL BLAME",
-                format!("{:02}:{:02}", point.x, point.y),
-                if matches!(self.rpc_state, RpcState::Online | RpcState::Resyncing) {
-                    "Base cell with no recorded change"
-                } else {
-                    "Base or restored local draft cell"
-                },
-            ),
-            Selection::Entities(entity_ids) => (
-                if entity_ids.len() == 1 {
-                    "ENTITY BLAME"
-                } else {
-                    "GROUP SELECTION"
-                },
-                if entity_ids.len() == 1 {
-                    entity_ids[0].to_string()
-                } else {
-                    format!("{} entities", entity_ids.len())
-                },
-                if entity_ids.len() == 1 {
-                    "Entity has no observed provenance in this session"
-                } else {
-                    "Select one entity to inspect its provenance"
-                },
-            ),
-        };
-        html! {
-            <div class="blame-popover" role="dialog" aria-label="Selection blame">
-                <div class="popover-head">
-                    <span>{target_label}</span>
-                    <code title={target_code.clone()}>{target_code}</code>
-                    <button aria-label="Close blame" onclick={ctx.link().callback(|_| Msg::ClearSelection)}>{"x"}</button>
-                </div>
-                {
-                    if let Some(entry) = blame {
-                        html! {
-                            <div class="popover-body">
-                                <span class="actor-mark">{actor_mark(entry.actor.as_str())}</span>
-                                <div><strong>{entry.actor.to_string()}</strong><small>{format_time(entry.occurred_at_ms)}</small></div>
-                                <div class="sequence"><small>{"SEQUENCE"}</small><strong>{format!("#{:04}", entry.sequence)}</strong></div>
-                            </div>
-                        }
-                    } else {
-                        html! {
-                            <div class="popover-empty"><strong>{"No observed provenance"}</strong><small>{empty_detail}</small></div>
-                        }
-                    }
-                }
-            </div>
-        }
-    }
-
     fn view_right_sidebar(&self, ctx: &Context<Self>) -> Html {
         let tabs = [
             RightTab::Inspector,
+            RightTab::Blame,
             RightTab::LevelStructure,
             RightTab::LevelConfiguration,
+            RightTab::AdvancedDistribution,
         ];
         let toggle_layout_label = self.right_panel_layout.toggle_label();
         let toggle_layout_icon = if self.right_panel_layout == PanelLayout::Docked {
@@ -3341,7 +4010,7 @@ impl App {
         html! {
             <aside class={classes!("right-sidebar", "panel", (self.right_panel_layout == PanelLayout::Floating).then_some("panel-floating"))}>
                 <div class="panel-tabs compact-tab-bar">
-                    { for tabs.into_iter().map(|tab| {
+                    { for tabs.into_iter().filter(|tab| *tab != RightTab::AdvancedDistribution || self.mode == Mode::Distribution).map(|tab| {
                         let active = self.right_tab == tab;
                         html! {
                             <button
@@ -3358,8 +4027,10 @@ impl App {
                     {
                         match self.right_tab {
                             RightTab::Inspector => self.view_selection_inspector(ctx),
+                            RightTab::Blame => self.view_blame_panel(self.blame_for_selection()),
                             RightTab::LevelStructure => self.view_level_structure(ctx),
                             RightTab::LevelConfiguration => self.view_level_configuration_panel(ctx),
+                            RightTab::AdvancedDistribution => self.view_distribution_panel(ctx),
                         }
                     }
                 </div>
@@ -3457,6 +4128,22 @@ impl App {
         } else {
             "Project default"
         };
+        let shortcut_hints: &[&str] = match (self.mode, self.workspace_tool) {
+            (Mode::Select, WorkspaceTool::Transform) => {
+                &["Click select", "Shift+Click multi", "Arrows move"]
+            }
+            (Mode::Select, WorkspaceTool::Place) => &["Drag template to place"],
+            (Mode::Select, WorkspaceTool::Decorate) => {
+                &["I ice", "G glass", "D direction", "K locker"]
+            }
+            (Mode::Map, WorkspaceTool::Cells) => &["Drag paint cells"],
+            (Mode::Map, WorkspaceTool::Resize) => &["Drag map edge"],
+            (Mode::Brush, WorkspaceTool::Paint) => &["B paint", "Shift+drag erase", "1–0 color"],
+            (Mode::Brush, WorkspaceTool::Fill) => &["F fill", "1–0 color"],
+            (Mode::Distribution, _) => &["Click Pools / Blocks", "Shift+click add", "Drag empty space to select"],
+            (Mode::Sandbox, _) => &["Sandbox parity gated"],
+            _ => &[],
+        };
         html! {
             <footer class="statusbar">
                 <span class="status-primary"><i class={classes!("status-dot", if matches!(self.rpc_state, RpcState::Online) { "online" } else { "local" })}></i>{rpc_label}</span>
@@ -3473,10 +4160,9 @@ impl App {
                     { if self.theme.user_override.is_some() { html! { <button onclick={ctx.link().callback(|_| Msg::UseProjectTheme)}>{"Reset"}</button> } } else { Html::default() } }
                 </span>
                 <span class="status-spacer"></span>
-                <span>{"Q/W/B/P modes"}</span>
-                <span>{"Z/X/C tools"}</span>
+                { for shortcut_hints.iter().map(|hint| html! { <span>{*hint}</span> }) }
                 <span>{"Ctrl+K commands"}</span>
-                <span>{"Ctrl+Z my undo"}</span>
+                <span>{"Ctrl+Z undo"}</span>
             </footer>
         }
     }
@@ -3579,25 +4265,74 @@ impl App {
         }
     }
 
-    fn enter_catalog(&mut self, ctx: &Context<Self>, user: UserSummary) {
+    fn enter_editor(&mut self, ctx: &Context<Self>, user: UserSummary) {
+        self.invalidate_image_studio();
         self.invalidate_rpc();
+        self.advance_level_intent();
+        self.reset_level_configuration();
         self.selected_workspace_id = user.personal_workspace_id.clone();
         self.inspector_collapsed = load_inspector_collapsed_sections(&user.id);
+        self.model = EditorModel::blank(&user.id, &self.session_id);
+        self.selection = None;
+        self.drag_kind = None;
+        self.map_paint_kind = None;
+        self.last_drag = None;
+        self.blind_gesture = None;
+        self.entity_drag = None;
+        self.pan_gesture = None;
+        self.placement_drag = None;
+        self.map_resize_gesture = None;
+        self.marquee_gesture = None;
+        self.isolated_blind = None;
+        self.key_locker_assignment = None;
+        self.shape_catalog.clear();
+        self.selected_shape_id = None;
+        self.active_shape_template_id = None;
+        self.shape_catalog_pending = false;
+        self.image_catalog.clear();
+        self.image_catalog_pending = false;
+        self.studio_modal = None;
+        self.palette_open = false;
+        self.open_menu = None;
         self.user = Some(user);
-        self.phase = Phase::Catalog;
+        self.phase = Phase::Editor;
         self.workspaces.clear();
         self.projects.clear();
+        self.catalog_levels.clear();
+        self.catalog_invitations.clear();
         self.catalog_project = None;
-        self.levels.clear();
+        self.explorer_action = None;
+        self.expanded_workspaces.clear();
+        self.expanded_projects.clear();
+        self.workspace_draft_name.clear();
+        self.project_name.clear();
+        self.level_name.clear();
+        self.level_duration = "0".to_owned();
+        self.workspace_name = "No workspace".to_owned();
+        self.project_display_name = "No project".to_owned();
+        self.level_display_name = "No level".to_owned();
+        self.target = ProjectLevelTarget::new(String::new(), String::new());
+        self.level_duration_seconds = 0.0;
+        self.can_edit_timeline = false;
+        self.canvas_size_initialized = false;
+        self.frame_grid();
+        self.left_tab = LeftTab::Explorer;
+        self.auto_open_initial_level = true;
         self.form_error = None;
+        self.canvas_dirty = true;
         self.load_catalog(ctx);
     }
 
     fn load_catalog(&mut self, ctx: &Context<Self>) {
+        self.catalog_request_generation = self.catalog_request_generation.wrapping_add(1);
+        let generation = self.catalog_request_generation;
         self.request_pending = true;
         let link = ctx.link().clone();
         wasm_bindgen_futures::spawn_local(async move {
-            link.send_message(Msg::CatalogLoaded(RestClient.catalog().await));
+            link.send_message(Msg::CatalogLoaded {
+                generation,
+                result: RestClient.catalog().await,
+            });
         });
     }
 
@@ -3630,14 +4365,18 @@ impl App {
     }
 
     fn open_level(&mut self, ctx: &Context<Self>, project: ProjectSummary, level: LevelSummary) {
-        let Some(user) = self.user.as_ref() else {
+        self.invalidate_image_studio();
+        let Some(user_id) = self.user.as_ref().map(|user| user.id.clone()) else {
             self.clear_session();
             return;
         };
-        let key = draft_storage_key(&user.id, &project.id, &level.id);
+        self.advance_level_intent();
+        self.reset_level_configuration();
+        let key = draft_storage_key(&user_id, &project.id, &level.id);
         self.model = load_draft(&key)
-            .map(|snapshot| EditorModel::from_snapshot(snapshot, &user.id, &self.session_id))
-            .unwrap_or_else(|| EditorModel::blank(&user.id, &self.session_id));
+            .map(|snapshot| EditorModel::from_snapshot(snapshot, &user_id, &self.session_id))
+            .unwrap_or_else(|| EditorModel::blank(&user_id, &self.session_id));
+        self.selected_workspace_id = project.workspace_id.clone();
         self.workspace_name = self
             .workspaces
             .iter()
@@ -3651,12 +4390,18 @@ impl App {
         self.can_edit_timeline = project.can_edit_timeline();
         self.theme.project_default =
             Theme::from_name(&project.default_theme).unwrap_or(Theme::Dark);
+        self.expanded_workspaces
+            .insert(project.workspace_id.clone());
+        self.expanded_projects.insert(project.id.clone());
         self.catalog_project = Some(project);
+        self.explorer_action = None;
+        self.auto_open_initial_level = false;
         self.phase = Phase::Editor;
         self.selection = None;
         self.isolated_blind = None;
         self.shape_catalog.clear();
         self.selected_shape_id = None;
+        self.active_shape_template_id = None;
         self.shape_draft_name.clear();
         self.shape_draft_mask = 1;
         self.shape_catalog_pending = true;
@@ -3685,6 +4430,59 @@ impl App {
             });
         });
         self.load_image_catalog(ctx);
+        self.load_prepared_catalog(ctx);
+    }
+
+    fn unbind_level(&mut self) {
+        self.invalidate_image_studio();
+        self.invalidate_rpc();
+        self.advance_level_intent();
+        self.reset_level_configuration();
+        if let Some(user) = self.user.as_ref() {
+            self.model = EditorModel::blank(&user.id, &self.session_id);
+        }
+        self.target = ProjectLevelTarget::new(String::new(), String::new());
+        self.workspace_name = self
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == self.selected_workspace_id)
+            .map(|workspace| workspace.name.clone())
+            .unwrap_or_else(|| "No workspace".to_owned());
+        self.project_display_name = "No project".to_owned();
+        self.level_display_name = "No level".to_owned();
+        self.level_duration_seconds = 0.0;
+        self.can_edit_timeline = false;
+        self.catalog_project = None;
+        self.selection = None;
+        self.isolated_blind = None;
+        self.shape_catalog.clear();
+        self.selected_shape_id = None;
+        self.active_shape_template_id = None;
+        self.image_catalog.clear();
+        self.server_events.clear();
+        self.remote_blame.clear();
+        self.remote_entity_blame.clear();
+        self.server_sequence = None;
+        self.server_hash = None;
+        self.left_tab = LeftTab::Explorer;
+        self.frame_grid();
+        self.canvas_dirty = true;
+    }
+
+    fn advance_level_intent(&mut self) {
+        self.level_intent_generation = self.level_intent_generation.wrapping_add(1);
+    }
+
+    fn reset_level_configuration(&mut self) {
+        self.level_configuration_generation = self.level_configuration_generation.wrapping_add(1);
+        self.level_configuration_open = false;
+        self.level_configuration_pending = false;
+        self.level_configuration_error = None;
+        self.level_configuration_name.clear();
+        self.level_configuration_duration.clear();
+        if self.right_tab == RightTab::LevelConfiguration {
+            self.right_tab = RightTab::Inspector;
+        }
     }
 
     fn load_image_catalog(&mut self, ctx: &Context<Self>) {
@@ -3695,11 +4493,13 @@ impl App {
             return;
         }
         self.image_catalog_pending = true;
+        let scope = self.image_scope().0;
         let project_id = self.target.project_id.to_string();
         let request_project_id = project_id.clone();
         let link = ctx.link().clone();
         wasm_bindgen_futures::spawn_local(async move {
             link.send_message(Msg::ImageCatalogLoaded {
+                scope,
                 project_id: request_project_id,
                 result: RestClient.list_image_catalog(&project_id).await,
             });
@@ -3778,11 +4578,13 @@ impl App {
         }
         self.image_catalog_pending = true;
         self.image_import_error = None;
+        let (scope,generation) = self.image_scope();
         let project_id = self.target.project_id.to_string();
         let request_project_id = project_id.clone();
         let link = ctx.link().clone();
         wasm_bindgen_futures::spawn_local(async move {
             link.send_message(Msg::ImageImported {
+                scope, generation,
                 project_id: request_project_id,
                 result: RestClient
                     .upload_image(&project_id, &name, file, media_type)
@@ -3806,18 +4608,13 @@ impl App {
                 level.duration_seconds = configuration.duration_seconds;
             }
         }
-        if let Some(level) = self
-            .levels
-            .iter_mut()
-            .find(|level| level.id == self.target.level_id.as_str())
-        {
-            level.name = configuration.name;
-            level.duration_seconds = configuration.duration_seconds;
-        }
     }
 
     fn save_level_configuration(&mut self, ctx: &Context<Self>) -> bool {
-        if self.level_configuration_pending || !self.can_edit_timeline {
+        if !self.level_configuration_open
+            || self.level_configuration_pending
+            || !self.can_edit_timeline
+        {
             return false;
         }
         let name = self.level_configuration_name.trim().to_owned();
@@ -3833,15 +4630,19 @@ impl App {
         }
         self.level_configuration_pending = true;
         self.level_configuration_error = None;
-        let project_id = self.target.project_id.to_string();
-        let level_id = self.target.level_id.to_string();
+        let target = self.target.clone();
+        let generation = self.level_configuration_generation;
+        let project_id = target.project_id.to_string();
+        let level_id = target.level_id.to_string();
         let link = ctx.link().clone();
         wasm_bindgen_futures::spawn_local(async move {
-            link.send_message(Msg::LevelConfigurationUpdated(
-                RestClient
+            link.send_message(Msg::LevelConfigurationUpdated {
+                target,
+                generation,
+                result: RestClient
                     .update_level_configuration(&project_id, &level_id, &name, duration_seconds)
                     .await,
-            ));
+            });
         });
         true
     }
@@ -3858,15 +4659,24 @@ impl App {
     }
 
     fn clear_session(&mut self) {
+        self.invalidate_image_studio();
         self.invalidate_rpc();
+        self.catalog_request_generation = self.catalog_request_generation.wrapping_add(1);
+        self.advance_level_intent();
+        self.reset_level_configuration();
+        self.disconnect_canvas_resize_observer();
         self.phase = Phase::Authentication;
         self.user = None;
         self.workspaces.clear();
         self.projects.clear();
         self.catalog_project = None;
-        self.levels.clear();
         self.catalog_levels.clear();
         self.catalog_invitations.clear();
+        self.workspace_draft_name.clear();
+        self.explorer_action = None;
+        self.expanded_workspaces.clear();
+        self.expanded_projects.clear();
+        self.auto_open_initial_level = false;
         self.project_configuration = None;
         self.configuration_project = None;
         self.target = ProjectLevelTarget::new(String::new(), String::new());
@@ -3881,6 +4691,9 @@ impl App {
     }
 
     fn invalidate_rpc(&mut self) {
+        if self.mode == Mode::Brush {
+            self.set_mode(Mode::Select);
+        }
         self.connection_attempt += 1;
         self.rpc = None;
         self.reconnect_timer = None;
@@ -3891,6 +4704,7 @@ impl App {
         self.last_sent_cursor = None;
         self.cursor_timer = None;
         self.cursor_in_flight = false;
+        self.image_request_interrupted();
         self.pending_commands.clear();
         self.pending_cells.clear();
         self.pending_entities.clear();
@@ -3913,11 +4727,56 @@ impl App {
         self.seen_commands.clear();
     }
 
+    fn open_sand_studio(&mut self) -> bool {
+        let Some(entity_id) = self.selected_entity_id().cloned() else {
+            return false;
+        };
+        if self
+            .model
+            .timeline()
+            .snapshot()
+            .entity(&entity_id)
+            .is_none_or(|entity| entity.as_blind().is_none())
+        {
+            return false;
+        }
+        let mut changed = self.set_mode(Mode::Brush);
+        if self.isolated_blind.as_ref() != Some(&entity_id) {
+            self.isolated_blind = Some(entity_id);
+            changed = true;
+        }
+        self.workspace_tool = WorkspaceTool::Paint;
+        self.blind_brush_tool = BlindBrushTool::Paint;
+        self.canvas_dirty = true;
+        changed
+    }
+
     fn set_mode(&mut self, mode: Mode) -> bool {
         if self.mode == mode {
             return false;
         }
+        let previous_mode = self.mode;
+        self.distribution = DistributionState::default();
+        if self.right_tab == RightTab::AdvancedDistribution { self.right_tab = RightTab::Inspector; }
+        if mode == Mode::Brush {
+            self.left_tab_before_sand_studio = Some(self.left_tab);
+            self.left_panel_layout_before_sand_studio = Some(self.left_panel_layout);
+            self.left_tab = LeftTab::SandStudio;
+            self.left_panel_layout = PanelLayout::Docked;
+        } else if previous_mode == Mode::Brush {
+            self.left_tab = self
+                .left_tab_before_sand_studio
+                .take()
+                .filter(|tab| *tab != LeftTab::SandStudio)
+                .unwrap_or(LeftTab::ShapeTemplates);
+            if let Some(layout) = self.left_panel_layout_before_sand_studio.take() {
+                self.left_panel_layout = layout;
+            }
+        }
         self.mode = mode;
+        if mode == Mode::Distribution && !matches!(self.selection, Some(Selection::Entities(_))) {
+            self.selection = None;
+        }
         self.workspace_tool = WorkspaceTool::default_for(mode);
         self.blind_brush_tool = BlindBrushTool::Paint;
         self.drag_kind = None;
@@ -3967,7 +4826,12 @@ impl App {
 
     fn select_and_focus_inspector(&mut self, selection: Selection) {
         self.selection = Some(selection);
-        self.right_tab = RightTab::Inspector;
+        if self.mode == Mode::Distribution {
+            if !matches!(self.selection, Some(Selection::Entities(_))) { self.selection = None; }
+            self.sync_distribution_selection();
+        } else {
+            self.right_tab = RightTab::Inspector;
+        }
     }
 
     fn select_entities_and_focus_inspector(&mut self, entity_ids: Vec<EntityId>) {
@@ -4025,6 +4889,7 @@ impl App {
 
     fn begin_placement_drag(&mut self, kind: PlacementKind, shape: Shape) -> bool {
         if self.mode != Mode::Select
+            || self.workspace_tool != WorkspaceTool::Place
             || !self.can_edit_timeline
             || !matches!(self.rpc_state, RpcState::Online)
         {
@@ -4087,7 +4952,12 @@ impl App {
     }
 
     fn canvas_down(&mut self, ctx: &Context<Self>, event: PointerEvent) -> bool {
+        if self.image_studio.apply.is_some() { return self.image_pointer_down(event); }
+        if self.mode == Mode::Distribution && event.button() == 0 { return self.distribution_pointer_down(event); }
         event.prevent_default();
+        if let Some(root) = self.root_ref.cast::<HtmlElement>() {
+            let _ = root.focus();
+        }
         if event.button() == 1 || event.button() == 2 {
             let Some((start_x, start_y)) = self.canvas_position(&event) else {
                 return false;
@@ -4198,6 +5068,7 @@ impl App {
                             start_canvas_x,
                             start_canvas_y,
                             active: false,
+                            pointer_on_grid: true,
                         });
                     }
                 }
@@ -4239,11 +5110,12 @@ impl App {
             CellKind::Wall => CellKind::Floor,
         });
         self.drag_kind = Some(kind);
-        self.apply_cell(ctx, point, kind);
+        self.apply_cell_stamp(ctx, point, self.selected_shape_template(), kind);
         true
     }
 
     fn canvas_move(&mut self, ctx: &Context<Self>, event: PointerEvent) -> bool {
+        if self.image_studio.apply.is_some() { return self.image_pointer_move(event); }
         let cursor = self.point_from_pointer(&event);
         self.queue_cursor(ctx, cursor);
         if let Some(pan) = self.pan_gesture.as_ref() {
@@ -4301,15 +5173,25 @@ impl App {
             if !active {
                 return false;
             }
-            let Some(point) = self.point_from_canvas_position(canvas_x, canvas_y) else {
-                return false;
-            };
-            if drag.current == point && drag.active {
+            let point = self.point_from_canvas_position(canvas_x, canvas_y);
+            if point.is_none() {
+                if drag.active && !drag.pointer_on_grid {
+                    return false;
+                }
+                let drag = self.entity_drag.as_mut().expect("drag exists");
+                drag.active = true;
+                drag.pointer_on_grid = false;
+                self.canvas_dirty = true;
+                return true;
+            }
+            let point = point.expect("point was checked");
+            if drag.current == point && drag.active && drag.pointer_on_grid {
                 return false;
             }
             let drag = self.entity_drag.as_mut().expect("drag exists");
             drag.current = point;
             drag.active = true;
+            drag.pointer_on_grid = true;
             self.canvas_dirty = true;
             return true;
         }
@@ -4355,11 +5237,12 @@ impl App {
         }
         self.last_drag = Some(point);
         self.select_and_focus_inspector(Selection::Cell(point));
-        self.apply_cell(ctx, point, kind);
+        self.apply_cell_stamp(ctx, point, self.selected_shape_template(), kind);
         true
     }
 
     fn canvas_up(&mut self, ctx: &Context<Self>, event: PointerEvent) -> bool {
+        if self.image_studio.apply.is_some() { return self.image_pointer_up(event, false); }
         if self
             .pan_gesture
             .as_ref()
@@ -4408,6 +5291,13 @@ impl App {
             if delta_x == 0 && delta_y == 0 && drag.rotation_steps == 0 {
                 return true;
             }
+            if !self.entity_drag_preview(&drag).valid {
+                self.push_toast(
+                    "Element cannot snap to occupied, blocked, or out-of-bounds cells".to_owned(),
+                    "warning",
+                );
+                return true;
+            }
             if drag.duplicate {
                 return self.duplicate_entities_from_drag(ctx, drag);
             }
@@ -4440,13 +5330,20 @@ impl App {
                     }
                 }
                 if !entity_ids.is_empty() {
-                    self.select_entities_and_focus_inspector(entity_ids);
+                    if self.mode == Mode::Distribution {
+                        self.selection = Some(Selection::Entities(entity_ids));
+                        self.sync_distribution_selection();
+                    } else {
+                        self.select_entities_and_focus_inspector(entity_ids);
+                    }
                 } else if !gesture.additive {
                     self.selection = None;
                 }
             } else if !gesture.additive {
-                self.select_and_focus_inspector(Selection::Cell(gesture.current));
+                if self.mode == Mode::Distribution { self.selection = None; }
+                else { self.select_and_focus_inspector(Selection::Cell(gesture.current)); }
             }
+            if self.mode == Mode::Distribution { self.sync_distribution_selection(); }
             self.canvas_dirty = true;
             return true;
         }
@@ -4460,6 +5357,7 @@ impl App {
     }
 
     fn canvas_cancel(&mut self, event: PointerEvent) -> bool {
+        if self.image_studio.apply.is_some() { return self.image_pointer_up(event, true); }
         self.release_pointer(event.pointer_id());
         self.drag_kind = None;
         self.last_drag = None;
@@ -4525,11 +5423,10 @@ impl App {
             },
             (BlindBrushTool::FloodFill, 0, _) => {
                 let pixels: BTreeSet<_> = blind
-                    .empty_fill_region(entity.shape(), pixel)
+                    .fill_region(entity.shape(), pixel)
                     .into_iter()
                     .collect();
                 if pixels.is_empty() {
-                    self.push_toast("Fill requires an empty Pool pixel".to_owned(), "info");
                     return true;
                 }
                 self.capture_pointer(event.pointer_id());
@@ -4584,6 +5481,10 @@ impl App {
             self.canvas_dirty = true;
             return true;
         };
+        let Some(pixels_per_cell) = entity.as_blind().map(|blind| blind.pixels_per_cell()) else {
+            self.blind_gesture = None;
+            return true;
+        };
         let Some(pixel) = self.blind_pixel_from_pointer(&event, entity) else {
             if let Some(gesture) = self.blind_gesture.as_mut() {
                 gesture.last_pixel = None;
@@ -4594,8 +5495,10 @@ impl App {
             return false;
         }
 
-        let segment =
-            last_pixel.map_or_else(|| vec![pixel], |last| rasterize_blind_segment(last, pixel));
+        let segment = last_pixel.map_or_else(
+            || vec![pixel],
+            |last| rasterize_blind_segment_in_tile(last, pixel, pixels_per_cell),
+        );
         let continuous = segment
             .iter()
             .all(|sample| gesture.partition.contains(sample));
@@ -4744,16 +5647,19 @@ impl App {
         blind_pixel_from_top_left_sample(entity, world_cell, pixel_x, pixel_y_from_top)
     }
 
-    fn apply_cell(&mut self, ctx: &Context<Self>, point: GridPoint, kind: CellKind) -> bool {
+    fn apply_cell_stamp(
+        &mut self,
+        ctx: &Context<Self>,
+        origin: GridPoint,
+        shape: Shape,
+        kind: CellKind,
+    ) -> bool {
         if !self.can_edit_timeline {
             self.push_toast(
                 "Editing requires the exact edit_timeline capability".to_owned(),
                 "warning",
             );
             return true;
-        }
-        if self.pending_cells.contains_key(&point) {
-            return false;
         }
         if !matches!(self.rpc_state, RpcState::Online) {
             self.push_toast(
@@ -4763,19 +5669,55 @@ impl App {
             return true;
         }
 
+        let size = self.model.timeline().snapshot().size();
+        let Some(points) = shape_world_points(origin, shape) else {
+            return false;
+        };
+        let points = points
+            .into_iter()
+            .filter(|point| point.x < size.width() && point.y < size.height())
+            .filter(|point| !self.pending_cells.contains_key(point))
+            .filter(|point| self.effective_cell(*point) != Some(kind))
+            .collect::<Vec<_>>();
+        if points.is_empty() {
+            return false;
+        }
+        if kind == CellKind::Wall
+            && let Some(point) = points
+                .iter()
+                .copied()
+                .find(|point| self.model.timeline().snapshot().entity_at(*point).is_some())
+        {
+            self.push_toast(
+                format!(
+                    "The brush footprint overlaps an entity at ({}, {})",
+                    point.x, point.y
+                ),
+                "warning",
+            );
+            return true;
+        }
+
         let Some(rpc) = self.rpc.clone() else {
             return false;
         };
-        let command = self.model.prepare_set_cell(point, kind, now_ms());
+        let edits = points
+            .iter()
+            .copied()
+            .map(|point| CellEdit::new(point, kind))
+            .collect();
+        let command = self.model.prepare_set_cells(edits, now_ms());
         let command_id = command.metadata.id.to_string();
         self.pending_commands.insert(command_id.clone());
-        self.pending_cells.insert(
-            point,
-            PendingCell {
-                kind,
-                command_id: command_id.clone(),
-            },
-        );
+        for point in points {
+            self.pending_cells.insert(
+                point,
+                PendingCell {
+                    kind,
+                    command_id: command_id.clone(),
+                },
+            );
+        }
         self.canvas_dirty = true;
 
         let request = ApplyCommandRequest {
@@ -4934,6 +5876,25 @@ impl App {
         })
     }
 
+    fn selected_shape_template(&self) -> Shape {
+        self.active_shape_template_id
+            .as_ref()
+            .and_then(|shape_id| {
+                self.shape_catalog
+                    .iter()
+                    .find(|entry| &entry.id == shape_id)
+            })
+            .and_then(|entry| {
+                Shape::new(
+                    entry.shape.width,
+                    entry.shape.height,
+                    entry.shape.occupied_mask,
+                )
+                .ok()
+            })
+            .unwrap_or_else(|| Shape::new(1, 1, 1).expect("single-cell template is valid"))
+    }
+
     fn select_shape_draft(&mut self, shape_id: &str) -> bool {
         let Some(entry) = self.shape_catalog.iter().find(|entry| entry.id == shape_id) else {
             return false;
@@ -5079,6 +6040,18 @@ impl App {
                 Vec::new(),
             ),
             EntityAction::RotateClockwise | EntityAction::FlipHorizontal => {
+                let transforms = entities
+                    .iter()
+                    .map(|entity| match action {
+                        EntityAction::RotateClockwise => {
+                            EntityTransform::new(entity.id().clone()).rotated_clockwise(1)
+                        }
+                        EntityAction::FlipHorizontal => {
+                            EntityTransform::new(entity.id().clone()).flipped_horizontal()
+                        }
+                        EntityAction::Delete => unreachable!(),
+                    })
+                    .collect::<Vec<_>>();
                 let transformed = entities
                     .into_iter()
                     .map(|entity| match action {
@@ -5094,7 +6067,7 @@ impl App {
                     })
                     .collect();
                 (
-                    self.model.prepare_transform_entities(transformed, now_ms()),
+                    self.model.prepare_transform_entities(transforms, now_ms()),
                     placement_points,
                 )
             }
@@ -5136,27 +6109,22 @@ impl App {
         {
             return false;
         }
-        let mut transformed = Vec::with_capacity(entities.len());
-        for entity in entities {
-            let Ok(resampled) = entity.resampled_blind(pixels_per_cell) else {
-                self.push_toast("Pool resolution could not be applied".to_owned(), "warning");
-                return true;
-            };
-            transformed.push(resampled);
-        }
-        if transformed
-            .iter()
-            .all(|entity| self.model.timeline().snapshot().entity(entity.id()) == Some(entity))
-        {
+        if entities.iter().all(|entity| {
+            entity
+                .as_blind()
+                .is_some_and(|blind| blind.pixels_per_cell() == pixels_per_cell)
+        }) {
             return false;
         }
-        let placement_points = transformed
+        let placement_points = entities
             .iter()
             .flat_map(|entity| {
                 shape_world_points(entity.origin(), entity.shape()).unwrap_or_default()
             })
             .collect();
-        let envelope = self.model.prepare_transform_entities(transformed, now_ms());
+        let envelope =
+            self.model
+                .prepare_set_blind_resolutions(entity_ids.clone(), pixels_per_cell, now_ms());
         self.submit_entity_command(ctx, envelope, entity_ids, placement_points)
     }
 
@@ -5196,16 +6164,18 @@ impl App {
                 .snapshot()
                 .entity(entity_id)
                 .and_then(|entity| match entity.kind() {
-                    PlaceableEntityKind::Block(block) => {
-                        Some(block.collect_layers().len() > layer_index)
-                    }
+                    PlaceableEntityKind::Block(block) => block
+                        .collect_layers()
+                        .get(layer_index)
+                        .map(|layer| !layer.is_locked()),
                     PlaceableEntityKind::Blind(_) => None,
                 })
                 .unwrap_or(false)
         });
         if !all_editable {
             self.push_toast(
-                "Select Blocks with a matching capacity layer to batch-edit it".to_owned(),
+                "Select Blocks with matching, unlocked capacity layers to batch-edit them"
+                    .to_owned(),
                 "info",
             );
             return true;
@@ -5267,8 +6237,15 @@ impl App {
             return false;
         };
         let mut layers = block.collect_layers().to_vec();
-        if layer_index >= layers.len() {
+        let Some(layer) = layers.get(layer_index) else {
             return false;
+        };
+        if layer.is_locked() {
+            self.push_toast(
+                "Locked capacity layers cannot be removed".to_owned(),
+                "info",
+            );
+            return true;
         }
         layers.remove(layer_index);
         let envelope =
@@ -5328,8 +6305,11 @@ impl App {
         let Ok(delta_y) = i16::try_from(delta_y) else {
             return false;
         };
+        let snapshot = self.model.timeline().snapshot();
         let mut moves = Vec::with_capacity(origins.len());
         let mut entity_ids = Vec::with_capacity(origins.len());
+        let mut placement_points = Vec::new();
+        let mut previews = Vec::with_capacity(origins.len());
         for (entity_id, origin) in origins {
             let (Some(x), Some(y)) = (
                 origin.x.checked_add_signed(delta_x),
@@ -5341,11 +6321,25 @@ impl App {
                 );
                 return true;
             };
+            let Some(entity) = snapshot.entity(&entity_id) else {
+                self.selection = None;
+                return true;
+            };
+            let destination = GridPoint::new(x, y);
+            placement_points
+                .extend(shape_world_points(destination, entity.shape()).unwrap_or_default());
             entity_ids.push(entity_id.clone());
-            moves.push(EntityMove::new(entity_id, GridPoint::new(x, y)));
+            previews.push(entity.moved_to(destination));
+            moves.push(EntityMove::new(entity_id, destination));
         }
         let envelope = self.model.prepare_move_entities(moves, now_ms());
-        self.submit_entity_command(ctx, envelope, entity_ids, Vec::new())
+        self.submit_entity_command_with_previews(
+            ctx,
+            envelope,
+            entity_ids,
+            placement_points,
+            previews,
+        )
     }
 
     fn duplicate_entities_from_drag(&mut self, ctx: &Context<Self>, drag: EntityDrag) -> bool {
@@ -5377,28 +6371,39 @@ impl App {
         let mut duplicates = Vec::with_capacity(drag.origins.len());
         let mut placement_points = Vec::new();
         for (entity_id, origin) in &drag.origins {
-            let Some(destination) =
-                dragged_entity_origin(*origin, drag.start, drag.current, drag.rotation_steps)
-            else {
+            let Some(source) = snapshot.entity(entity_id) else {
+                return false;
+            };
+            let Some(copy) = dragged_entity_preview(
+                source,
+                *origin,
+                drag.start,
+                drag.current,
+                drag.rotation_steps,
+            ) else {
                 self.push_toast(
                     "Duplicate rejected: selection would leave the grid".to_owned(),
                     "warning",
                 );
                 return true;
             };
-            let Some(source) = snapshot.entity(entity_id) else {
-                return false;
-            };
-            let mut copy = source.clone();
-            for _ in 0..drag.rotation_steps {
-                copy = copy.rotated_clockwise();
-            }
+            let destination = copy.origin();
             placement_points
                 .extend(shape_world_points(destination, copy.shape()).unwrap_or_default());
             duplicates.push((copy, destination));
         }
         let (envelope, duplicate_ids) = self.model.prepare_duplicate_entities(duplicates, now_ms());
-        let submitted = self.submit_entity_command(ctx, envelope, duplicate_ids, placement_points);
+        let previews = match &envelope.command {
+            LevelCommand::PlaceEntities { entities } => entities.clone(),
+            _ => Vec::new(),
+        };
+        let submitted = self.submit_entity_command_with_previews(
+            ctx,
+            envelope,
+            duplicate_ids,
+            placement_points,
+            previews,
+        );
         if submitted {
             self.push_toast(
                 "Duplicated selection (decorators are not copied)".to_owned(),
@@ -5434,34 +6439,46 @@ impl App {
             return false;
         }
         let snapshot = self.model.timeline().snapshot();
-        let mut transformed = Vec::with_capacity(drag.origins.len());
+        let mut transforms = Vec::with_capacity(drag.origins.len());
         let mut placement_points = Vec::new();
         let mut entity_ids = Vec::with_capacity(drag.origins.len());
+        let mut previews = Vec::with_capacity(drag.origins.len());
         for (entity_id, origin) in &drag.origins {
-            let Some(destination) =
-                dragged_entity_origin(*origin, drag.start, drag.current, drag.rotation_steps)
-            else {
+            let Some(source) = snapshot.entity(entity_id) else {
+                return false;
+            };
+            let Some(preview) = dragged_entity_preview(
+                source,
+                *origin,
+                drag.start,
+                drag.current,
+                drag.rotation_steps,
+            ) else {
                 self.push_toast(
                     "Transform rejected: selection would leave the grid".to_owned(),
                     "warning",
                 );
                 return true;
             };
-            let Some(source) = snapshot.entity(entity_id) else {
-                return false;
-            };
-            let mut entity = source.clone();
-            for _ in 0..drag.rotation_steps {
-                entity = entity.rotated_clockwise();
-            }
-            entity = entity.moved_to(destination);
+            let destination = preview.origin();
             placement_points
-                .extend(shape_world_points(destination, entity.shape()).unwrap_or_default());
+                .extend(shape_world_points(destination, preview.shape()).unwrap_or_default());
             entity_ids.push(entity_id.clone());
-            transformed.push(entity);
+            previews.push(preview);
+            transforms.push(
+                EntityTransform::new(entity_id.clone())
+                    .moved_to(destination)
+                    .rotated_clockwise(drag.rotation_steps),
+            );
         }
-        let envelope = self.model.prepare_transform_entities(transformed, now_ms());
-        self.submit_entity_command(ctx, envelope, entity_ids, placement_points)
+        let envelope = self.model.prepare_transform_entities(transforms, now_ms());
+        self.submit_entity_command_with_previews(
+            ctx,
+            envelope,
+            entity_ids,
+            placement_points,
+            previews,
+        )
     }
 
     fn edit_selected_decorator(&mut self, ctx: &Context<Self>, action: DecoratorAction) -> bool {
@@ -5644,6 +6661,23 @@ impl App {
         entity_ids: impl IntoIterator<Item = EntityId>,
         placement_points: Vec<GridPoint>,
     ) -> bool {
+        self.submit_entity_command_with_previews(
+            ctx,
+            envelope,
+            entity_ids,
+            placement_points,
+            Vec::new(),
+        )
+    }
+
+    fn submit_entity_command_with_previews(
+        &mut self,
+        ctx: &Context<Self>,
+        envelope: CommandEnvelope,
+        entity_ids: impl IntoIterator<Item = EntityId>,
+        placement_points: Vec<GridPoint>,
+        previews: Vec<PlaceableEntity>,
+    ) -> bool {
         let Some(rpc) = self
             .rpc
             .clone()
@@ -5652,9 +6686,19 @@ impl App {
             return false;
         };
         let command_id = envelope.metadata.id.to_string();
+        let mut previews = previews
+            .into_iter()
+            .map(|entity| (entity.id().clone(), entity))
+            .collect::<BTreeMap<_, _>>();
         self.pending_commands.insert(command_id.clone());
         for entity_id in entity_ids {
-            self.pending_entities.insert(entity_id, command_id.clone());
+            self.pending_entities.insert(
+                entity_id.clone(),
+                PendingEntity {
+                    command_id: command_id.clone(),
+                    preview: previews.remove(&entity_id),
+                },
+            );
         }
         for point in placement_points {
             self.pending_placements.insert(point, command_id.clone());
@@ -5692,7 +6736,13 @@ impl App {
         let command_id = envelope.metadata.id.to_string();
         self.pending_commands.insert(command_id.clone());
         for entity_id in entity_ids {
-            self.pending_entities.insert(entity_id, command_id.clone());
+            self.pending_entities.insert(
+                entity_id,
+                PendingEntity {
+                    command_id: command_id.clone(),
+                    preview: None,
+                },
+            );
         }
         let request = ApplyCommandRequest {
             target: self.target.clone(),
@@ -5756,9 +6806,34 @@ impl App {
     }
 
     fn key_down(&mut self, ctx: &Context<Self>, event: KeyboardEvent) -> bool {
+        if self.distribution_modal_open() {
+            if event.key() == "Escape" {
+                event.prevent_default();
+                return self.distribution_message(ctx, DistributionMsg::CloseDivision);
+            }
+            return false;
+        }
+        if self.image_studio.apply.is_some() {
+            if event.key() == "Escape" {
+                event.prevent_default();
+                if self.studio_modal.is_some() { self.cancel_conversion(); self.studio_modal = None; }
+                else { self.cancel_apply_image(); }
+                return true;
+            }
+            // Inputs retain browser editing; every workspace shortcut is suspended.
+            return false;
+        }
+        if self.explorer_action.is_some() && event.key() == "Escape" {
+            event.prevent_default();
+            self.explorer_action = None;
+            self.form_error = None;
+            self.advance_level_intent();
+            return true;
+        }
         if self.studio_modal.is_some() {
             if event.key() == "Escape" {
                 event.prevent_default();
+                self.cancel_conversion();
                 self.studio_modal = None;
                 return true;
             }
@@ -5963,6 +7038,10 @@ impl App {
     }
 
     fn start_connection(&mut self, ctx: &Context<Self>) {
+        if self.target.project_id.as_str().is_empty() || self.target.level_id.as_str().is_empty() {
+            self.rpc_state = RpcState::Offline;
+            return;
+        }
         self.reconnect_timer = None;
         self.connection_attempt += 1;
         self.rpc = None;
@@ -5971,6 +7050,7 @@ impl App {
         self.last_sent_cursor = None;
         self.cursor_timer = None;
         self.cursor_in_flight = false;
+        self.image_request_interrupted();
         self.pending_commands.clear();
         self.pending_cells.clear();
         self.pending_entities.clear();
@@ -6037,7 +7117,8 @@ impl App {
                 }
                 self.rpc = None;
                 self.presence.clear();
-                self.pending_commands.clear();
+                self.image_request_interrupted();
+        self.pending_commands.clear();
                 self.pending_cells.clear();
                 self.pending_entities.clear();
                 self.pending_placements.clear();
@@ -6133,7 +7214,8 @@ impl App {
         if response.target != self.target {
             self.connection_attempt += 1;
             self.rpc = None;
-            self.pending_commands.clear();
+            self.image_request_interrupted();
+        self.pending_commands.clear();
             self.pending_cells.clear();
             self.pending_entities.clear();
             self.pending_placements.clear();
@@ -6151,7 +7233,8 @@ impl App {
         if computed_hash != response.level_hash {
             self.connection_attempt += 1;
             self.rpc = None;
-            self.pending_commands.clear();
+            self.image_request_interrupted();
+        self.pending_commands.clear();
             self.pending_cells.clear();
             self.pending_entities.clear();
             self.pending_placements.clear();
@@ -6179,7 +7262,8 @@ impl App {
         if let Err(error) = self.model.replace_snapshot(response.snapshot) {
             self.connection_attempt += 1;
             self.rpc = None;
-            self.pending_commands.clear();
+            self.image_request_interrupted();
+        self.pending_commands.clear();
             self.pending_cells.clear();
             self.pending_entities.clear();
             self.pending_placements.clear();
@@ -6194,6 +7278,7 @@ impl App {
         self.key_locker_assignment = None;
         self.server_sequence = Some(response.server_sequence);
         self.server_hash = Some(response.level_hash);
+        self.image_request_interrupted();
         self.pending_commands.clear();
         self.pending_cells.clear();
         self.pending_entities.clear();
@@ -6243,6 +7328,7 @@ impl App {
     fn reject_server_history(&mut self, ctx: &Context<Self>, error: String) -> bool {
         self.connection_attempt += 1;
         self.rpc = None;
+        self.image_request_interrupted();
         self.pending_commands.clear();
         self.pending_cells.clear();
         self.pending_entities.clear();
@@ -6374,6 +7460,7 @@ impl App {
         command_id: String,
         result: Result<ApplyCommandResponse, String>,
     ) -> bool {
+        self.distribution_command_finished(&command_id, result.as_ref().err());
         match result {
             Ok(response) => match response.result {
                 ApplyCommandResult::Applied { event } => self.accept_server_event(
@@ -6453,7 +7540,8 @@ impl App {
             return;
         }
         if self.rpc.is_none() {
-            self.pending_commands.clear();
+            self.image_request_interrupted();
+        self.pending_commands.clear();
             self.pending_cells.clear();
             self.pending_entities.clear();
             self.pending_placements.clear();
@@ -6472,7 +7560,7 @@ impl App {
         self.pending_cells
             .retain(|_, pending| pending.command_id != command_id);
         self.pending_entities
-            .retain(|_, pending_command| pending_command != command_id);
+            .retain(|_, pending| pending.command_id != command_id);
         self.pending_placements
             .retain(|_, pending_command| pending_command != command_id);
         if self.pending_grid.as_deref() == Some(command_id) {
@@ -6687,36 +7775,61 @@ impl App {
         true
     }
 
-    fn preview_origin(&self, entity: &PlaceableEntity) -> GridPoint {
-        let Some(drag) = self.entity_drag.as_ref() else {
-            return entity.origin();
-        };
-        let Some((_, origin)) = drag
-            .origins
-            .iter()
-            .find(|(entity_id, _)| entity_id == entity.id())
-        else {
-            return entity.origin();
-        };
-        dragged_entity_origin(*origin, drag.start, drag.current, drag.rotation_steps)
-            .unwrap_or(*origin)
+    fn preview_entity(&self, entity: &PlaceableEntity) -> PlaceableEntity {
+        if let Some(projected) = self.image_projection(entity) { return projected; }
+        let pending = self
+            .pending_entities
+            .get(entity.id())
+            .and_then(|pending| pending.preview.as_ref());
+        resolved_entity_preview(entity, None, pending)
     }
 
-    fn preview_entity(&self, entity: &PlaceableEntity) -> PlaceableEntity {
-        let rotation_steps = self
-            .entity_drag
-            .as_ref()
-            .filter(|drag| {
-                drag.origins
-                    .iter()
-                    .any(|(entity_id, _)| entity_id == entity.id())
+    fn entity_drag_preview(&self, drag: &EntityDrag) -> EntityDragPreview {
+        let snapshot = self.model.timeline().snapshot();
+        let dragged_ids = drag
+            .origins
+            .iter()
+            .map(|(entity_id, _)| entity_id.clone())
+            .collect::<BTreeSet<_>>();
+        let entities = drag
+            .origins
+            .iter()
+            .filter_map(|(entity_id, origin)| {
+                snapshot.entity(entity_id).and_then(|entity| {
+                    dragged_entity_preview(
+                        entity,
+                        *origin,
+                        drag.start,
+                        drag.current,
+                        drag.rotation_steps,
+                    )
+                })
             })
-            .map_or(0, |drag| drag.rotation_steps);
-        let mut preview = entity.clone();
-        for _ in 0..rotation_steps {
-            preview = preview.rotated_clockwise();
+            .collect::<Vec<_>>();
+        let size = snapshot.size();
+        let mut occupied = BTreeSet::new();
+        let mut valid = drag.pointer_on_grid && entities.len() == drag.origins.len();
+        for entity in &entities {
+            let Some(points) = shape_world_points(entity.origin(), entity.shape()) else {
+                valid = false;
+                continue;
+            };
+            for point in points {
+                let collides = snapshot
+                    .entity_at(point)
+                    .is_some_and(|occupant| drag.duplicate || !dragged_ids.contains(occupant.id()));
+                if point.x >= size.width()
+                    || point.y >= size.height()
+                    || self.effective_cell(point) != Some(CellKind::Floor)
+                    || self.pending_placements.contains_key(&point)
+                    || collides
+                    || !occupied.insert(point)
+                {
+                    valid = false;
+                }
+            }
         }
-        preview.moved_to(self.preview_origin(entity))
+        EntityDragPreview { entities, valid }
     }
 
     fn activity_events(&self) -> &[HistoryEvent] {
@@ -6914,7 +8027,7 @@ impl App {
             context.stroke();
         }
 
-        context.set_font("11px ui-monospace, SFMono-Regular, Consolas, monospace");
+        context.set_font(&self.ui_settings.canvas_font(11, false));
         context.set_text_align("center");
         context.set_text_baseline("middle");
 
@@ -6975,13 +8088,40 @@ impl App {
                 continue;
             }
             let display = self.preview_entity(entity);
+            context.save();
+            if self.distribution.hover.is_some() { context.set_global_alpha(0.18); }
             self.draw_entity(&context, &palette, &display)?;
+            context.restore();
         }
         if self.isolated_blind.is_none() {
+            let snapshot = self.model.timeline().snapshot();
+            let pending_duplicates = self
+                .pending_entities
+                .values()
+                .filter_map(|pending| pending.preview.as_ref())
+                .filter(|preview| snapshot.entity(preview.id()).is_none());
+            context.save();
+            context.set_global_alpha(0.72);
+            for entity in pending_duplicates {
+                self.draw_entity(&context, &palette, entity)?;
+            }
+            context.restore();
+
+            if let Some(drag) = self.entity_drag.as_ref().filter(|drag| drag.active) {
+                let preview = self.entity_drag_preview(drag);
+                self.draw_entity_drag_ghost(&context, &palette, &preview);
+            }
+        }
+        if self.isolated_blind.is_none() {
+            context.save();
+            if self.distribution.hover.is_some() { context.set_global_alpha(0.18); }
             self.draw_decorators(&context);
+            context.restore();
         }
         self.draw_blind_gesture_preview(&context, &palette);
         self.draw_placement_preview(&context, &palette);
+        self.draw_image_overlay(&context);
+        self.draw_distribution_highlight(&context);
 
         context.set_fill_style_str(palette.label);
         for index in 0..size.width() {
@@ -7042,7 +8182,7 @@ impl App {
             context.set_line_width(2.0);
             context.stroke();
             context.set_text_align("left");
-            context.set_font("bold 10px ui-monospace, SFMono-Regular, Consolas, monospace");
+            context.set_font(&self.ui_settings.canvas_font(10, true));
             context.fill_text(participant.actor.as_str(), x + 11.0, y - 10.0)?;
         }
 
@@ -7070,7 +8210,7 @@ impl App {
             context.set_line_dash(&js_sys::Array::new()).ok();
             context.restore();
         }
-        self.draw_map_resize_handles(&context, &palette);
+        if self.image_studio.apply.is_none() { self.draw_map_resize_handles(&context, &palette); }
 
         context.set_text_align("right");
         context.set_fill_style_str(palette.label);
@@ -7134,13 +8274,48 @@ impl App {
             context.stroke_rect(x - 6.5, y - 6.5, 13.0, 13.0);
         }
         context.set_fill_style_str(palette.selection);
-        context.set_font("10px ui-monospace, SFMono-Regular, Consolas, monospace");
+        context.set_font(&self.ui_settings.canvas_font(10, false));
         context.set_text_align("center");
         let _ = context.fill_text(
             &format!("{} x {}", size.width(), size.height()),
             left + width / 2.0,
             top - 15.0,
         );
+        context.restore();
+    }
+
+    fn draw_entity_drag_ghost(
+        &self,
+        context: &CanvasRenderingContext2d,
+        palette: &CanvasPalette,
+        preview: &EntityDragPreview,
+    ) {
+        let color = if preview.valid {
+            palette.selection
+        } else {
+            palette.invalid
+        };
+        context.save();
+        context.set_global_alpha(0.62);
+        context.set_fill_style_str(color);
+        context.set_stroke_style_str(color);
+        context.set_line_width(3.0);
+        for entity in &preview.entities {
+            for cell in entity.shape().occupied_cells() {
+                let left =
+                    BOARD_ORIGIN + f64::from(entity.origin().x + u16::from(cell.x)) * CELL_SIZE;
+                let top =
+                    BOARD_ORIGIN + f64::from(entity.origin().y + u16::from(cell.y)) * CELL_SIZE;
+                context.fill_rect(left + 8.0, top + 8.0, CELL_SIZE - 16.0, CELL_SIZE - 16.0);
+                draw_shape_boundary(
+                    context,
+                    left,
+                    top,
+                    5.0,
+                    shape_boundary_edges(entity.shape(), cell),
+                );
+            }
+        }
         context.restore();
     }
 
@@ -7216,9 +8391,7 @@ impl App {
                     draw_shape_boundary(context, left, top, 7.5, edges);
                     if label_cell == Some(cell) {
                         context.set_fill_style_str(palette.entity_label);
-                        context.set_font(
-                            "bold 12px ui-monospace, SFMono-Regular, Consolas, monospace",
-                        );
+                        context.set_font(&self.ui_settings.canvas_font(12, true));
                         context.fill_text("B", left + CELL_SIZE / 2.0, top + CELL_SIZE / 2.0)?;
                     }
                 }
@@ -7277,8 +8450,7 @@ impl App {
                     }
                     if label_cell == Some(cell) {
                         context.set_fill_style_str(palette.entity_label);
-                        context
-                            .set_font("bold 9px ui-monospace, SFMono-Regular, Consolas, monospace");
+                        context.set_font(&self.ui_settings.canvas_font(9, true));
                         context.fill_text("PL", left + CELL_SIZE / 2.0, top + CELL_SIZE / 2.0)?;
                     }
                 }
@@ -7342,7 +8514,7 @@ impl App {
         context.save();
         context.set_text_align("center");
         context.set_text_baseline("middle");
-        context.set_font("bold 10px ui-monospace, SFMono-Regular, Consolas, monospace");
+        context.set_font(&self.ui_settings.canvas_font(10, true));
         for decorator in snapshot.decorators() {
             match decorator.kind() {
                 DecoratorKind::Ice {
@@ -7523,24 +8695,6 @@ fn draw_role_badge(
     context.stroke_rect(x - 10.5, y - 10.5, 21.0, 21.0);
     context.set_fill_style_str(foreground);
     let _ = context.fill_text(label, x, y);
-}
-
-fn catalog_text_matches<const N: usize>(query: &str, values: [&str; N]) -> bool {
-    query.is_empty()
-        || values
-            .into_iter()
-            .any(|value| value.to_ascii_lowercase().contains(query))
-}
-
-fn catalog_project_matches(project: &ProjectSummary, levels: &[LevelSummary], query: &str) -> bool {
-    catalog_text_matches(query, [&project.name, &project.id])
-        || levels
-            .iter()
-            .any(|level| catalog_level_matches(level, query))
-}
-
-fn catalog_level_matches(level: &LevelSummary, query: &str) -> bool {
-    catalog_text_matches(query, [&level.name, &level.id])
 }
 
 fn map_resize_edge_from_command(
@@ -7797,28 +8951,6 @@ fn view_entity_kind_details(entity: &PlaceableEntity, collapsed: bool, header: H
     }
 }
 
-fn dragged_entity_origin(
-    origin: GridPoint,
-    start: GridPoint,
-    landing: GridPoint,
-    rotation_steps: u8,
-) -> Option<GridPoint> {
-    let mut x = i32::from(origin.x).checked_add(i32::from(landing.x) - i32::from(start.x))?;
-    let mut y = i32::from(origin.y).checked_add(i32::from(landing.y) - i32::from(start.y))?;
-    let anchor_x = i32::from(landing.x);
-    let anchor_y = i32::from(landing.y);
-    for _ in 0..rotation_steps % 4 {
-        let relative_x = x.checked_sub(anchor_x)?;
-        let relative_y = y.checked_sub(anchor_y)?;
-        x = anchor_x.checked_sub(relative_y)?;
-        y = anchor_y.checked_add(relative_x)?;
-    }
-    if !(0..=i32::from(u16::MAX)).contains(&x) || !(0..=i32::from(u16::MAX)).contains(&y) {
-        return None;
-    }
-    Some(GridPoint::new(x as u16, y as u16))
-}
-
 fn selection_status(selection: Option<&Selection>) -> String {
     match selection {
         Some(Selection::Cell(point)) => format!("CELL {:02}:{:02}", point.x, point.y),
@@ -7872,10 +9004,11 @@ fn shape_template_thumbnail(sample: &ShapeCatalogEntry) -> Html {
     };
     let width = shape.width();
     let height = shape.height();
+    let cell_percent = 100.0 / f64::from(width.max(height));
     html! {
         <div
             class="shape-template-thumbnail"
-            style={format!("--shape-template-columns: {width}; --shape-template-rows: {height};")}
+            style={format!("--shape-template-columns: {width}; --shape-template-rows: {height}; --shape-template-cell: {cell_percent:.4}%;")}
             aria-hidden="true"
         >
             { for (0..height).flat_map(|y| (0..width).map(move |x| {
@@ -7939,19 +9072,7 @@ fn block_color(color_index: u16) -> &'static str {
 }
 
 fn blind_color(color_index: u8) -> &'static str {
-    match color_index {
-        1 => "#ff8b68",
-        2 => "#ffd15a",
-        3 => "#72dd91",
-        4 => "#54caec",
-        5 => "#7895ff",
-        6 => "#af82f2",
-        7 => "#f17bd2",
-        8 => "#ff7489",
-        9 => "#b69a7b",
-        10 => "#f4f7fa",
-        _ => "#000000",
-    }
+    color_index.checked_sub(1).and_then(|index|oreak_core::PALETTE_HEX.get(usize::from(index))).copied().unwrap_or("#000000")
 }
 
 fn spawn_bootstrap(ctx: &Context<App>) {
@@ -8125,6 +9246,7 @@ fn view_history_event(event: &HistoryEvent) -> Html {
                 cell_kind_label(*kind)
             ),
         ),
+        LevelCommand::SetCells { cells } => ("Stamp cells", format!("{} cells", cells.len())),
         LevelCommand::PlaceEntity { entity } => (
             "Place entity",
             format!(
@@ -8145,9 +9267,26 @@ fn view_history_event(event: &HistoryEvent) -> Html {
             "Move entities",
             format!("{} selected entities", moves.len()),
         ),
-        LevelCommand::TransformEntities { entities } => (
+        LevelCommand::TransformEntities {
+            transforms,
+            entities,
+        } => (
             "Transform entities",
-            format!("{} selected entities", entities.len()),
+            format!(
+                "{} selected entities",
+                if transforms.is_empty() {
+                    entities.len()
+                } else {
+                    transforms.len()
+                }
+            ),
+        ),
+        LevelCommand::SetBlindResolutions {
+            entity_ids,
+            pixels_per_cell,
+        } => (
+            "Set Pool resolution",
+            format!("{} Pools / {pixels_per_cell} px/cell", entity_ids.len()),
         ),
         LevelCommand::RotateEntityClockwise { entity_id } => {
             ("Rotate entity", entity_id.to_string())
@@ -8230,6 +9369,8 @@ fn view_history_event(event: &HistoryEvent) -> Html {
                 start.x, start.y
             ),
         ),
+        LevelCommand::SetPoolDistributionGroups { entity_id, groups, .. } => ("Pool Division", format!("{} · {} groups", entity_id, groups.len())),
+        LevelCommand::ApplyDistribution { request, .. } => ("Distribute", format!("{} Pools · {} layers", request.pools.len(), request.layers.len())),
         LevelCommand::RestoreEntity { entity } => (
             "Restore entity",
             format!(
@@ -8255,5 +9396,46 @@ fn view_history_event(event: &HistoryEvent) -> Html {
                 <small>{format!("{} / {}", event.metadata.actor, format_time(event.metadata.occurred_at_ms))}</small>
             </div>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod ui_settings_tests {
+    use super::UiSettings;
+
+    #[test]
+    fn ui_settings_accept_only_supported_values_and_reset() {
+        let mut settings = UiSettings::default();
+        assert!(settings.set_font_size("2"));
+        assert!(settings.set_scale("125"));
+        assert!(!settings.set_font_size("8"));
+        assert!(!settings.set_scale("175"));
+        assert_eq!(settings.font_size_offset, 2);
+        assert_eq!(settings.scale_percent, 125);
+        assert!(settings.reset());
+        assert_eq!(settings, UiSettings::default());
+    }
+
+    #[test]
+    fn ui_scale_compensates_shell_dimensions() {
+        let settings = UiSettings {
+            font_size_offset: 1,
+            scale_percent: 125,
+        };
+        let style = settings.shell_style(252.0, 296.0);
+        assert!(style.contains("--left-sidebar-width: 201.60px"));
+        assert!(style.contains("--right-sidebar-width: 236.80px"));
+        assert!(style.contains("--canvas-min-width: 384.00px"));
+        assert!(style.contains("--narrow-sidebar-width: 176.00px"));
+        assert!(style.contains("--narrow-canvas-min-width: 368.00px"));
+        assert!(style.contains("--ui-font-offset: 1px"));
+        assert!(style.contains("width: 80.0000vw"));
+        assert!(style.contains("height: 80.0000vh"));
+        assert!(style.contains("--ui-scale: 1.25"));
+        assert!(style.contains("zoom: var(--ui-scale)"));
+        assert_eq!(
+            settings.canvas_font(10, true),
+            "bold 11px ui-monospace, SFMono-Regular, Consolas, monospace"
+        );
     }
 }

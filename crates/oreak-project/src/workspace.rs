@@ -408,6 +408,25 @@ impl Workspace {
         Ok(())
     }
 
+    pub fn unregister_project(
+        &mut self,
+        project_id: &ProjectId,
+        context: AuditContext,
+    ) -> Result<(), WorkspaceError> {
+        self.ensure_fresh_audit(&context.event_id)?;
+        self.require_admin(&context.actor)?;
+        if !self.projects.remove(project_id) {
+            return Err(WorkspaceError::ProjectNotFound(project_id.clone()));
+        }
+        self.append_audit(
+            context,
+            AuditAction::ProjectUnregistered {
+                project_id: project_id.clone(),
+            },
+        );
+        Ok(())
+    }
+
     fn owner_count(&self) -> usize {
         self.members
             .values()
@@ -484,6 +503,8 @@ pub enum WorkspaceError {
     NoChange,
     #[error("project '{0}' is already registered")]
     DuplicateProject(ProjectId),
+    #[error("project '{0}' was not found")]
+    ProjectNotFound(ProjectId),
     #[error("audit event '{0}' already exists")]
     DuplicateAuditEvent(AuditEventId),
 }
@@ -576,6 +597,43 @@ mod tests {
             ),
             Err(WorkspaceError::OwnerRequired)
         );
+    }
+
+    #[test]
+    fn unregistering_a_project_requires_workspace_administration_and_is_audited() {
+        let mut workspace = organization();
+        let project_id = ProjectId::new("project-to-delete").unwrap();
+        workspace
+            .register_project(
+                project_id.clone(),
+                context("project-registered", "owner", 1),
+            )
+            .unwrap();
+
+        assert_eq!(
+            workspace
+                .unregister_project(&project_id, context("project-delete-denied", "member", 2)),
+            Err(WorkspaceError::PermissionDenied)
+        );
+        assert!(workspace.projects().contains(&project_id));
+
+        workspace
+            .unregister_project(&project_id, context("project-unregistered", "owner", 3))
+            .unwrap();
+        assert!(!workspace.projects().contains(&project_id));
+        assert_eq!(
+            workspace.audit_events().last().unwrap().action(),
+            &AuditAction::ProjectUnregistered {
+                project_id: project_id.clone()
+            }
+        );
+        let audit_count = workspace.audit_events().len();
+        assert_eq!(
+            workspace
+                .unregister_project(&project_id, context("project-delete-missing", "owner", 4)),
+            Err(WorkspaceError::ProjectNotFound(project_id))
+        );
+        assert_eq!(workspace.audit_events().len(), audit_count);
     }
 
     #[test]

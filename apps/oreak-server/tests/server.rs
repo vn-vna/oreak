@@ -19,9 +19,11 @@ use jsonrpsee::{
     ws_client::{WsClient, WsClientBuilder},
 };
 use oreak_core::{
-    Blind, BlindPixel, BlindStroke, BlindTile, Block, CellKind, CommandEnvelope, CommandMetadata,
-    DecoratorId, EntityId, EntityMove, GridAnchor, GridPoint, GridSize, LevelCommand,
-    PlaceableEntity, Shape,
+    Blind, BlindPixel, BlindStroke, BlindTile, Block, CellKind, CollectCapacity, CollectLayer,
+    CommandEnvelope, CommandMetadata, DecoratorId, DistributionLayerSelection,
+    DistributionPoolSelection, DistributionRequest, EntityId, EntityMove, GridAnchor, GridPoint,
+    GridSize, LevelCommand, PlaceableEntity, PlaceableEntityKind, PoolBoundary,
+    PoolDistributionGroup, Shape,
 };
 use oreak_protocol::{
     ApplyCommandRequest, ApplyCommandResult, HealthResponse, HealthStatus, LevelHistoryRequest,
@@ -758,6 +760,60 @@ async fn level_configuration_creation_update_validation_and_authorization() {
 }
 
 #[tokio::test]
+async fn project_and_level_deletion_are_audited_and_idempotently_missing() {
+    let router = build_application().into_router();
+    let (cookie, target, user) =
+        create_project_level(&router, "delete-resources@example.com").await;
+    let project_id = target.project_id.to_string();
+    let level_id = target.level_id.to_string();
+    let level_uri = format!("/api/projects/{project_id}/levels/{level_id}");
+
+    let deleted_level = api_request(&router, Method::DELETE, &level_uri, None, Some(&cookie)).await;
+    assert_eq!(deleted_level.status(), StatusCode::NO_CONTENT);
+    let missing_level = api_request(&router, Method::DELETE, &level_uri, None, Some(&cookie)).await;
+    assert_eq!(missing_level.status(), StatusCode::NOT_FOUND);
+    let project_audit = api_request(
+        &router,
+        Method::GET,
+        &format!("/api/projects/{project_id}/audit"),
+        None,
+        Some(&cookie),
+    )
+    .await;
+    assert!(
+        json_body(project_audit).await["audit"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["action"]["LevelDeleted"]["level_id"] == level_id)
+    );
+
+    let project_uri = format!("/api/projects/{project_id}");
+    let deleted_project =
+        api_request(&router, Method::DELETE, &project_uri, None, Some(&cookie)).await;
+    assert_eq!(deleted_project.status(), StatusCode::NO_CONTENT);
+    let missing_project =
+        api_request(&router, Method::DELETE, &project_uri, None, Some(&cookie)).await;
+    assert_eq!(missing_project.status(), StatusCode::NOT_FOUND);
+    let workspace_id = user["personal_workspace_id"].as_str().unwrap();
+    let workspace_audit = api_request(
+        &router,
+        Method::GET,
+        &format!("/api/workspaces/{workspace_id}/audit"),
+        None,
+        Some(&cookie),
+    )
+    .await;
+    assert!(
+        json_body(workspace_audit).await["audit"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["action"]["ProjectUnregistered"]["project_id"] == project_id)
+    );
+}
+
+#[tokio::test]
 async fn project_catalog_invitations_configuration_and_roles_are_authorized() {
     let router = build_application().into_router();
     let (owner_cookie, owner) = register(&router, "catalog-owner@example.com").await;
@@ -942,6 +998,28 @@ async fn project_shape_catalog_supports_validated_editor_crud() {
     let (outsider_cookie, _) = register(&router, "shape-outsider@example.com").await;
     let catalog_uri = format!("/api/projects/{}/shapes", target.project_id);
 
+    let defaults = api_request(
+        &router,
+        Method::GET,
+        &catalog_uri,
+        None,
+        Some(&owner_cookie),
+    )
+    .await;
+    assert_eq!(defaults.status(), StatusCode::OK);
+    let defaults = json_body(defaults).await;
+    let defaults = defaults["shapes"].as_array().unwrap();
+    assert_eq!(defaults.len(), 9);
+    for height in 1..=3 {
+        for width in 1..=3 {
+            assert!(defaults.iter().any(|shape| {
+                shape["shape"]["width"] == width
+                    && shape["shape"]["height"] == height
+                    && shape["shape"]["occupied_mask"] == (1_u64 << (width * height)) - 1
+            }));
+        }
+    }
+
     let created = api_request(
         &router,
         Method::POST,
@@ -969,7 +1047,14 @@ async fn project_shape_catalog_supports_validated_editor_crud() {
     )
     .await;
     assert_eq!(listed.status(), StatusCode::OK);
-    assert_eq!(json_body(listed).await["shapes"][0]["id"], shape_id);
+    let listed = json_body(listed).await;
+    assert!(
+        listed["shapes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|shape| shape["id"] == shape_id)
+    );
 
     let denied = api_request(
         &router,
@@ -1041,11 +1126,9 @@ async fn project_shape_catalog_supports_validated_editor_crud() {
         Some(&owner_cookie),
     )
     .await;
-    assert!(
-        json_body(listed).await["shapes"]
-            .as_array()
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        json_body(listed).await["shapes"].as_array().unwrap().len(),
+        9
     );
 }
 
@@ -1336,6 +1419,719 @@ async fn project_image_catalog_enforces_template_quota() {
 }
 
 #[tokio::test]
+async fn prepared_image_applies_atomically_through_authorized_rpc() {
+    use oreak_core::{
+        DitherMode, ImagePlacement, ImageSampling, ImageTransparency, IndexedImage, PaletteSettings,
+    };
+    use oreak_protocol::ApplyImageRequest;
+
+    let server = TestServer::start().await;
+    let (cookie, target, user) =
+        create_project_level(&server.router, "image-apply@example.com").await;
+    let client = server.client(Some(&cookie)).await;
+    let settings = PaletteSettings {
+        enabled_colors: (1..=10).collect(),
+        dithering: DitherMode::None,
+        alpha_threshold: 1,
+        background: None,
+        mappings: vec![],
+    };
+    // One continuous two-pixel source: left red, right yellow.
+    let mut png = Vec::new();
+    PngEncoder::new(&mut png)
+        .write_image(
+            &[255, 139, 104, 255, 255, 209, 90, 255],
+            2,
+            1,
+            ExtendedColorType::Rgba8,
+        )
+        .unwrap();
+    let uploaded = binary_request(
+        &server.router,
+        Method::POST,
+        &format!("/api/projects/{}/images?name=two-colors", target.project_id),
+        "image/png",
+        png,
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(uploaded.status(), StatusCode::CREATED);
+    let source = json_body(uploaded).await;
+    let prepared_response = api_request(
+        &server.router,
+        Method::POST,
+        &format!(
+            "/api/projects/{}/images/{}/prepare",
+            target.project_id,
+            source["id"].as_str().unwrap()
+        ),
+        Some(serde_json::json!({"name":"two-colors prepared", "settings":settings})),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(prepared_response.status(), StatusCode::CREATED);
+    let prepared = json_body(prepared_response).await;
+    let prepared_id = prepared["entry"]["id"].as_str().unwrap().to_owned();
+    let indexed: IndexedImage = serde_json::from_value(prepared["image"].clone()).unwrap();
+    assert_eq!(indexed.pixels, vec![1, 2]);
+    let shape = Shape::new(1, 1, 1).unwrap();
+    let pools: Vec<_> = (0..2)
+        .map(|x| {
+            PlaceableEntity::blind(
+                format!("image-pool-{x}"),
+                GridPoint::new(x, 0),
+                shape,
+                Blind::new(2, vec![BlindTile::empty(2).unwrap()]).unwrap(),
+            )
+            .unwrap()
+        })
+        .collect();
+    client
+        .apply_command(ApplyCommandRequest {
+            target: target.clone(),
+            command: CommandEnvelope::new(
+                CommandMetadata::new("image-place-pools", "spoof", 1),
+                LevelCommand::PlaceEntities {
+                    entities: pools.clone(),
+                },
+            ),
+        })
+        .await
+        .unwrap();
+    let placement = ImagePlacement {
+        x: 0.0,
+        y: 0.0,
+        width: 2.0,
+        height: 1.0,
+        sampling: ImageSampling::Nearest,
+        pixelation: 1,
+        resolution: None,
+        transparency: ImageTransparency::Preserve,
+    };
+    let request = ApplyImageRequest {
+        target: target.clone(),
+        metadata: CommandMetadata::new("image-apply", "spoof", 1),
+        prepared_image_id: prepared_id.clone(),
+        placement: placement.clone(),
+        targets: pools.clone(),
+    };
+    let anonymous = server.client(None).await;
+    assert!(anonymous.apply_image(request.clone()).await.is_err());
+    // No bypass through the ordinary command API, even with a valid pixel buffer.
+    assert!(
+        client
+            .apply_command(ApplyCommandRequest {
+                target: target.clone(),
+                command: CommandEnvelope::new(
+                    CommandMetadata::new("image-direct", "spoof", 1),
+                    LevelCommand::ApplyImageToPools {
+                        image: indexed,
+                        settings: settings.clone(),
+                        placement: placement.clone(),
+                        targets: pools.clone()
+                    },
+                ),
+            })
+            .await
+            .is_err()
+    );
+    let mut missing = request.clone();
+    missing.prepared_image_id = "missing-prepared-image".into();
+    assert!(client.apply_image(missing).await.is_err());
+    let applied = client.apply_image(request.clone()).await.unwrap();
+    assert_eq!(applied.server_sequence, 2);
+    let ApplyCommandResult::Applied { event } = applied.result else {
+        panic!("expected image event")
+    };
+    assert_eq!(event.metadata.actor.as_str(), user["id"].as_str().unwrap());
+    assert_eq!(event.changes.len(), 2);
+    let snapshot = client.level_snapshot(target.clone()).await.unwrap();
+    for (index, pool) in pools.iter().enumerate() {
+        let entity = snapshot.snapshot.entity(pool.id()).unwrap();
+        let blind = entity.as_blind().unwrap();
+        for y in 0..2 {
+            for x in 0..2 {
+                assert_eq!(
+                    blind.color_at(shape, BlindPixel::new(x, y)),
+                    Some(index as u8 + 1)
+                );
+            }
+        }
+    }
+    // A stale selection snapshot must reject the entire command, not partially overwrite.
+    let mut stale = request;
+    stale.metadata = CommandMetadata::new("image-stale", "spoof", 1);
+    assert!(client.apply_image(stale).await.is_err());
+    assert_eq!(
+        client
+            .level_snapshot(target.clone())
+            .await
+            .unwrap()
+            .server_sequence,
+        2
+    );
+    client
+        .undo_latest(UndoLatestRequest {
+            target: target.clone(),
+            metadata: CommandMetadata::new("image-undo", "spoof", 1),
+        })
+        .await
+        .unwrap();
+    let restored = client.level_snapshot(target).await.unwrap();
+    assert_eq!(restored.server_sequence, 3);
+    for pool in pools {
+        assert_eq!(restored.snapshot.entity(pool.id()), Some(&pool));
+    }
+}
+
+fn distribution_entities(boundary: PoolBoundary) -> Vec<PlaceableEntity> {
+    let shape = Shape::new(1, 1, 1).unwrap();
+    vec![
+        PlaceableEntity::blind(
+            "distribution-pool",
+            GridPoint::new(0, 0),
+            shape,
+            Blind::new(8, vec![BlindTile::from_colors(8, vec![1; 64]).unwrap()])
+                .unwrap()
+                .with_boundary(boundary)
+                .unwrap(),
+        )
+        .unwrap(),
+        PlaceableEntity::block(
+            "distribution-a",
+            GridPoint::new(1, 0),
+            shape,
+            Block::new(vec![
+                CollectLayer::new(1, Some(3), CollectCapacity::Finite(4), true),
+                CollectLayer::new(1, Some(2), CollectCapacity::Finite(91), false),
+            ]),
+        )
+        .unwrap(),
+        PlaceableEntity::block(
+            "distribution-b",
+            GridPoint::new(2, 0),
+            shape,
+            Block::new(vec![CollectLayer::new(
+                1,
+                None,
+                CollectCapacity::Unlimited,
+                false,
+            )]),
+        )
+        .unwrap(),
+    ]
+}
+
+fn distribution_layers(entity: &PlaceableEntity) -> &[CollectLayer] {
+    let PlaceableEntityKind::Block(block) = entity.kind() else {
+        panic!("expected a Block");
+    };
+    block.collect_layers()
+}
+
+fn distribution_command(expected_entities: Vec<PlaceableEntity>) -> LevelCommand {
+    LevelCommand::ApplyDistribution {
+        request: DistributionRequest {
+            pools: vec![DistributionPoolSelection {
+                entity_id: "distribution-pool".into(),
+                group_ids: vec![0],
+            }],
+            // Deliberately not entity/layer order; locked weight must be ignored.
+            layers: vec![
+                DistributionLayerSelection {
+                    entity_id: "distribution-b".into(),
+                    layer_index: 0,
+                    weight: 3,
+                },
+                DistributionLayerSelection {
+                    entity_id: "distribution-a".into(),
+                    layer_index: 1,
+                    weight: 1,
+                },
+                DistributionLayerSelection {
+                    entity_id: "distribution-a".into(),
+                    layer_index: 0,
+                    weight: 999,
+                },
+            ],
+        },
+        expected_entities,
+    }
+}
+
+fn distribution_rpc_request(
+    target: &ProjectLevelTarget,
+    id: &str,
+    command: LevelCommand,
+) -> ApplyCommandRequest {
+    ApplyCommandRequest {
+        target: target.clone(),
+        command: CommandEnvelope::new(CommandMetadata::new(id, "spoofed", 1), command),
+    }
+}
+
+fn assert_rpc_error_code(error: ClientError, code: RpcErrorCode) -> RpcErrorData {
+    let ClientError::Call(error) = error else {
+        panic!("expected a JSON-RPC call error");
+    };
+    assert_eq!(error.code(), code.json_rpc_code());
+    let data: RpcErrorData = serde_json::from_str(error.data().unwrap().get()).unwrap();
+    assert_eq!(data.code, code);
+    data
+}
+
+#[tokio::test]
+async fn distribution_rpc_counts_weights_atomically_and_undo_restores_capacities() {
+    for (boundary, expected_capacities) in [
+        // At ppc=8 the shared default padding/radius is 1: 6*6 playable pixels.
+        (PoolBoundary::default(), [4, 8, 24]),
+        (
+            PoolBoundary {
+                padding_pixels: Some(0),
+                corner_radius_pixels: Some(0),
+            },
+            [4, 15, 45],
+        ),
+    ] {
+        let server = TestServer::start().await;
+        let (cookie, target, user) =
+            create_project_level(&server.router, "distribution-apply@example.com").await;
+        let client = server.client(Some(&cookie)).await;
+        let entities = distribution_entities(boundary);
+        client
+            .apply_command(distribution_rpc_request(
+                &target,
+                "distribution-place",
+                LevelCommand::PlaceEntities {
+                    entities: entities.clone(),
+                },
+            ))
+            .await
+            .unwrap();
+        let before = client.level_snapshot(target.clone()).await.unwrap();
+        let mut subscription = client.subscribe_level(target.clone()).await.unwrap();
+        assert!(matches!(
+            subscription.next().await.unwrap().unwrap(),
+            LevelSubscriptionItem::Snapshot { .. }
+        ));
+        let request = distribution_rpc_request(
+            &target,
+            "distribution-apply",
+            distribution_command(entities.clone()),
+        );
+        let applied = client.apply_command(request.clone()).await.unwrap();
+        assert_eq!(applied.server_sequence, 2);
+        let ApplyCommandResult::Applied { event } = applied.result else {
+            panic!("expected one distribution event");
+        };
+        assert_eq!(event.changes.len(), 2);
+        assert_eq!(event.metadata.actor.as_str(), user["id"].as_str().unwrap());
+        assert_ne!(event.metadata.occurred_at_ms, 1);
+        assert!(matches!(
+            event.inverse,
+            LevelCommand::RestoreEntities { .. }
+        ));
+        assert!(matches!(
+            subscription.next().await.unwrap().unwrap(),
+            LevelSubscriptionItem::Event { event } if event.server_sequence == 2
+        ));
+        let after = client.level_snapshot(target.clone()).await.unwrap();
+        assert_eq!(after.snapshot.entity(entities[0].id()), Some(&entities[0]));
+        let capacities: Vec<_> = entities[1..]
+            .iter()
+            .flat_map(|original| distribution_layers(after.snapshot.entity(original.id()).unwrap()))
+            .map(|layer| layer.capacity())
+            .collect();
+        assert_eq!(
+            capacities,
+            expected_capacities.map(CollectCapacity::Finite).to_vec()
+        );
+        // Radius, color and lock state are retained; only unlocked capacities change.
+        for original in &entities[1..] {
+            let actual = after.snapshot.entity(original.id()).unwrap();
+            for (before, after) in distribution_layers(original)
+                .iter()
+                .zip(distribution_layers(actual))
+            {
+                assert_eq!(before.color_index(), after.color_index());
+                assert_eq!(before.radius(), after.radius());
+                assert_eq!(before.is_locked(), after.is_locked());
+            }
+        }
+        let error = client.apply_command(request).await.unwrap_err();
+        let data = assert_rpc_error_code(error, RpcErrorCode::DuplicateCommand);
+        assert_eq!(data.message, RpcErrorCode::DuplicateCommand.message());
+        assert_eq!(client.level_snapshot(target.clone()).await.unwrap(), after);
+        let undo = client
+            .undo_latest(UndoLatestRequest {
+                target: target.clone(),
+                metadata: CommandMetadata::new("distribution-undo", "spoofed", 1),
+            })
+            .await
+            .unwrap();
+        assert_eq!(undo.server_sequence, 3);
+        assert_eq!(undo.event.reverts_sequence, Some(2));
+        assert!(matches!(
+            undo.event.command,
+            LevelCommand::RestoreEntities { .. }
+        ));
+        let restored = client.level_snapshot(target.clone()).await.unwrap();
+        assert_eq!(restored.snapshot, before.snapshot);
+        assert_eq!(restored.level_hash, before.level_hash);
+        assert!(matches!(
+            subscription.next().await.unwrap().unwrap(),
+            LevelSubscriptionItem::Event { event } if event.server_sequence == 3
+        ));
+        assert!(
+            timeout(Duration::from_millis(100), subscription.next())
+                .await
+                .is_err()
+        );
+        let history = client
+            .level_history(LevelHistoryRequest {
+                target,
+                before_sequence: None,
+                limit: 10,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            history
+                .events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![3, 2, 1]
+        );
+    }
+}
+
+#[tokio::test]
+async fn distribution_group_save_stale_guards_and_undo_preserve_exact_entities() {
+    let server = TestServer::start().await;
+    let (cookie, target, _) =
+        create_project_level(&server.router, "distribution-groups@example.com").await;
+    let client = server.client(Some(&cookie)).await;
+    let entities = distribution_entities(PoolBoundary::default());
+    client
+        .apply_command(distribution_rpc_request(
+            &target,
+            "distribution-place",
+            LevelCommand::PlaceEntities {
+                entities: entities.clone(),
+            },
+        ))
+        .await
+        .unwrap();
+    let before = client.level_snapshot(target.clone()).await.unwrap();
+    let groups = vec![PoolDistributionGroup {
+        id: 7,
+        name: "Border selection".into(),
+        pixels: vec![BlindPixel::new(0, 0), BlindPixel::new(7, 7)],
+    }];
+    let group_command = LevelCommand::SetPoolDistributionGroups {
+        entity_id: entities[0].id().clone(),
+        expected: entities[0].clone(),
+        groups: groups.clone(),
+    };
+    let saved = client
+        .apply_command(distribution_rpc_request(
+            &target,
+            "distribution-save",
+            group_command.clone(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(saved.server_sequence, 2);
+    let current = client.level_snapshot(target.clone()).await.unwrap();
+    assert_eq!(
+        current.snapshot.entity(entities[0].id()),
+        Some(&entities[0].with_pool_distribution_groups(groups).unwrap())
+    );
+    let mut subscription = client.subscribe_level(target.clone()).await.unwrap();
+    subscription.next().await.unwrap().unwrap();
+    // Exact source metadata is stale even though only excluded border pixels changed.
+    let stale_source = distribution_command(entities.clone());
+    let mut stale_targets = current.snapshot.entities().to_vec();
+    let index = stale_targets
+        .iter()
+        .position(|entity| entity.id() == entities[1].id())
+        .unwrap();
+    stale_targets[index] = stale_targets[index]
+        .with_block_collect_layers(vec![
+            CollectLayer::new(1, Some(9), CollectCapacity::Finite(4), true),
+            CollectLayer::new(1, Some(2), CollectCapacity::Finite(91), false),
+        ])
+        .unwrap();
+    // Exact target radius differs, while color/capacity and allocation inputs agree.
+    for (id, command, entity_id) in [
+        ("distribution-stale-source", stale_source, entities[0].id()),
+        (
+            "distribution-stale-target",
+            distribution_command(stale_targets),
+            entities[1].id(),
+        ),
+        ("distribution-stale-groups", group_command, entities[0].id()),
+    ] {
+        let error = client
+            .apply_command(distribution_rpc_request(&target, id, command))
+            .await
+            .unwrap_err();
+        let data = assert_rpc_error_code(error, RpcErrorCode::InvalidCommand);
+        let details = serde_json::to_string(&data).unwrap();
+        assert!(details.contains(entity_id.as_str()));
+        assert!(details.contains("changed after the preview"));
+        assert_eq!(
+            client.level_snapshot(target.clone()).await.unwrap(),
+            current
+        );
+    }
+    let history = client
+        .level_history(LevelHistoryRequest {
+            target: target.clone(),
+            before_sequence: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert_eq!(history.events.len(), 2);
+    assert!(
+        timeout(Duration::from_millis(100), subscription.next())
+            .await
+            .is_err()
+    );
+    let undo = client
+        .undo_latest(UndoLatestRequest {
+            target: target.clone(),
+            metadata: CommandMetadata::new("distribution-group-undo", "spoofed", 1),
+        })
+        .await
+        .unwrap();
+    assert_eq!(undo.server_sequence, 3);
+    assert_eq!(undo.event.reverts_sequence, Some(2));
+    assert!(matches!(
+        undo.event.command,
+        LevelCommand::RestoreEntities { .. }
+    ));
+    let restored = client.level_snapshot(target).await.unwrap();
+    assert_eq!(restored.snapshot, before.snapshot);
+    assert_eq!(restored.level_hash, before.level_hash);
+}
+
+#[tokio::test]
+async fn distribution_payload_budget_rejects_before_commit_or_broadcast() {
+    let server = TestServer::start().await;
+    let (cookie, target, _) =
+        create_project_level(&server.router, "distribution-budget@example.com").await;
+    let client = server.client(Some(&cookie)).await;
+    let mut entities = distribution_entities(PoolBoundary::default());
+    // Ordinary commands can leave a large snapshot. Each placement response fits
+    // the transport limit, but distribution/group edits must check the full snapshot.
+    for entity in &mut entities[1..] {
+        let mut layers = distribution_layers(entity).to_vec();
+        layers.resize(
+            40_000,
+            CollectLayer::new(1, None, CollectCapacity::Finite(91), false),
+        );
+        *entity = entity.with_block_collect_layers(layers).unwrap();
+    }
+    let extra = PlaceableEntity::block(
+        "distribution-unselected",
+        GridPoint::new(3, 0),
+        Shape::new(1, 1, 1).unwrap(),
+        Block::new(vec![
+            CollectLayer::new(
+                1,
+                None,
+                CollectCapacity::Finite(91),
+                false
+            );
+            40_000
+        ]),
+    )
+    .unwrap();
+    let saved_groups = vec![PoolDistributionGroup {
+        id: 2,
+        name: "Existing border mask".into(),
+        pixels: vec![BlindPixel::new(0, 0)],
+    }];
+    for (index, entity) in entities.iter().chain(std::iter::once(&extra)).enumerate() {
+        client
+            .apply_command(distribution_rpc_request(
+                &target,
+                &format!("distribution-large-place-{index}"),
+                LevelCommand::PlaceEntity {
+                    entity: entity.clone(),
+                },
+            ))
+            .await
+            .unwrap();
+        if index == 0 {
+            client
+                .apply_command(distribution_rpc_request(
+                    &target,
+                    "distribution-early-group-save",
+                    LevelCommand::SetPoolDistributionGroups {
+                        entity_id: entity.id().clone(),
+                        expected: entity.clone(),
+                        groups: saved_groups.clone(),
+                    },
+                ))
+                .await
+                .unwrap();
+        }
+    }
+    entities[0] = entities[0]
+        .with_pool_distribution_groups(saved_groups)
+        .unwrap();
+    client
+        .apply_command(distribution_rpc_request(
+            &target,
+            "distribution-later-small-command",
+            LevelCommand::SetCell {
+                point: GridPoint::new(7, 7),
+                kind: CellKind::Wall,
+            },
+        ))
+        .await
+        .unwrap();
+    let before = client.level_snapshot(target.clone()).await.unwrap();
+    assert!(serde_json::to_vec(&before).unwrap().len() > 8 * 1024 * 1024);
+    let mut subscription = client.subscribe_level(target.clone()).await.unwrap();
+    subscription.next().await.unwrap().unwrap();
+    for (id, command) in [
+        (
+            "distribution-large-apply",
+            distribution_command(entities.clone()),
+        ),
+        (
+            "distribution-large-groups",
+            LevelCommand::SetPoolDistributionGroups {
+                entity_id: entities[0].id().clone(),
+                expected: entities[0].clone(),
+                groups: vec![PoolDistributionGroup {
+                    id: 1,
+                    name: "Mask".into(),
+                    pixels: vec![BlindPixel::new(1, 1)],
+                }],
+            },
+        ),
+    ] {
+        let error = client
+            .apply_command(distribution_rpc_request(&target, id, command))
+            .await
+            .unwrap_err();
+        let data = assert_rpc_error_code(error, RpcErrorCode::InvalidCommand);
+        let details = serde_json::to_string(&data).unwrap();
+        assert!(details.contains("invalid distribution"));
+        assert!(details.contains("8 MiB"));
+        assert_eq!(client.level_snapshot(target.clone()).await.unwrap(), before);
+    }
+    // An active group edit also enables the conservative bounded-history undo
+    // guard. Even undoing the later tiny cell edit cannot publish a huge snapshot.
+    let error = client
+        .undo_latest(UndoLatestRequest {
+            target: target.clone(),
+            metadata: CommandMetadata::new("distribution-large-undo", "spoofed", 1),
+        })
+        .await
+        .unwrap_err();
+    let data = assert_rpc_error_code(error, RpcErrorCode::InvalidCommand);
+    assert!(serde_json::to_string(&data).unwrap().contains("8 MiB"));
+    assert_eq!(client.level_snapshot(target.clone()).await.unwrap(), before);
+    let history = client
+        .level_history(LevelHistoryRequest {
+            target,
+            before_sequence: None,
+            limit: 10,
+        })
+        .await
+        .unwrap();
+    assert_eq!(history.events[0].sequence, 6);
+    assert!(
+        timeout(Duration::from_millis(100), subscription.next())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn distribution_commands_require_existing_edit_permission() {
+    let server = TestServer::start().await;
+    let (cookie, target, _) =
+        create_project_level(&server.router, "distribution-owner@example.com").await;
+    let (viewer_cookie, _) = register(&server.router, "distribution-viewer@example.com").await;
+    let invitation = api_request(
+        &server.router,
+        Method::POST,
+        &format!("/api/projects/{}/invitations", target.project_id),
+        Some(serde_json::json!({"email": "distribution-viewer@example.com", "roles": ["viewer"]})),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(invitation.status(), StatusCode::CREATED);
+    let invitation = json_body(invitation).await;
+    let accepted = api_request(
+        &server.router,
+        Method::POST,
+        &format!(
+            "/api/projects/{}/invitations/{}/accept",
+            target.project_id,
+            invitation["id"].as_str().unwrap()
+        ),
+        None,
+        Some(&viewer_cookie),
+    )
+    .await;
+    assert_eq!(accepted.status(), StatusCode::OK);
+    let owner = server.client(Some(&cookie)).await;
+    let entities = distribution_entities(PoolBoundary::default());
+    owner
+        .apply_command(distribution_rpc_request(
+            &target,
+            "distribution-place",
+            LevelCommand::PlaceEntities {
+                entities: entities.clone(),
+            },
+        ))
+        .await
+        .unwrap();
+    let before = owner.level_snapshot(target.clone()).await.unwrap();
+    for (cookie, error_code) in [
+        (Some(viewer_cookie.as_str()), RpcErrorCode::PermissionDenied),
+        (None, RpcErrorCode::AuthenticationRequired),
+    ] {
+        let client = server.client(cookie).await;
+        if cookie.is_some() {
+            assert_eq!(client.level_snapshot(target.clone()).await.unwrap(), before);
+        }
+        for command in [
+            distribution_command(entities.clone()),
+            LevelCommand::SetPoolDistributionGroups {
+                entity_id: entities[0].id().clone(),
+                expected: entities[0].clone(),
+                groups: vec![PoolDistributionGroup {
+                    id: 1,
+                    name: "Selected".into(),
+                    pixels: vec![BlindPixel::new(1, 1)],
+                }],
+            },
+        ] {
+            let error = client
+                .apply_command(distribution_rpc_request(
+                    &target,
+                    "distribution-denied",
+                    command,
+                ))
+                .await
+                .unwrap_err();
+            assert_rpc_error_code(error, error_code);
+        }
+    }
+    assert_eq!(owner.level_snapshot(target).await.unwrap(), before);
+}
+
+#[tokio::test]
 async fn json_rpc_health_accepts_http() {
     let application = build_application();
     let _rpc_handle = application.rpc_handle();
@@ -1552,7 +2348,7 @@ async fn blind_brush_commands_use_the_authoritative_core_path() {
         })
         .await
         .unwrap();
-    let no_change = client
+    let recolored = client
         .apply_command(ApplyCommandRequest {
             target: target.clone(),
             command: CommandEnvelope::new(
@@ -1566,15 +2362,18 @@ async fn blind_brush_commands_use_the_authoritative_core_path() {
         })
         .await
         .unwrap();
-    assert_eq!(no_change.result, ApplyCommandResult::NoChange);
-    assert_eq!(no_change.server_sequence, 4);
+    assert!(matches!(
+        recolored.result,
+        ApplyCommandResult::Applied { .. }
+    ));
+    assert_eq!(recolored.server_sequence, 5);
 
     let snapshot = client.level_snapshot(target).await.unwrap();
     let entity = snapshot.snapshot.entity(&entity_id).unwrap();
     let blind = entity.as_blind().unwrap();
     assert_eq!(
         blind.color_at(entity.shape(), BlindPixel::new(0, 0)),
-        Some(4)
+        Some(9)
     );
     assert_eq!(
         blind.color_at(entity.shape(), BlindPixel::new(1, 0)),

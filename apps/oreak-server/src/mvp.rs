@@ -12,8 +12,9 @@ use argon2::{
     password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
 };
 use image::{
-    ImageFormat, ImageReader, Limits,
-    codecs::{png::PngDecoder, webp::WebPDecoder},
+    ExtendedColorType, ImageEncoder, ImageFormat, ImageReader, Limits, RgbaImage,
+    codecs::{png::PngDecoder, png::PngEncoder, webp::WebPDecoder},
+    imageops::FilterType,
 };
 
 use axum::{
@@ -27,7 +28,9 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post, put},
 };
-use oreak_core::{MAX_BLOCK_SHAPE_AXIS, Shape};
+use oreak_core::{
+    IndexedImage, MAX_BLOCK_SHAPE_AXIS, PALETTE_RGB, PaletteSettings, Shape, convert_rgba,
+};
 use oreak_plugin_api::MANIFEST_FORMAT_VERSION;
 use oreak_project::{
     ApprovalPolicy, AuditAction, AuditContext, AuditEvent, AuditEventId, Capability, InvitationId,
@@ -36,7 +39,7 @@ use oreak_project::{
     WorkspaceError, WorkspaceId, WorkspaceKind, WorkspaceRole,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore};
 
 const API_BODY_LIMIT: usize = 16 * 1024;
 const MAX_IMAGE_UPLOAD_BYTES: usize = 512 * 1024;
@@ -45,6 +48,8 @@ const MAX_IMAGE_PIXELS: u64 = 1_024 * 1_024;
 const MAX_IMAGE_DECODE_BYTES: u64 = MAX_IMAGE_PIXELS * 4;
 const MAX_PROJECT_IMAGE_CATALOG_ENTRIES: usize = 64;
 const MAX_PROJECT_IMAGE_CATALOG_BYTES: usize = 8 * 1024 * 1024;
+const MAX_PROJECT_PREPARED_IMAGES: usize = 64;
+const MAX_PROJECT_PREPARED_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 const AUTH_RATE_LIMIT: u32 = 5;
 const AUTH_RATE_WINDOW: Duration = Duration::from_secs(60);
 const MAX_RATE_LIMIT_KEYS: usize = 1_024;
@@ -61,6 +66,7 @@ pub(crate) struct MvpState {
     store: Arc<RwLock<MemoryStore>>,
     auth_rate_limiter: Arc<Mutex<RateLimiter>>,
     secure_cookies: bool,
+    image_workers: Arc<Semaphore>,
 }
 
 impl MvpState {
@@ -73,6 +79,7 @@ impl MvpState {
                 MAX_RATE_LIMIT_KEYS,
             ))),
             secure_cookies,
+            image_workers: Arc::new(Semaphore::new(2)),
         }
     }
 
@@ -126,6 +133,28 @@ impl MvpState {
             return Err(RpcAccessError::PermissionDenied);
         }
         Ok(user_id)
+    }
+
+    /// Resolve an immutable, project-scoped asset only after the caller authorizes RPC Edit access.
+    pub(crate) async fn load_prepared_image(
+        &self,
+        project_id: &str,
+        id: &str,
+    ) -> Result<(IndexedImage, PaletteSettings), String> {
+        let project_id =
+            ProjectId::new(project_id).map_err(|_| "prepared image not found".to_owned())?;
+        let store = self.store.read().await;
+        let prepared = store
+            .projects
+            .get(&project_id)
+            .and_then(|record| {
+                record
+                    .prepared_images
+                    .iter()
+                    .find(|image| image.entry.id == id)
+            })
+            .ok_or_else(|| "prepared image not found".to_owned())?;
+        Ok((prepared.image.clone(), prepared.entry.settings.clone()))
     }
 
     async fn authenticate_token(&self, token: &str) -> Result<UserId, ApiError> {
@@ -194,6 +223,7 @@ struct ProjectRecord {
     project: Project,
     shape_catalog: Vec<ShapeCatalogRecord>,
     image_catalog: Vec<ImageCatalogRecord>,
+    prepared_images: Vec<PreparedImage>,
 }
 
 struct ShapeCatalogRecord {
@@ -204,6 +234,27 @@ struct ShapeCatalogRecord {
     created_at_ms: i64,
     updated_by: UserId,
     updated_at_ms: i64,
+}
+
+fn default_shape_catalog(user_id: &UserId, occurred_at_ms: i64) -> Vec<ShapeCatalogRecord> {
+    let mut shapes = Vec::with_capacity(9);
+    for height in 1_u8..=3 {
+        for width in 1_u8..=3 {
+            let area = u32::from(width) * u32::from(height);
+            let occupied_mask = (1_u64 << area) - 1;
+            shapes.push(ShapeCatalogRecord {
+                id: format!("shape-default-{width}x{height}"),
+                name: format!("{width} x {height} Rectangle"),
+                shape: Shape::new(width, height, occupied_mask)
+                    .expect("the default rectangle shapes are valid"),
+                created_by: user_id.clone(),
+                created_at_ms: occurred_at_ms,
+                updated_by: user_id.clone(),
+                updated_at_ms: occurred_at_ms,
+            });
+        }
+    }
+    shapes
 }
 
 struct ImageCatalogRecord {
@@ -338,6 +389,7 @@ impl ApiError {
             | ProjectError::MemberNotFound(_)
             | ProjectError::InvitationNotFound(_) => StatusCode::NOT_FOUND,
             ProjectError::DuplicateLevel(_)
+            | ProjectError::LevelHasHistory(_)
             | ProjectError::DuplicateReleaseChannel(_)
             | ProjectError::DuplicateInvitation(_)
             | ProjectError::PendingInvitationExists(_)
@@ -353,6 +405,7 @@ impl ApiError {
                 StatusCode::FORBIDDEN
             }
             WorkspaceError::DuplicateProject(_) => StatusCode::CONFLICT,
+            WorkspaceError::ProjectNotFound(_) => StatusCode::NOT_FOUND,
             _ => StatusCode::BAD_REQUEST,
         };
         Self::new(status, error.to_string())
@@ -610,6 +663,44 @@ impl From<&ImageCatalogRecord> for ImageCatalogEntry {
     }
 }
 
+#[derive(Clone, Serialize)]
+struct PreparedImageEntry {
+    id: String,
+    source_image_id: String,
+    name: String,
+    settings: PaletteSettings,
+    width: u32,
+    height: u32,
+    palette_version: u32,
+    created_by: UserId,
+    created_at_ms: i64,
+}
+
+#[derive(Clone, Serialize)]
+struct PreparedImage {
+    entry: PreparedImageEntry,
+    image: IndexedImage,
+}
+
+#[derive(Serialize)]
+struct PreparedImageList {
+    images: Vec<PreparedImageEntry>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PrepareImageRequest {
+    name: String,
+    settings: PaletteSettings,
+}
+
+#[derive(Serialize)]
+struct ImagePixels {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
 #[derive(Serialize)]
 struct AuditList {
     audit: Vec<AuditSummary>,
@@ -668,6 +759,10 @@ pub(crate) fn router(state: MvpState) -> Router {
         )
         .route("/api/projects", get(list_projects).post(create_project))
         .route(
+            "/api/projects/{project_id}",
+            axum::routing::delete(delete_project),
+        )
+        .route(
             "/api/projects/{project_id}/members",
             get(list_project_members),
         )
@@ -692,6 +787,10 @@ pub(crate) fn router(state: MvpState) -> Router {
             get(list_levels).post(create_level),
         )
         .route(
+            "/api/projects/{project_id}/levels/{level_id}",
+            axum::routing::delete(delete_level),
+        )
+        .route(
             "/api/projects/{project_id}/levels/{level_id}/configuration",
             get(get_level_configuration).put(update_level_configuration),
         )
@@ -712,6 +811,26 @@ pub(crate) fn router(state: MvpState) -> Router {
         .route(
             "/api/projects/{project_id}/images/{image_id}/content",
             get(download_image_catalog_entry),
+        )
+        .route(
+            "/api/projects/{project_id}/images/{image_id}/pixels",
+            get(get_image_pixels),
+        )
+        .route(
+            "/api/projects/{project_id}/images/{image_id}/prepare",
+            post(prepare_image),
+        )
+        .route(
+            "/api/projects/{project_id}/prepared-images",
+            get(list_prepared_images),
+        )
+        .route(
+            "/api/projects/{project_id}/prepared-images/{image_id}",
+            get(get_prepared_image),
+        )
+        .route(
+            "/api/projects/{project_id}/prepared-images/{image_id}/thumbnail",
+            get(get_prepared_image_thumbnail),
         )
         .route("/api/projects/{project_id}/audit", get(list_project_audit))
         .route(
@@ -1036,11 +1155,13 @@ async fn create_project(
         audit_context(&user_id)?,
     )
     .map_err(ApiError::project)?;
+    let occurred_at_ms = now_timestamp()?.as_i64();
     let record = ProjectRecord {
         name,
         project,
-        shape_catalog: Vec::new(),
+        shape_catalog: default_shape_catalog(&user_id, occurred_at_ms),
         image_catalog: Vec::new(),
+        prepared_images: Vec::new(),
     };
 
     let mut store = state.store.write().await;
@@ -1075,6 +1196,35 @@ async fn create_project(
     )
     .ok_or_else(ApiError::internal)?;
     Ok((StatusCode::CREATED, Json(summary)))
+}
+
+async fn delete_project(
+    State(state): State<MvpState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let user_id = authenticate(&state, &headers).await?;
+    let project_id = parse_project_id(project_id)?;
+    let mut store = state.store.write().await;
+    let workspace_id = store
+        .projects
+        .get(&project_id)
+        .ok_or_else(|| ApiError::not_found("project"))?
+        .project
+        .workspace_id()
+        .clone();
+    store
+        .workspaces
+        .get_mut(&workspace_id)
+        .ok_or_else(ApiError::internal)?
+        .workspace
+        .unregister_project(&project_id, audit_context(&user_id)?)
+        .map_err(ApiError::workspace)?;
+    store
+        .projects
+        .remove(&project_id)
+        .expect("project existed while holding the store write lock");
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn list_project_members(
@@ -1318,6 +1468,26 @@ async fn create_level(
             revision_count: 0,
         }),
     ))
+}
+
+async fn delete_level(
+    State(state): State<MvpState>,
+    headers: HeaderMap,
+    Path((project_id, level_id)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let user_id = authenticate(&state, &headers).await?;
+    let project_id = parse_project_id(project_id)?;
+    let level_id = parse_level_id(level_id)?;
+    let mut store = state.store.write().await;
+    authorized_project(&store, &project_id, &user_id, ProjectAccess::EditLevel)?;
+    store
+        .projects
+        .get_mut(&project_id)
+        .expect("project was authorized")
+        .project
+        .delete_level(&level_id, audit_context(&user_id)?)
+        .map_err(ApiError::project)?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn get_level_configuration(
@@ -1577,6 +1747,297 @@ async fn download_image_catalog_entry(
     Ok(response)
 }
 
+// These JSON assets are authorization-scoped just like the original byte download.
+fn private_json<T: Serialize>(value: T) -> Response {
+    let mut response = Json(value).into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    response
+}
+
+async fn list_prepared_images(
+    State(state): State<MvpState>,
+    headers: HeaderMap,
+    Path(project_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let user_id = authenticate(&state, &headers).await?;
+    let project_id = parse_project_id(project_id)?;
+    let images = {
+        let store = state.store.read().await;
+        let record = authorized_project(&store, &project_id, &user_id, ProjectAccess::View)?;
+        record
+            .prepared_images
+            .iter()
+            .map(|image| image.entry.clone())
+            .collect()
+    };
+    Ok(private_json(PreparedImageList { images }))
+}
+
+async fn get_prepared_image(
+    State(state): State<MvpState>,
+    headers: HeaderMap,
+    Path((project_id, image_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let user_id = authenticate(&state, &headers).await?;
+    let project_id = parse_project_id(project_id)?;
+    let image = {
+        let store = state.store.read().await;
+        let record = authorized_project(&store, &project_id, &user_id, ProjectAccess::View)?;
+        record
+            .prepared_images
+            .iter()
+            .find(|image| image.entry.id == image_id)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("prepared image"))?
+    };
+    Ok(private_json(image))
+}
+
+fn render_prepared_image_thumbnail(
+    image: IndexedImage,
+    settings: PaletteSettings,
+) -> Result<(Vec<u8>, String), ApiError> {
+    image.validate().map_err(|_| ApiError::internal())?;
+    let mut rgba = Vec::with_capacity(image.pixels.len() * 4);
+    for index in &image.pixels {
+        if *index == 0 {
+            rgba.extend_from_slice(&[0, 0, 0, 0]);
+        } else {
+            let [red, green, blue] = PALETTE_RGB
+                .get(usize::from(*index - 1))
+                .copied()
+                .ok_or_else(ApiError::internal)?;
+            rgba.extend_from_slice(&[red, green, blue, 255]);
+        }
+    }
+    let rgba =
+        RgbaImage::from_raw(image.width, image.height, rgba).ok_or_else(ApiError::internal)?;
+    let max_axis = image.width.max(image.height);
+    let thumbnail = if max_axis > 256 {
+        let width = (u64::from(image.width) * 256 / u64::from(max_axis)).max(1) as u32;
+        let height = (u64::from(image.height) * 256 / u64::from(max_axis)).max(1) as u32;
+        image::imageops::resize(&rgba, width, height, FilterType::Nearest)
+    } else {
+        rgba
+    };
+
+    let mut png = Vec::new();
+    PngEncoder::new(&mut png)
+        .write_image(
+            thumbnail.as_raw(),
+            thumbnail.width(),
+            thumbnail.height(),
+            ExtendedColorType::Rgba8,
+        )
+        .map_err(|_| ApiError::internal())?;
+
+    let mut etag = blake3::Hasher::new();
+    etag.update(b"oreak-prepared-thumbnail-v1");
+    etag.update(&image.width.to_le_bytes());
+    etag.update(&image.height.to_le_bytes());
+    etag.update(&image.palette_version.to_le_bytes());
+    etag.update(&image.pixels);
+    etag.update(&serde_json::to_vec(&settings).map_err(|_| ApiError::internal())?);
+    Ok((png, format!("\"{}\"", etag.finalize().to_hex())))
+}
+
+async fn get_prepared_image_thumbnail(
+    State(state): State<MvpState>,
+    headers: HeaderMap,
+    Path((project_id, image_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let user_id = authenticate(&state, &headers).await?;
+    let project_id = parse_project_id(project_id)?;
+    let (image, settings) = {
+        let store = state.store.read().await;
+        let record = authorized_project(&store, &project_id, &user_id, ProjectAccess::View)?;
+        let prepared = record
+            .prepared_images
+            .iter()
+            .find(|image| image.entry.id == image_id)
+            .ok_or_else(|| ApiError::not_found("prepared image"))?;
+        (prepared.image.clone(), prepared.entry.settings.clone())
+    };
+    let permit = state
+        .image_workers
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| ApiError::internal())?;
+    let (png, etag) = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        render_prepared_image_thumbnail(image, settings)
+    })
+    .await
+    .map_err(|_| ApiError::internal())??;
+    {
+        let store = state.store.read().await;
+        authorized_project(&store, &project_id, &user_id, ProjectAccess::View)?;
+    }
+
+    let mut response = png.into_response();
+    let response_headers = response.headers_mut();
+    response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("image/png"));
+    response_headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    response_headers.insert(CACHE_CONTROL, HeaderValue::from_static("private, no-store"));
+    response_headers.insert(
+        ETAG,
+        HeaderValue::from_str(&etag).map_err(|_| ApiError::internal())?,
+    );
+    Ok(response)
+}
+
+async fn image_source_for_decode(
+    state: &MvpState,
+    project_id: &ProjectId,
+    image_id: &str,
+    user_id: &UserId,
+    access: ProjectAccess,
+) -> Result<(Vec<u8>, OwnedSemaphorePermit), ApiError> {
+    // Bound CPU jobs and their decoded buffers, without waiting while holding the store lock.
+    let permit = state
+        .image_workers
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| ApiError::internal())?;
+    let store = state.store.read().await;
+    let record = authorized_project(&store, project_id, user_id, access)?;
+    let source = record
+        .image_catalog
+        .iter()
+        .find(|image| image.id == image_id)
+        .ok_or_else(|| ApiError::not_found("image"))?;
+    Ok((source.content.clone(), permit))
+}
+
+async fn get_image_pixels(
+    State(state): State<MvpState>,
+    headers: HeaderMap,
+    Path((project_id, image_id)): Path<(String, String)>,
+) -> Result<Response, ApiError> {
+    let user_id = authenticate(&state, &headers).await?;
+    let project_id = parse_project_id(project_id)?;
+    let (content, permit) = image_source_for_decode(
+        &state,
+        &project_id,
+        &image_id,
+        &user_id,
+        ProjectAccess::View,
+    )
+    .await?;
+    let pixels = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let (_, image) = decode_catalog_image(&content)?;
+        // Keep raw decoded orientation/dimensions, matching preparation exactly.
+        Ok::<_, ApiError>(ImagePixels {
+            width: image.width(),
+            height: image.height(),
+            rgba: image.into_rgba8().into_raw(),
+        })
+    })
+    .await
+    .map_err(|_| ApiError::internal())??;
+    {
+        let store = state.store.read().await;
+        authorized_project(&store, &project_id, &user_id, ProjectAccess::View)?;
+    }
+    Ok(private_json(pixels))
+}
+
+fn check_prepared_image_quota(
+    images: &[PreparedImage],
+    incoming_bytes: usize,
+) -> Result<(), ApiError> {
+    if images.len() >= MAX_PROJECT_PREPARED_IMAGES {
+        return Err(ApiError::bad_request(
+            "project prepared image catalog has reached its template limit",
+        ));
+    }
+    let total = images.iter().try_fold(incoming_bytes, |total, image| {
+        total.checked_add(image.image.pixels.len())
+    });
+    if total.is_none_or(|total| total > MAX_PROJECT_PREPARED_IMAGE_BYTES) {
+        return Err(ApiError::bad_request(
+            "project prepared image catalog has reached its storage limit",
+        ));
+    }
+    Ok(())
+}
+
+async fn prepare_image(
+    State(state): State<MvpState>,
+    headers: HeaderMap,
+    Path((project_id, image_id)): Path<(String, String)>,
+    Json(input): Json<PrepareImageRequest>,
+) -> Result<Response, ApiError> {
+    let user_id = authenticate(&state, &headers).await?;
+    let project_id = parse_project_id(project_id)?;
+    let name = validate_name(input.name)?;
+    let (content, permit) = image_source_for_decode(
+        &state,
+        &project_id,
+        &image_id,
+        &user_id,
+        ProjectAccess::EditLevel,
+    )
+    .await?;
+    let settings = input.settings;
+    settings
+        .validate()
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    let (image, settings) = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let (_, decoded) = decode_catalog_image(&content)?;
+        let rgba = decoded.into_rgba8();
+        let image = convert_rgba(rgba.width(), rgba.height(), rgba.as_raw(), &settings)
+            .map_err(|error| ApiError::bad_request(error.to_string()))?;
+        Ok::<_, ApiError>((image, settings))
+    })
+    .await
+    .map_err(|_| ApiError::internal())??;
+    let prepared = PreparedImage {
+        entry: PreparedImageEntry {
+            id: random_identifier("prep")?,
+            source_image_id: image_id,
+            name,
+            settings,
+            width: image.width,
+            height: image.height,
+            palette_version: image.palette_version,
+            created_by: user_id.clone(),
+            created_at_ms: now_timestamp()?.as_i64(),
+        },
+        image,
+    };
+    {
+        let mut store = state.store.write().await;
+        // Recheck authorization and quota atomically after CPU work, including concurrent requests.
+        authorized_project(&store, &project_id, &user_id, ProjectAccess::EditLevel)?;
+        let record = store
+            .projects
+            .get_mut(&project_id)
+            .expect("project was authorized");
+        check_prepared_image_quota(&record.prepared_images, prepared.image.pixels.len())?;
+        if record
+            .prepared_images
+            .iter()
+            .any(|image| image.entry.id == prepared.entry.id)
+        {
+            return Err(ApiError::internal());
+        }
+        record.prepared_images.push(prepared.clone());
+    }
+    let mut response = private_json(prepared);
+    *response.status_mut() = StatusCode::CREATED;
+    Ok(response)
+}
+
 async fn list_project_audit(
     State(state): State<MvpState>,
     headers: HeaderMap,
@@ -1828,6 +2289,11 @@ fn dummy_hash() -> String {
 }
 
 fn validate_catalog_image(content: &[u8]) -> Result<(&'static str, u32, u32), ApiError> {
+    let (media_type, image) = decode_catalog_image(content)?;
+    Ok((media_type, image.width(), image.height()))
+}
+
+fn decode_catalog_image(content: &[u8]) -> Result<(&'static str, image::DynamicImage), ApiError> {
     if content.is_empty() {
         return Err(ApiError::bad_request("image upload cannot be empty"));
     }
@@ -1851,12 +2317,17 @@ fn validate_catalog_image(content: &[u8]) -> Result<(&'static str, u32, u32), Ap
     })?;
     let width = image.width();
     let height = image.height();
-    if u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS {
+    if width == 0
+        || height == 0
+        || width > MAX_IMAGE_AXIS
+        || height > MAX_IMAGE_AXIS
+        || u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS
+    {
         return Err(ApiError::bad_request(
             "image exceeds the decoded pixel limit",
         ));
     }
-    Ok((format.to_mime_type(), width, height))
+    Ok((format.to_mime_type(), image))
 }
 
 fn image_decode_limits() -> Limits {
@@ -2266,6 +2737,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn prepared_image_byte_quota_accepts_boundary_and_rejects_overflow() {
+        let prepared = PreparedImage {
+            entry: PreparedImageEntry {
+                id: "prepared".to_owned(),
+                source_image_id: "source".to_owned(),
+                name: "Prepared".to_owned(),
+                settings: PaletteSettings::default(),
+                width: 1,
+                height: 1,
+                palette_version: 1,
+                created_by: UserId::new("owner").unwrap(),
+                created_at_ms: 0,
+            },
+            image: IndexedImage {
+                width: 1,
+                height: 1,
+                pixels: vec![1],
+                palette_version: 1,
+            },
+        };
+        let images = [prepared];
+        assert!(check_prepared_image_quota(&images, MAX_PROJECT_PREPARED_IMAGE_BYTES - 1).is_ok());
+        assert!(check_prepared_image_quota(&images, MAX_PROJECT_PREPARED_IMAGE_BYTES).is_err());
+        assert!(check_prepared_image_quota(&images, usize::MAX).is_err());
+    }
+
+    #[test]
     fn passwords_are_argon2id_hashes() {
         let hash = hash_password("correct horse battery staple").unwrap();
         assert!(hash.starts_with("$argon2id$v=19$"));
@@ -2338,6 +2836,7 @@ mod tests {
             project,
             shape_catalog: Vec::new(),
             image_catalog: Vec::new(),
+            prepared_images: Vec::new(),
         };
         assert!(has_project_access(
             &store,

@@ -1,7 +1,7 @@
 use oreak_core::{
-    Block, CollectCapacity, CollectLayer, CommandEnvelope, CommandMetadata, EntityId, GridPoint,
-    LevelCommand, LevelError, LevelSnapshot, LevelTimeline, PlaceableEntity, PlaceableEntityKind,
-    Shape, TimelineError,
+    Block, CollectCapacity, CollectLayer, CommandEnvelope, CommandMetadata, EntityError, EntityId,
+    EntityTransform, GridPoint, LevelCommand, LevelError, LevelSnapshot, LevelTimeline,
+    PlaceableEntity, PlaceableEntityKind, Shape, TimelineError,
 };
 
 fn command(id: &str, command: LevelCommand) -> CommandEnvelope {
@@ -68,10 +68,11 @@ fn transform_entities_validates_the_final_arrangement_and_undoes_together() {
         .apply(command(
             "swap-pair",
             LevelCommand::TransformEntities {
-                entities: vec![
-                    a.moved_to(GridPoint::new(1, 0)),
-                    b.moved_to(GridPoint::new(0, 0)),
+                transforms: vec![
+                    EntityTransform::new("a").moved_to(GridPoint::new(1, 0)),
+                    EntityTransform::new("b").moved_to(GridPoint::new(0, 0)),
                 ],
+                entities: Vec::new(),
             },
         ))
         .unwrap();
@@ -218,6 +219,168 @@ fn batch_capacity_edit_preserves_each_block_otherwise_and_undoes() {
         .unwrap();
     assert_eq!(capacity_of(&timeline, "a"), CollectCapacity::Finite(2));
     assert_eq!(capacity_of(&timeline, "b"), CollectCapacity::Finite(7));
+}
+
+#[test]
+fn semantic_transform_preserves_concurrent_capacity_edits() {
+    let mut timeline = LevelTimeline::new(LevelSnapshot::new(4, 3).unwrap()).unwrap();
+    let entity = PlaceableEntity::block(
+        "a",
+        GridPoint::new(0, 0),
+        Shape::new(2, 1, 0b11).unwrap(),
+        Block::new(vec![CollectLayer::new(
+            1,
+            None,
+            CollectCapacity::Finite(2),
+            false,
+        )]),
+    )
+    .unwrap();
+    timeline
+        .apply(command("place", LevelCommand::PlaceEntity { entity }))
+        .unwrap();
+    timeline
+        .apply(command(
+            "capacity",
+            LevelCommand::SetBlockLayerCapacity {
+                entity_ids: vec![EntityId::from("a")],
+                layer_index: 0,
+                capacity: CollectCapacity::Finite(9),
+            },
+        ))
+        .unwrap();
+
+    timeline
+        .apply(command(
+            "rotate-and-move",
+            LevelCommand::TransformEntities {
+                transforms: vec![
+                    EntityTransform::new("a")
+                        .moved_to(GridPoint::new(1, 0))
+                        .rotated_clockwise(1),
+                ],
+                entities: Vec::new(),
+            },
+        ))
+        .unwrap();
+    let transformed = timeline.snapshot().entity(&EntityId::from("a")).unwrap();
+    assert_eq!(transformed.origin(), GridPoint::new(1, 0));
+    assert_eq!(transformed.shape(), Shape::new(1, 2, 0b11).unwrap());
+    assert_eq!(capacity_of(&timeline, "a"), CollectCapacity::Finite(9));
+}
+
+#[test]
+fn locked_collect_layers_reject_capacity_and_wholesale_changes() {
+    let mut timeline = LevelTimeline::new(LevelSnapshot::new(4, 3).unwrap()).unwrap();
+    let entity = PlaceableEntity::block(
+        "locked",
+        GridPoint::new(0, 0),
+        Shape::new(1, 1, 1).unwrap(),
+        Block::new(vec![CollectLayer::new(
+            1,
+            None,
+            CollectCapacity::Finite(2),
+            true,
+        )]),
+    )
+    .unwrap();
+    timeline
+        .apply(command("place", LevelCommand::PlaceEntity { entity }))
+        .unwrap();
+    let before = timeline.snapshot().clone();
+
+    let capacity_error = timeline
+        .apply(command(
+            "locked-capacity",
+            LevelCommand::SetBlockLayerCapacity {
+                entity_ids: vec![EntityId::from("locked")],
+                layer_index: 0,
+                capacity: CollectCapacity::Finite(9),
+            },
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        capacity_error,
+        TimelineError::InvalidLevel(LevelError::InvalidEntity(
+            EntityError::CollectLayerLocked { .. }
+        ))
+    ));
+    assert_eq!(timeline.snapshot(), &before);
+
+    let layers_error = timeline
+        .apply(command(
+            "remove-locked-layer",
+            LevelCommand::SetBlockCollectLayers {
+                entity_id: EntityId::from("locked"),
+                layers: Vec::new(),
+            },
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        layers_error,
+        TimelineError::InvalidLevel(LevelError::InvalidEntity(
+            EntityError::CollectLayerLocked { .. }
+        ))
+    ));
+    assert_eq!(timeline.snapshot(), &before);
+}
+
+#[test]
+fn collect_layer_replacement_rejects_values_not_representable_by_legacy() {
+    let mut timeline = LevelTimeline::new(LevelSnapshot::new(4, 3).unwrap()).unwrap();
+    timeline
+        .apply(command(
+            "place",
+            LevelCommand::PlaceEntity {
+                entity: block("a", 0, 0, CollectCapacity::Unlimited),
+            },
+        ))
+        .unwrap();
+    let before = timeline.snapshot().clone();
+
+    let color_error = timeline
+        .apply(command(
+            "invalid-color",
+            LevelCommand::SetBlockCollectLayers {
+                entity_id: EntityId::from("a"),
+                layers: vec![CollectLayer::new(
+                    16,
+                    None,
+                    CollectCapacity::Unlimited,
+                    false,
+                )],
+            },
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        color_error,
+        TimelineError::InvalidLevel(LevelError::InvalidEntity(
+            EntityError::InvalidCollectLayerColor(16)
+        ))
+    ));
+    assert_eq!(timeline.snapshot(), &before);
+
+    let capacity_error = timeline
+        .apply(command(
+            "invalid-capacity",
+            LevelCommand::SetBlockCollectLayers {
+                entity_id: EntityId::from("a"),
+                layers: vec![CollectLayer::new(
+                    1,
+                    None,
+                    CollectCapacity::Finite(i32::MAX as u32 + 1),
+                    false,
+                )],
+            },
+        ))
+        .unwrap_err();
+    assert!(matches!(
+        capacity_error,
+        TimelineError::InvalidLevel(LevelError::InvalidEntity(
+            EntityError::CollectCapacityTooLarge(_)
+        ))
+    ));
+    assert_eq!(timeline.snapshot(), &before);
 }
 
 #[test]

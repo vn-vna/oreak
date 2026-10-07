@@ -443,6 +443,34 @@ impl LevelSnapshot {
                             hasher.update(&guide.second().y.to_le_bytes());
                         }
                     }
+                    if !blind.distribution_groups().is_empty() {
+                        hasher.update(b"oreak-pool-distribution-groups-v1");
+                        hash_len(&mut hasher, blind.distribution_groups().len());
+                        for group in blind.distribution_groups() {
+                            hasher.update(&group.id.to_le_bytes());
+                            hash_string(&mut hasher, &group.name);
+                            hash_len(&mut hasher, group.pixels.len());
+                            for pixel in &group.pixels {
+                                hasher.update(&pixel.x.to_le_bytes());
+                                hasher.update(&pixel.y.to_le_bytes());
+                            }
+                        }
+                    }
+                    let boundary = blind.boundary();
+                    if !boundary.is_default() {
+                        hasher.update(b"oreak-pool-boundary-v1");
+                        for value in [boundary.padding_pixels, boundary.corner_radius_pixels] {
+                            match value {
+                                Some(pixels) => {
+                                    hasher.update(&[1]);
+                                    hasher.update(&pixels.to_le_bytes());
+                                }
+                                None => {
+                                    hasher.update(&[0]);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -771,6 +799,12 @@ pub enum LevelError {
         point: GridPoint,
         entity_id: EntityId,
     },
+
+    #[error("cell edit batch contains {count} cells, exceeding the limit of {max}")]
+    CellEditLimitExceeded { count: usize, max: usize },
+
+    #[error("cell ({}, {}) occurs more than once in a cell edit batch", point.x, point.y)]
+    DuplicateCellEdit { point: GridPoint },
 
     #[error("decorator ID '{0}' occurs more than once")]
     DuplicateDecoratorId(DecoratorId),

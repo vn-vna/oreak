@@ -8,7 +8,7 @@ use jsonrpsee::{
     core::{RpcResult, SubscriptionResult},
     proc_macros::rpc,
 };
-use oreak_core::{ActorId, CommandId, GridPoint};
+use oreak_core::{ActorId, CommandId, GridPoint, ImagePlacement, PlaceableEntity};
 pub use oreak_core::{
     ApplyOutcome, CommandEnvelope, CommandMetadata, HistoryEvent, LevelHash, LevelSnapshot,
 };
@@ -148,6 +148,16 @@ pub struct LevelHistoryResponse {
 pub struct ApplyCommandRequest {
     pub target: ProjectLevelTarget,
     pub command: CommandEnvelope,
+}
+
+/// Applies a server-prepared immutable image to the exact Pools used for preview.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ApplyImageRequest {
+    pub target: ProjectLevelTarget,
+    pub metadata: CommandMetadata,
+    pub prepared_image_id: String,
+    pub placement: ImagePlacement,
+    pub targets: Vec<PlaceableEntity>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -351,6 +361,9 @@ pub trait OreakRpc {
     #[method(name = "apply_command", param_kind = map, with_extensions)]
     async fn apply_command(&self, request: ApplyCommandRequest) -> RpcResult<ApplyCommandResponse>;
 
+    #[method(name = "apply_image", param_kind = map, with_extensions)]
+    async fn apply_image(&self, request: ApplyImageRequest) -> RpcResult<ApplyCommandResponse>;
+
     #[method(name = "undo_latest", param_kind = map, with_extensions)]
     async fn undo_latest(&self, request: UndoLatestRequest) -> RpcResult<UndoLatestResponse>;
 
@@ -383,8 +396,8 @@ mod tests {
         PresenceParticipant, ProjectId, ProjectLevelTarget, RpcErrorCode, RpcErrorData,
     };
     use oreak_core::{
-        ActorId, BlindPixel, BlindStroke, CommandEnvelope, CommandMetadata, EntityId, EntityMove,
-        GridAnchor, GridPoint, GridSize, LevelCommand,
+        ActorId, BlindPixel, BlindStroke, CellEdit, CellKind, CommandEnvelope, CommandMetadata,
+        EntityId, EntityMove, GridAnchor, GridPoint, GridSize, LevelCommand,
     };
 
     #[test]
@@ -542,6 +555,69 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<LevelCommand>(value).unwrap(),
             moves
+        );
+    }
+
+    #[test]
+    fn multi_cell_stamp_has_a_stable_wire_shape() {
+        let command = LevelCommand::SetCells {
+            cells: vec![
+                CellEdit::new(GridPoint::new(1, 2), CellKind::Wall),
+                CellEdit::new(GridPoint::new(2, 2), CellKind::Floor),
+            ],
+        };
+        let value = serde_json::to_value(&command).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "SetCells": {
+                    "cells": [
+                        { "point": { "x": 1, "y": 2 }, "kind": "Wall" },
+                        { "point": { "x": 2, "y": 2 }, "kind": "Floor" }
+                    ]
+                }
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<LevelCommand>(value).unwrap(),
+            command
+        );
+    }
+
+    #[test]
+    fn apply_image_request_roundtrips_expected_targets_without_embedded_asset() {
+        let target = oreak_core::PlaceableEntity::blind(
+            "pool",
+            GridPoint::new(0, 0),
+            oreak_core::Shape::new(1, 1, 1).unwrap(),
+            oreak_core::Blind::new(1, vec![oreak_core::BlindTile::empty(1).unwrap()]).unwrap(),
+        )
+        .unwrap();
+        let request = super::ApplyImageRequest {
+            target: ProjectLevelTarget::new("project", "level"),
+            metadata: oreak_core::CommandMetadata::new("image", "artist", 100),
+            prepared_image_id: "prepared-1".to_owned(),
+            placement: oreak_core::ImagePlacement {
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+                sampling: oreak_core::ImageSampling::Nearest,
+                pixelation: 1,
+                resolution: None,
+                transparency: oreak_core::ImageTransparency::Preserve,
+            },
+            targets: vec![target],
+        };
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value["prepared_image_id"], "prepared-1");
+        assert_eq!(value["placement"]["sampling"], "nearest");
+        assert_eq!(value["targets"].as_array().unwrap().len(), 1);
+        assert!(value.get("image").is_none());
+        assert!(value.get("settings").is_none());
+        assert_eq!(
+            serde_json::from_value::<super::ApplyImageRequest>(value).unwrap(),
+            request
         );
     }
 

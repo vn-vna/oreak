@@ -3,9 +3,10 @@ use std::rc::Rc;
 use jsonrpsee_wasm_client::{Client, WasmClientBuilder};
 use oreak_core::HistoryEvent;
 use oreak_protocol::{
-    ApplyCommandRequest, ApplyCommandResponse, LevelHistoryRequest, LevelPresenceItem,
-    LevelSnapshotResponse, LevelSubscriptionItem, MAX_LEVEL_HISTORY_PAGE_SIZE, OreakRpcClient as _,
-    ProjectLevelTarget, UndoLatestRequest, UndoLatestResponse, UpdateLevelCursorRequest,
+    ApplyCommandRequest, ApplyCommandResponse, ApplyImageRequest, LevelHistoryRequest,
+    LevelPresenceItem, LevelSnapshotResponse, LevelSubscriptionItem, MAX_LEVEL_HISTORY_PAGE_SIZE,
+    OreakRpcClient as _, ProjectLevelTarget, UndoLatestRequest, UndoLatestResponse,
+    UpdateLevelCursorRequest,
 };
 use yew::Callback;
 
@@ -132,6 +133,17 @@ impl RpcClient {
             .apply_command(request)
             .await
             .map_err(|error| format!("apply_command failed: {error}"))
+    }
+
+    pub async fn apply_image(
+        &self,
+        request: ApplyImageRequest,
+    ) -> Result<ApplyCommandResponse, String> {
+        self.inner
+            .as_ref()
+            .apply_image(request)
+            .await
+            .map_err(|error| format!("apply_image failed: {error}"))
     }
 
     pub async fn undo_latest(

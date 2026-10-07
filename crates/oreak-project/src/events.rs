@@ -70,6 +70,9 @@ pub enum AuditAction {
     ProjectRegistered {
         project_id: ProjectId,
     },
+    ProjectUnregistered {
+        project_id: ProjectId,
+    },
     ProjectCreated,
     ProjectInvitationCreated {
         invitation_id: InvitationId,
@@ -104,6 +107,9 @@ pub enum AuditAction {
         version: FormulaVersion,
     },
     LevelCreated {
+        level_id: LevelId,
+    },
+    LevelDeleted {
         level_id: LevelId,
     },
     LevelConfigurationChanged {
